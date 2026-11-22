@@ -1,0 +1,6 @@
+{
+  "name": "DeltaAI - Institutional Crypto Trading Platform",
+  "description": "Personal AI crypto trading terminal for Delta Exchange India featuring futures scalping, options strategies, automated risk controls, and real-time market intelligence.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

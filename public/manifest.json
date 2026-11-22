@@ -1,0 +1,73 @@
+{
+  "id": "/",
+  "name": "DeltaAI - Institutional Crypto Trading Platform",
+  "short_name": "DeltaAI",
+  "description": "Personal AI Crypto Trading Platform for Delta Exchange India with Futures Scalping, Options, and Risk Engine.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "display_override": ["window-controls-overlay", "standalone", "minimal-ui"],
+  "orientation": "any",
+  "theme_color": "#080b12",
+  "background_color": "#080b12",
+  "categories": ["finance", "productivity", "business"],
+  "lang": "en-US",
+  "dir": "ltr",
+  "prefer_related_applications": false,
+  "shortcuts": [
+    {
+      "name": "Trading Terminal",
+      "short_name": "Terminal",
+      "description": "Open Live Terminal and Charts",
+      "url": "/?tab=dashboard",
+      "icons": [{ "src": "/pwa-192x192.png", "sizes": "192x192", "type": "image/png" }]
+    },
+    {
+      "name": "AI Command Centre",
+      "short_name": "AI Command",
+      "description": "Access Gemini Market Intelligence & Trade Setups",
+      "url": "/?tab=ai-centre",
+      "icons": [{ "src": "/pwa-192x192.png", "sizes": "192x192", "type": "image/png" }]
+    },
+    {
+      "name": "Trading Intelligence",
+      "short_name": "Sniper",
+      "description": "Intraday Camarilla & CPR Sniper Signals",
+      "url": "/?tab=strategies",
+      "icons": [{ "src": "/pwa-192x192.png", "sizes": "192x192", "type": "image/png" }]
+    },
+    {
+      "name": "Positions & Orders",
+      "short_name": "Positions",
+      "description": "Monitor Open Derivatives & Realized PnL",
+      "url": "/?tab=positions",
+      "icons": [{ "src": "/pwa-192x192.png", "sizes": "192x192", "type": "image/png" }]
+    }
+  ],
+  "icons": [
+    {
+      "src": "/pwa-192x192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/pwa-512x512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/pwa-maskable-512x512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    },
+    {
+      "src": "/icon.svg",
+      "sizes": "512x512",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    }
+  ]
+}

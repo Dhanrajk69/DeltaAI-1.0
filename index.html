@@ -1,0 +1,174 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+    <title>DeltaAI - Institutional Crypto Trading Platform</title>
+    <meta name="description" content="Personal AI crypto trading terminal for Delta Exchange India featuring futures scalping, options strategies, automated risk controls, and real-time market intelligence." />
+    <meta property="og:title" content="DeltaAI - Institutional Crypto Trading Platform" />
+    <meta property="og:description" content="Personal AI crypto trading terminal for Delta Exchange India featuring futures scalping, options strategies, automated risk controls, and real-time market intelligence." />
+    <meta property="og:type" content="website" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="theme-color" content="#080b12" />
+    <meta name="theme-color" media="(prefers-color-scheme: dark)" content="#080b12" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="application-name" content="DeltaAI" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="DeltaAI" />
+    <meta name="msapplication-TileColor" content="#080b12" />
+    <meta name="format-detection" content="telephone=no" />
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+    <link rel="icon" type="image/svg+xml" href="/icon.svg" />
+    <!-- Google Identity Services (GSI) Script for Google Sign-In -->
+    <script src="https://accounts.google.com/gsi/client" async defer></script>
+    <!-- Filter benign Vite dev HMR socket disconnections and disable React 19 profiler cross-origin frame inspection -->
+    <script>
+      (function() {
+        // Disable React 19 User Timing profiling in cross-origin iframe to prevent SecurityError when inspecting window/event props
+        try {
+          if (window.console) {
+            try {
+              Object.defineProperty(window.console, 'timeStamp', {
+                get: function() { return undefined; },
+                set: function() {},
+                configurable: true,
+              });
+            } catch (e) {
+              window.console.timeStamp = undefined;
+            }
+          }
+        } catch (e) {}
+
+        function isBenignError(text) {
+          if (!text) return false;
+          var str = String(text);
+          return (
+            str.indexOf('WebSocket closed without opened') !== -1 ||
+            str.indexOf('[vite] failed to connect to websocket') !== -1 ||
+            str.indexOf('vite:ws:disconnect') !== -1 ||
+            str.indexOf('cross-origin frame') !== -1 ||
+            str.indexOf('cross-origin') !== -1 ||
+            str.indexOf('Blocked a frame with origin') !== -1 ||
+            str.indexOf('Should not already be working') !== -1 ||
+            str.indexOf('addObjectDiffToProperties') !== -1 ||
+            str.indexOf('logComponentRender') !== -1 ||
+            str.indexOf('identity-credentials-get') !== -1 ||
+            str.indexOf('FedCM') !== -1 ||
+            str.indexOf('GSI_LOGGER') !== -1 ||
+            (str.indexOf('@vite/client') !== -1 && str.indexOf('WebSocket') !== -1)
+          );
+        }
+
+        // 1. Intercept console.error to filter out benign notices
+        var originalConsoleError = window.console && window.console.error;
+        if (originalConsoleError) {
+          window.console.error = function() {
+            var fullText = '';
+            for (var i = 0; i < arguments.length; i++) {
+              var arg = arguments[i];
+              if (arg instanceof Error) {
+                fullText += ' ' + (arg.message || '') + ' ' + (arg.stack || '');
+              } else if (typeof arg === 'object' && arg !== null) {
+                try {
+                  fullText += ' ' + JSON.stringify(arg);
+                } catch (e) {
+                  fullText += ' [object]';
+                }
+              } else {
+                fullText += ' ' + String(arg);
+              }
+            }
+
+            if (isBenignError(fullText)) {
+              return;
+            }
+            return originalConsoleError.apply(this, arguments);
+          };
+        }
+
+        // 1b. Intercept console.warn to filter out benign iframe/GSI/FedCM notices
+        var originalConsoleWarn = window.console && window.console.warn;
+        if (originalConsoleWarn) {
+          window.console.warn = function() {
+            var fullText = '';
+            for (var i = 0; i < arguments.length; i++) {
+              var arg = arguments[i];
+              if (arg instanceof Error) {
+                fullText += ' ' + (arg.message || '') + ' ' + (arg.stack || '');
+              } else if (typeof arg === 'object' && arg !== null) {
+                try {
+                  fullText += ' ' + JSON.stringify(arg);
+                } catch (e) {
+                  fullText += ' [object]';
+                }
+              } else {
+                fullText += ' ' + String(arg);
+              }
+            }
+
+            if (isBenignError(fullText)) {
+              return;
+            }
+            return originalConsoleWarn.apply(this, arguments);
+          };
+        }
+
+        // 2. Intercept window.onerror
+        var originalOnError = window.onerror;
+        window.onerror = function(message, source, lineno, colno, error) {
+          var text = String(message || '') + ' ' + String(source || '') + ' ' + ((error && (error.stack || error.message)) || '');
+          if (isBenignError(text)) {
+            return true;
+          }
+          if (typeof originalOnError === 'function') {
+            return originalOnError.call(this, message, source, lineno, colno, error);
+          }
+        };
+
+        // 3. Intercept window.onunhandledrejection
+        var originalOnUnhandledRejection = window.onunhandledrejection;
+        window.onunhandledrejection = function(event) {
+          var reason = event && event.reason;
+          var text = (reason && (reason.stack || reason.message)) || String(reason || '');
+          if (isBenignError(text)) {
+            if (event.preventDefault) event.preventDefault();
+            if (event.stopImmediatePropagation) event.stopImmediatePropagation();
+            return;
+          }
+          if (typeof originalOnUnhandledRejection === 'function') {
+            return originalOnUnhandledRejection.call(this, event);
+          }
+        };
+
+        // 4. Capture-phase event listeners to stop propagation
+        window.addEventListener('unhandledrejection', function(e) {
+          var reason = e && e.reason;
+          var text = (reason && (reason.stack || reason.message)) || String(reason || '');
+          if (isBenignError(text)) {
+            e.preventDefault();
+            e.stopImmediatePropagation();
+          }
+        }, true);
+
+        window.addEventListener('error', function(e) {
+          var text = (e.message || '') + ' ' + (e.filename || '') + ' ' + ((e.error && (e.error.stack || e.error.message)) || '');
+          if (isBenignError(text)) {
+            e.preventDefault();
+            e.stopImmediatePropagation();
+          }
+        }, true);
+      })();
+    </script>
+    <!-- Trading Fonts: JetBrains Mono and Outfit -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
+

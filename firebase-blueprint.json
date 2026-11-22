@@ -1,0 +1,40 @@
+{
+  "entities": {
+    "UserPortfolio": {
+      "title": "User Portfolio",
+      "description": "User portfolio and account state",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "totalEquity": { "type": "number" },
+        "availableBalance": { "type": "number" },
+        "marginUsed": { "type": "number" },
+        "updatedAt": { "type": "number" }
+      },
+      "required": ["userId", "totalEquity"]
+    },
+    "ClosedTrade": {
+      "title": "Closed Trade",
+      "description": "Historical closed trades and journal entries",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "symbol": { "type": "string" },
+        "side": { "type": "string" },
+        "realisedPnl": { "type": "number" },
+        "closedAt": { "type": "number" }
+      },
+      "required": ["id", "symbol", "realisedPnl", "closedAt"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/UserPortfolio" },
+      "description": "User portfolio document"
+    },
+    "/users/{userId}/trades/{tradeId}": {
+      "schema": { "$ref": "#/entities/ClosedTrade" },
+      "description": "User closed trades subcollection"
+    }
+  }
+}

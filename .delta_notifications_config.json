@@ -1,0 +1,14 @@
+{
+  "ntfyTopic": "deltaai-dhanraj-9842",
+  "telegramBotToken": "",
+  "telegramChatId": "",
+  "webhookUrl": "",
+  "whatsappNumber": "",
+  "enabledEvents": {
+    "fills": true,
+    "tpSl": true,
+    "autoPilot": true,
+    "killSwitch": true,
+    "staleSignals": true
+  }
+}
