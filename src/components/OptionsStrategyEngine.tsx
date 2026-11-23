@@ -73,6 +73,8 @@ interface OptionsStrategyEngineProps {
   sniperSignal?: SniperSignal | null;
   correlatedSignal?: CorrelatedSignal | null;
   onPlaySound?: () => void;
+  isExchangeHydrated?: boolean;
+  appBootTimestamp?: number;
 }
 
 export const OptionsStrategyEngine: React.FC<OptionsStrategyEngineProps> = React.memo(({
@@ -91,6 +93,8 @@ export const OptionsStrategyEngine: React.FC<OptionsStrategyEngineProps> = React
   sniperSignal,
   correlatedSignal,
   onPlaySound,
+  isExchangeHydrated = true,
+  appBootTimestamp,
 }) => {
   const isLiveUnverified = tradingMode === 'LIVE' && !isLiveApiAuthenticated;
 
@@ -118,6 +122,8 @@ export const OptionsStrategyEngine: React.FC<OptionsStrategyEngineProps> = React
     tradingMode,
     availableBalance: portfolioTelemetry.availableMargin || portfolioTelemetry.availableBalance,
     isLiveApiAuthenticated,
+    isExchangeHydrated,
+    appBootTimestamp,
     onSendNotification,
     onPlaySound,
     aiAnalysis,
@@ -197,6 +203,12 @@ export const OptionsStrategyEngine: React.FC<OptionsStrategyEngineProps> = React
     isBalancedOneToOne,
     liveAvailableEquityUsd,
     nearMissReason,
+    regimeRouter,
+    regimeStatusLabel,
+    maxNetDebitAllowedUsd,
+    estimatedNetDebitUsd,
+    utcDayTradesCount,
+    postSlCooldownBarsRemaining,
   } = optionsEngine;
 
   // ═══════════════════════════════════════════════════════════
@@ -518,7 +530,7 @@ export const OptionsStrategyEngine: React.FC<OptionsStrategyEngineProps> = React
             className="btn-delta-sm btn-toggle-active"
           >
             <RefreshCw className={`w-3.5 h-3.5 ${portfolioTelemetry.isSyncingLive ? 'animate-spin' : ''}`} />
-            <span>Sync Now</span>
+            <span>{portfolioTelemetry.isSyncingLive ? 'Syncing...' : 'Sync Now'}</span>
           </button>
           {(hasPhantomLocalPosition ||
             (tradingMode === 'LIVE' &&
@@ -576,44 +588,34 @@ export const OptionsStrategyEngine: React.FC<OptionsStrategyEngineProps> = React
               <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-gradient-to-br from-cyan-500/20 to-blue-600/20 border border-cyan-500/40 text-cyan-400 shrink-0 mt-0.5">
                 <Sliders className="h-5 w-5 animate-pulse" />
               </div>
-              <div className="min-w-0 flex-1 space-y-1.5">
+              <div className="min-w-0 flex-1 space-y-1">
                 <div className="flex flex-wrap items-center gap-2 min-w-0">
                   <h2 className="text-sm font-extrabold uppercase tracking-wider text-slate-100 inline-flex flex-wrap items-center gap-1.5 leading-snug">
                     <span>OPTIONS STRATEGY LAB</span>
                     <span className="text-cyan-400">· {isAutoPilotEnabled ? 'AUTO-PILOT DISPATCH' : 'MANUAL STAGING'}</span>
                   </h2>
-                  <span className="badge-delta badge-delta-armed font-mono-numbers">
-                    DELTA EXCHANGE LIVE
-                  </span>
-                  <span
-                    className="badge-delta badge-delta-live font-mono-numbers"
-                    title={`Synced from Risk Settings (${marginMode} Margin, Hard Cap ${maxLeverageCap}x)`}
-                  >
-                    Global Lev: {effectiveGlobalLeverage}x ({leverageSyncLocked ? 'Synced' : `Cap ${maxLeverageCap}x`} · {marginMode})
-                  </span>
-                  <span
-                    className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md border bg-purple-950/60 border-purple-500/40 text-purple-200 text-[10px] font-mono-numbers font-bold"
-                    title={`Risk-Scaled sizing synced from Risk Settings (Max Risk ${maxRiskPerTradePct}%)`}
-                  >
-                    Risk-Scaled ({maxRiskPerTradePct}% · {basketLots} cts)
+                  <span className="text-[11px] font-mono-numbers text-slate-400 tabular-nums">
+                    · Lev {effectiveGlobalLeverage}x ({marginMode}) · UTC {utcDayTradesCount}/3
+                    {postSlCooldownBarsRemaining > 0 ? ` · Cooldown ${postSlCooldownBarsRemaining}b` : ''}
                   </span>
                 </div>
-                <div className="flex flex-wrap items-center gap-1.5 min-w-0">
-                  <span className="badge-delta badge-delta-armed font-mono">
-                    {intradayMode 
-                      ? `Mode: INTRADAY SCALP ${isAutoPilotEnabled ? '(AUTO-DISPATCH ARMED)' : ''}` 
-                      : 'Mode: DAILY / MULTI-DAY'}
+                <div className={`text-[11px] font-mono-numbers leading-snug break-words tabular-nums ${
+                  regimeRouter?.isNoTrade ? 'text-amber-300 font-semibold' : 'text-slate-300'
+                }`}>
+                  {regimeStatusLabel ||
+                    (regimeRouter?.isNoTrade
+                      ? 'NO TRADE (CHOP / LOW VOLATILITY)'
+                      : `Defined-Risk Debit Spreads (${effectiveResolvedStrategy})`)}
+                  {' · '}
+                  <span className="text-slate-400">
+                    Max Net Debit ≤ 1% Equity (${maxNetDebitAllowedUsd.toFixed(2)}) · Est. ${estimatedNetDebitUsd.toFixed(2)} · 1.5x–2.2x Target · Auto-Close 4h Pre-Expiry
                   </span>
-                  {intradayMode && (
-                    <span className="badge-delta badge-delta-live font-mono rounded-lg whitespace-normal break-words text-left">
-                      {pos && pos.legs && pos.legs.length > 0
-                        ? `ACTIVE POSITION: ${pos.strategyName} (${pos.legs.map((l) => `$${Number(l.strike || 0).toLocaleString()}${l.type === 'PUT' ? 'P' : 'C'}`).join(' / ')}) · Entry Spot $${pos.entryUnderlyingPrice.toLocaleString()}`
-                        : isAutoPilotEnabled 
-                        ? `Auto-Routing: Correlated ${signalOptionsCorrelation?.signalSide || 'REGIME'} → ${signalOptionsCorrelation?.recommendedStrategy || optionsEngine.getRecommendedIntradayStrategy(curMarket).strategy} (${signalOptionsCorrelation?.synergyScore || 85}% Synergy)`
-                        : `Signal Correlation: ${signalOptionsCorrelation?.signalSide || 'REGIME'} → ${signalOptionsCorrelation?.recommendedStrategy || optionsEngine.getRecommendedIntradayStrategy(curMarket).strategy}`}
-                    </span>
-                  )}
                 </div>
+                {pos && pos.legs && pos.legs.length > 0 && (
+                  <div className="text-[11px] font-mono-numbers text-emerald-300 break-words tabular-nums">
+                    ACTIVE POSITION: {pos.strategyName} ({pos.legs.map((l) => `$${Number(l.strike || 0).toLocaleString()}${l.type === 'PUT' ? 'P' : 'C'}`).join(' / ')}) · Entry Spot ${pos.entryUnderlyingPrice.toLocaleString()}
+                  </div>
+                )}
               </div>
             </div>
 
@@ -779,10 +781,9 @@ export const OptionsStrategyEngine: React.FC<OptionsStrategyEngineProps> = React
                 )}
               </div>
 
-              {/* Auto-Handoff: Sniper → Options Lab Toggle */}
               <div
                 className="flex items-center gap-2 px-3 h-9 bg-slate-900 border border-slate-800 rounded-lg font-mono-numbers"
-                title="Smart Regime Auto-Handoff: Automatically switches execution to Options Lab (Iron Condor) when CPR is Stretched (>= 2.5x)"
+                title="Smart Regime Auto-Handoff: Automatically routes high volatility / Wide CPR (>= 80th percentile) trends to Options Debit Spreads"
               >
                 <span className="text-[11px] text-slate-300 font-sans font-medium">Auto-Handoff:</span>
                 <button
@@ -798,7 +799,7 @@ export const OptionsStrategyEngine: React.FC<OptionsStrategyEngineProps> = React
                     }`}
                   />
                 </button>
-                <span className={`badge-delta ${autoHandoffEnabled ? 'badge-delta-armed' : 'badge-delta-standby'}`}>
+                <span className={`text-[11px] font-bold ${autoHandoffEnabled ? 'text-cyan-300' : 'text-slate-500'}`}>
                   {autoHandoffEnabled ? 'ARMED' : 'OFF'}
                 </span>
               </div>
@@ -815,20 +816,20 @@ export const OptionsStrategyEngine: React.FC<OptionsStrategyEngineProps> = React
           </div>
 
           {isRegimeHandoffActive && (
-            <div className="p-3.5 rounded-xl bg-cyan-950/60 border border-cyan-500/50 text-cyan-200 flex items-center justify-between gap-3 flex-wrap">
+            <div className="p-3.5 rounded-xl bg-cyan-950/50 border border-cyan-500/40 text-cyan-200 flex items-center justify-between gap-3 flex-wrap">
               <div className="flex items-center gap-2.5">
-                <Zap className="w-5 h-5 text-cyan-400 shrink-0 animate-pulse" />
+                <Zap className="w-5 h-5 text-cyan-400 shrink-0" />
                 <div>
                   <span className="font-extrabold block text-xs tracking-wide text-cyan-300">
-                    ⚡ DUAL-TF REGIME ROUTER ACTIVE: {isWide4hCpr ? `4h Wide CPR (${(cpr4hWidthPct ?? 0).toFixed(2)}% ≥ 0.45%)` : `CPR Stretched (${cprStrengthRatio}x)`} → Options Lab Armed (4-Leg Iron Condor Credit Mode)
+                    UNIFIED REGIME ROUTER: High Vol / Wide CPR (P{Math.round(regimeRouter?.cprPercentile ?? 80)}) → {effectiveResolvedStrategy}
                   </span>
-                  <span className="text-[11px] text-cyan-200/90 font-mono">
-                    4h Wide CPR theta harvesting runs in parallel with 5m/15m Narrow CPR $15 Micro Sniper (Independent 1/1 Spread Slot · Acct Margin {(accountMarginUtilizationPct ?? 0).toFixed(1)}% / 65%).
+                  <span className="text-[11px] text-cyan-200/90 font-mono-numbers tabular-nums">
+                    ~0.50–0.55 Long + ~0.25–0.30 Short Delta · Max Net Debit ≤ 1% Equity (${maxNetDebitAllowedUsd.toFixed(2)}) · 1.5x–2.2x Debit Ladder · Auto-Close 4h Pre-Expiry
                   </span>
                 </div>
               </div>
-              <span className="badge-delta badge-delta-armed font-mono">
-                OPTIONS SLOT: {optionsSpreadSlotOccupied ? '1/1 IN PLAY' : '0/1 ARMED'} · IRON CONDOR
+              <span className="text-[11px] font-mono-numbers font-bold text-cyan-300 tabular-nums">
+                Slot: {optionsSpreadSlotOccupied ? '1/1 Active' : '0/1 Ready'}
               </span>
             </div>
           )}
@@ -847,48 +848,33 @@ export const OptionsStrategyEngine: React.FC<OptionsStrategyEngineProps> = React
               summary={
                 <>
                   <span className={autoPilotGates.allPassed ? 'text-emerald-400 font-bold' : 'text-amber-300 font-bold'}>
-                    {autoPilotGates.allPassed ? '5/5 GATES READY' : 'GATE HOLD'}
+                    {autoPilotGates.allPassed ? 'GATES READY' : 'GATE HOLD'}
                   </span>
                   <span className="text-slate-600">·</span>
-                  <span>
-                    {executionLane === 'NEUTRAL_THETA_HARVEST' ? 'Lane B: Iron Condor' : 'Lane A: Directional'}
-                  </span>
+                  <span>{effectiveResolvedStrategy}</span>
                   <span className="text-slate-600">·</span>
                   <span>Scan: {nextAutoScanSec}s</span>
                   <span className="text-slate-600">·</span>
-                  <span>Margin: {(accountMarginUtilizationPct ?? 0).toFixed(1)}%/65%</span>
+                  <span>Debit ≤ 1%: ${estimatedNetDebitUsd.toFixed(2)}/${maxNetDebitAllowedUsd.toFixed(2)}</span>
                 </>
               }
             >
               <div className="flex flex-wrap items-center justify-between gap-2 pb-2 mb-2.5 border-b border-slate-800 text-xs font-bold text-cyan-300">
                 <div className="flex flex-wrap items-center gap-2">
-                  <Cpu className="w-4 h-4 animate-spin text-cyan-400" />
-                  <span>Pre-Flight Analysis Checklist (Auto-Pilot Armed)</span>
-                  <span
-                    className={`badge-delta ${
-                      executionLane === 'NEUTRAL_THETA_HARVEST'
-                        ? 'badge-delta-armed'
-                        : 'badge-delta-paper'
-                    }`}
-                  >
-                    {executionLane === 'NEUTRAL_THETA_HARVEST'
-                      ? 'LANE B: NEUTRAL THETA HARVEST (IRON CONDOR)'
-                      : 'LANE A: TRENDING DIRECTIONAL'}
+                  <Cpu className="w-4 h-4 text-cyan-400" />
+                  <span>Pre-Flight Analysis Checklist</span>
+                  <span className="text-[11px] font-normal text-slate-400 tabular-nums">
+                    · {regimeRouter?.isNoTrade ? 'NO TRADE (CHOP / LOW VOLATILITY)' : effectiveResolvedStrategy} · UTC {utcDayTradesCount}/3
                   </span>
                 </div>
-                <div className="flex flex-wrap items-center gap-2 text-[10px]">
-                  <span className="badge-delta badge-delta-standby">
-                    Next Scan: {nextAutoScanSec}s
-                  </span>
-                  <span className="badge-delta badge-delta-armed">
-                    4h CPR: {(cpr4hWidthPct ?? 0).toFixed(2)}% ({isWide4hCpr ? 'WIDE ≥0.45%' : 'STD'})
-                  </span>
-                  <span className={`badge-delta ${(accountMarginUtilizationPct ?? 0) < 65 ? 'badge-delta-live' : 'badge-delta-danger'}`}>
-                    Cap ≤35% (${equitySizingSummary.estimatedMarginUsd.toFixed(2)}) · Acct {(accountMarginUtilizationPct ?? 0).toFixed(1)}%/65%
-                  </span>
+                <div className="flex flex-wrap items-center gap-2 text-[10px] tabular-nums">
+                  <span className="text-slate-400">Next Scan: {nextAutoScanSec}s</span>
+                  <span className="text-slate-600">·</span>
+                  <span className="text-cyan-300">CPR P{Math.round(regimeRouter?.cprPercentile ?? 50)} ({regimeRouter?.cprWidthPct?.toFixed(2) ?? '0.00'}%)</span>
+                  <span className="text-slate-600">·</span>
                   <span className={autoPilotGates.allPassed ? 'text-emerald-400 font-extrabold flex items-center gap-1' : 'text-amber-400 font-semibold flex items-center gap-1'}>
                     {autoPilotGates.allPassed ? <CheckCircle2 className="w-4 h-4 text-emerald-400" /> : <AlertTriangle className="w-4 h-4 text-amber-400" />}
-                    {autoPilotGates.allPassed ? 'ALL GATES PASSED (READY)' : autoPilotGates.isAnalyzingAutoPilot ? 'SCANNING NEXT FRESH SETUP...' : 'GATE HOLD'}
+                    {autoPilotGates.allPassed ? 'ALL GATES PASSED' : autoPilotGates.isAnalyzingAutoPilot ? 'SCANNING...' : 'GATE HOLD'}
                   </span>
                 </div>
               </div>
@@ -2399,36 +2385,15 @@ export const OptionsStrategyEngine: React.FC<OptionsStrategyEngineProps> = React
                               {step.stepLabel} <span className="text-[#94A3B8] font-semibold">· {step.targetPct}%</span>
                             </span>
                             {isHit ? (
-                              <span
-                                className="inline-flex items-center px-1.5 py-0.5 rounded-full border text-[9.5px] font-extrabold shrink-0"
-                                style={{
-                                  backgroundColor: p.badgeBg,
-                                  borderColor: p.badgeBorder,
-                                  color: p.text,
-                                }}
-                              >
+                              <span className="text-[10px] font-extrabold shrink-0" style={{ color: p.text }}>
                                 ✓ ACHIEVED
                               </span>
                             ) : isLoss ? (
-                              <span
-                                className="inline-flex items-center px-1.5 py-0.5 rounded-full border text-[9.5px] font-extrabold shrink-0"
-                                style={{
-                                  backgroundColor: p.badgeBg,
-                                  borderColor: p.badgeBorder,
-                                  color: p.text,
-                                }}
-                              >
+                              <span className="text-[10px] font-extrabold shrink-0" style={{ color: p.text }}>
                                 DD · -{step.drawdownPct}%
                               </span>
                             ) : (
-                              <span
-                                className="inline-flex items-center px-1.5 py-0.5 rounded-full border text-[9.5px] font-bold shrink-0"
-                                style={{
-                                  backgroundColor: p.badgeBg,
-                                  borderColor: p.badgeBorder,
-                                  color: p.text,
-                                }}
-                              >
+                              <span className="text-[10px] font-bold shrink-0 tabular-nums" style={{ color: p.text }}>
                                 {step.isCurrentActive ? `ACTIVE · ${step.progressPct}%` : `PENDING · ${step.progressPct}%`}
                               </span>
                             )}

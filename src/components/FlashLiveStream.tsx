@@ -736,7 +736,7 @@ export const FlashLiveStream: React.FC<FlashLiveStreamProps> = React.memo(
           ? 'bg-cyan-950/80 border-cyan-700/75'
           : 'bg-amber-950/80 border-amber-700/75',
         badgeColor: vwapAbove ? 'text-cyan-300 font-semibold' : 'text-amber-300 font-semibold',
-        headline: `${vwapAbove ? '+' : '-'}${currencyPrefix}${Math.abs(vwapDiff * exchangeRate).toFixed(2)} ${vwapAbove ? 'above' : 'below'} 5m VWAP (${fmtPrice(vwapApprox)}) · 9/20 EMA ${vwapAbove ? 'Bullish Stack' : 'Mean Reversion'}`,
+        headline: `${vwapAbove ? '+' : '-'}${currencyPrefix}${Math.abs(vwapDiff * exchangeRate).toFixed(2)} ${vwapAbove ? 'above' : 'below'} 5m VWAP (${fmtPrice(vwapApprox)}) · EMA 9/21 ${vwapAbove ? 'Bullish Stack' : 'Bearish Stack'}`,
         timestamp: 0,
         targetPrice: vwapApprox,
         stopLoss: vwapApprox * (vwapAbove ? 0.992 : 1.008),

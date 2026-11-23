@@ -1,11 +1,13 @@
 import fs from 'fs';
 import path from 'path';
 import type { WarehouseSignalRecord } from './analyticsWarehouse.ts';
+import { runUnifiedStrategyBacktest } from '../utils/backtestEngine.ts';
 
 export type HistoricalResolution = '1m' | '5m' | '15m' | '1h' | '4h' | '1d';
 export type HistoricalBacktestStrategyMode =
   | 'CAMARILLA_CPR_SNIPER'
   | 'AI_MATRIX_CONSENSUS'
+  | 'EMA_9_21_MOMENTUM_5M'
   | 'WAREHOUSE_SIGNALS_REPLAY';
 
 export interface DeltaOhlcvCandle {
@@ -524,6 +526,27 @@ export function runHistoricalBacktest(params: {
 }): HistoricalBacktestSummary {
   const symbol = normalizeDeltaHistoricalSymbol(params.symbol);
   const candles = [...params.candles].sort((a, b) => a.time - b.time);
+  if (
+    params.strategyMode === 'CAMARILLA_CPR_SNIPER' ||
+    params.strategyMode === 'AI_MATRIX_CONSENSUS' ||
+    params.strategyMode === 'EMA_9_21_MOMENTUM_5M'
+  ) {
+    return runUnifiedStrategyBacktest({
+      symbol: params.symbol,
+      timeframe: params.timeframe,
+      days: params.days,
+      strategyMode: params.strategyMode,
+      candles,
+      initialCapitalUsd: params.initialCapitalUsd,
+      leverage: params.leverage,
+      riskPerTradePct: params.riskPerTradePct,
+      takerFeeRate: params.feeRate,
+      gstRate: params.gstRate,
+      slippageBps: params.slippageBps,
+      usdInrRate: params.usdInrRate,
+    });
+  }
+
   const initialCapitalUsd = Math.max(50, Number(params.initialCapitalUsd || 1000));
   const leverage = Math.max(1, Math.min(20, Number(params.leverage || 10)));
   const riskPerTradePct = Math.max(0.25, Math.min(3, Number(params.riskPerTradePct || 1.0)));

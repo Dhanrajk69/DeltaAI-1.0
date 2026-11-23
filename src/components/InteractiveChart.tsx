@@ -86,6 +86,7 @@ export type ChartType = 'CANDLES' | 'HOLLOW' | 'HEIKIN_ASHI' | 'LINE' | 'AREA';
 
 interface CalculatedIndicators {
   ema9?: number;
+  ema21?: number;
   ema20?: number;
   ema50?: number;
   ema200?: number;
@@ -102,6 +103,54 @@ export type EnhancedCandle = Candle & CalculatedIndicators & {
   haLow?: number;
   haClose?: number;
 };
+
+interface EmaCrossoverSignal {
+  index: number;
+  time: number;
+  type: 'BULL' | 'BEAR';
+  price: number;
+  label: string;
+  isRecent: boolean;
+}
+
+function detectEma921Crossovers(candles: EnhancedCandle[]): EmaCrossoverSignal[] {
+  const crosses: EmaCrossoverSignal[] = [];
+  if (!candles || candles.length < 2) return crosses;
+
+  for (let i = 1; i < candles.length; i++) {
+    const prev = candles[i - 1];
+    const curr = candles[i];
+    if (prev.ema9 === undefined || prev.ema21 === undefined || curr.ema9 === undefined || curr.ema21 === undefined) continue;
+
+    const wasBelow = prev.ema9 <= prev.ema21;
+    const isAbove = curr.ema9 > curr.ema21;
+    const wasAbove = prev.ema9 >= prev.ema21;
+    const isBelow = curr.ema9 < curr.ema21;
+
+    const isRecent = i >= candles.length - 10;
+
+    if (wasBelow && isAbove) {
+      crosses.push({
+        index: i,
+        time: curr.time,
+        type: 'BULL',
+        price: curr.low,
+        label: 'EMA 9/21 Bull Cross',
+        isRecent,
+      });
+    } else if (wasAbove && isBelow) {
+      crosses.push({
+        index: i,
+        time: curr.time,
+        type: 'BEAR',
+        price: curr.high,
+        label: 'EMA 9/21 Bear Cross',
+        isRecent,
+      });
+    }
+  }
+  return crosses;
+}
 
 // Resolution to milliseconds helper
 function getIntervalMs(tf: string): number {
@@ -124,7 +173,7 @@ function computeIndicators(rawCandles: Candle[]): EnhancedCandle[] {
   const list: EnhancedCandle[] = rawCandles.map((c) => ({ ...c }));
 
   // 1. Calculate EMAs
-  const calcEma = (period: number, key: 'ema9' | 'ema20' | 'ema50' | 'ema200') => {
+  const calcEma = (period: number, key: 'ema9' | 'ema21' | 'ema20' | 'ema50' | 'ema200') => {
     if (list.length < period) return;
     const k = 2 / (period + 1);
     let ema = list[0].close;
@@ -139,7 +188,7 @@ function computeIndicators(rawCandles: Candle[]): EnhancedCandle[] {
   };
 
   calcEma(9, 'ema9');
-  calcEma(20, 'ema20');
+  calcEma(21, 'ema21');
   calcEma(50, 'ema50');
   calcEma(200, 'ema200');
 
@@ -277,7 +326,7 @@ export const InteractiveChart: React.FC<InteractiveChartProps> = React.memo(({
   // Chart Display Options (Clean TradingView defaults: Candles + EMA 9/20 + VWAP + CPR + Volume; heavy overlays toggleable)
   const [chartType, setChartType] = useState<ChartType>('CANDLES');
   const [showEma9, setShowEma9] = useState(true);
-  const [showEma20, setShowEma20] = useState(true);
+  const [showEma21, setShowEma21] = useState(true);
   const [showEma50, setShowEma50] = useState(chartRole === 'MACRO_4H');
   const [showEma200, setShowEma200] = useState(false);
   const [showVwap, setShowVwap] = useState(true);
@@ -1826,7 +1875,7 @@ export const InteractiveChart: React.FC<InteractiveChartProps> = React.memo(({
                       type="button"
                       onClick={() => {
                         setShowEma9(true);
-                        setShowEma20(true);
+                        setShowEma21(true);
                         setShowEma50(false);
                         setShowEma200(false);
                         setShowVwap(true);
@@ -1854,12 +1903,12 @@ export const InteractiveChart: React.FC<InteractiveChartProps> = React.memo(({
                     />
                   </label>
                   <label className="flex items-center justify-between px-2 py-1 rounded hover:bg-[#2a2e39] cursor-pointer text-slate-300">
-                    <span className="flex items-center gap-1.5 text-amber-400 font-medium">EMA 20</span>
+                    <span className="flex items-center gap-1.5 text-orange-400 font-medium">EMA 21</span>
                     <input
                       type="checkbox"
-                      checked={showEma20}
-                      onChange={(e) => setShowEma20(e.target.checked)}
-                      className="accent-amber-500 rounded"
+                      checked={showEma21}
+                      onChange={(e) => setShowEma21(e.target.checked)}
+                      className="accent-orange-500 rounded"
                     />
                   </label>
                   <label className="flex items-center justify-between px-2 py-1 rounded hover:bg-[#2a2e39] cursor-pointer text-slate-300">
@@ -2230,12 +2279,12 @@ export const InteractiveChart: React.FC<InteractiveChartProps> = React.memo(({
                     <div className="grid grid-cols-2 gap-1 text-[10.5px]">
                       {[
                         {
-                          label: 'EMA 9/20/50',
-                          active: showEma9 || showEma20 || showEma50,
+                          label: 'EMA 9/21/50',
+                          active: showEma9 || showEma21 || showEma50,
                           toggle: () => {
-                            const next = !(showEma9 || showEma20 || showEma50);
+                            const next = !(showEma9 || showEma21 || showEma50);
                             setShowEma9(next);
-                            setShowEma20(next);
+                            setShowEma21(next);
                             setShowEma50(next);
                           },
                         },
@@ -2350,18 +2399,18 @@ export const InteractiveChart: React.FC<InteractiveChartProps> = React.memo(({
                   </span>
                 </div>
 
-                {(showEma9 || showEma20 || showVwap || showEma50 || showEma200) && (
+                {(showEma9 || showEma21 || showVwap || showEma50 || showEma200) && (
                   <>
                     <span className="text-slate-800">|</span>
                     <div className="flex items-center gap-2 text-[10.5px]">
                       {showEma9 && activeCandle.ema9 !== undefined && (
                         <span className="text-slate-500">
-                          EMA9 <span className="text-[#00d2d3] font-medium">{(activeCandle.ema9 * exchangeRate).toFixed(markPrice >= 100 ? 1 : 3)}</span>
+                          EMA9 <span className="text-[#3b82f6] font-medium">{(activeCandle.ema9 * exchangeRate).toFixed(markPrice >= 100 ? 1 : 3)}</span>
                         </span>
                       )}
-                      {showEma20 && activeCandle.ema20 !== undefined && (
+                      {showEma21 && activeCandle.ema21 !== undefined && (
                         <span className="text-slate-500">
-                          EMA20 <span className="text-[#f59e0b] font-medium">{(activeCandle.ema20 * exchangeRate).toFixed(markPrice >= 100 ? 1 : 3)}</span>
+                          EMA21 <span className="text-[#f97316] font-medium">{(activeCandle.ema21 * exchangeRate).toFixed(markPrice >= 100 ? 1 : 3)}</span>
                         </span>
                       )}
                       {showVwap && activeCandle.vwap !== undefined && (
@@ -3486,7 +3535,7 @@ export const InteractiveChart: React.FC<InteractiveChartProps> = React.memo(({
             {showEma9 && (
               <polyline
                 fill="none"
-                stroke="#00d2d3"
+                stroke="#3b82f6"
                 strokeWidth="1.5"
                 points={visibleCandles
                   .filter((c) => c.ema9)
@@ -3495,15 +3544,15 @@ export const InteractiveChart: React.FC<InteractiveChartProps> = React.memo(({
               />
             )}
 
-            {/* EMA 20 */}
-            {showEma20 && (
+            {/* EMA 21 */}
+            {showEma21 && (
               <polyline
                 fill="none"
-                stroke="#f59e0b"
+                stroke="#f97316"
                 strokeWidth="1.5"
                 points={visibleCandles
-                  .filter((c) => c.ema20)
-                  .map((c, i) => `${i * candleWidth + candleWidth / 2},${getY(c.ema20!)}`)
+                  .filter((c) => c.ema21)
+                  .map((c, i) => `${i * candleWidth + candleWidth / 2},${getY(c.ema21!)}`)
                   .join(' ')}
               />
             )}

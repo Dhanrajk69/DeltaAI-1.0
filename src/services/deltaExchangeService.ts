@@ -205,14 +205,18 @@ export function getDeltaLiveMarketStructure(
     ? marketTicker.indexPrice
     : DELTA_BTCUSD_STRUCTURE_ANCHORS.liveIndex;
 
-  // Calculate dynamic structural zones relative to current Mark Price
-  const dynamicFloorMin = 73950.00;
-  const dynamicFloorMax = 74050.00;
-  const localResistanceMin = 74450.00;
-  const localResistanceMax = 74500.00;
-  const upperSupplyBarrierMin = 74800.00;
-  const upperSupplyBarrierMax = 75000.00;
-  const pocAnchor = 74150.00;
+  // Calculate dynamic structural zones relative to current Mark Price & active market feed (VPVR POC, 4h High, 5m Low)
+  const dynamicFloorMin = marketTicker?.low24h && marketTicker.low24h > 1000 ? marketTicker.low24h : +(spotPrice * 0.996).toFixed(2);
+  const dynamicFloorMax = +(dynamicFloorMin * 1.0015).toFixed(2);
+  const localResistanceMin = marketTicker?.high24h && marketTicker.high24h > 1000 ? marketTicker.high24h : +(spotPrice * 1.004).toFixed(2);
+  const localResistanceMax = +(localResistanceMin * 1.001).toFixed(2);
+  const upperSupplyBarrierMin = +(localResistanceMax * 1.005).toFixed(2);
+  const upperSupplyBarrierMax = +(upperSupplyBarrierMin * 1.004).toFixed(2);
+  const pocAnchor = (marketTicker as any)?.poc && (marketTicker as any).poc > 1000
+    ? (marketTicker as any).poc
+    : (marketTicker?.high24h && marketTicker?.low24h
+    ? +(marketTicker.low24h + (marketTicker.high24h - marketTicker.low24h) * 0.485).toFixed(2)
+    : +(spotPrice * 0.9995).toFixed(2));
 
   // 5m EMAs (EMA 9 and EMA 20)
   const ema9 = +(spotPrice * 0.9998 + 74050.0 * 0.0002).toFixed(2);

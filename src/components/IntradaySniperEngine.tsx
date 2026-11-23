@@ -3,7 +3,7 @@ import { computeCamarillaLevels, formatCamarillaPrice } from '../utils/camarilla
 import { computeDailyFibonacciLevels } from '../utils/fibonacciUtils';
 import { getDailySessionAnchor } from '../utils/dailyAnchorUtils';
 import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
-import { MarketTicker, TradingMode, SniperSignal, SniperActiveTrade, SniperLogEntry, SniperExposureMode, SniperScalpTier, AiAnalysisResult, SniperExecutionTriggerMode } from '../types';
+import { MarketTicker, TradingMode, SniperSignal, SniperActiveTrade, SniperLogEntry, SniperExposureMode, SniperScalpTier, AiAnalysisResult, SniperExecutionTriggerMode, SniperStrategyMode } from '../types';
 import { CamarillaPriceGauge } from './CamarillaPriceGauge';
 import { ProfitLadderDashdark } from './ProfitLadderDashdark';
 import { useAiMatrixCorrelation, evaluateLockedSignalValidity } from '../context/AiMatrixCorrelationContext';
@@ -95,6 +95,22 @@ interface IntradaySniperEngineProps {
   harvestTargetHit?: boolean;
   cycleWindowRemaining?: string;
   isTransitionWindow?: boolean;
+  manualLotSize?: number | null;
+  setManualLotSize?: (lot: number | null) => void;
+  pendingLimitOrder?: {
+    orderId?: string;
+    symbol: string;
+    side: 'LONG' | 'SHORT';
+    limitPrice: number;
+    lotSize: number;
+    contracts: number;
+    placedAtMs: number;
+    expiresAtMs: number;
+    mode: TradingMode;
+  } | null;
+  onCancelPendingLimitOrder?: () => void;
+  sniperStrategyMode?: SniperStrategyMode;
+  setSniperStrategyMode?: (mode: SniperStrategyMode) => void;
 }
 
 const LiveFiveMinCountdown: React.FC = React.memo(() => {
@@ -231,7 +247,14 @@ export const IntradaySniperEngine: React.FC<IntradaySniperEngineProps> = React.m
   harvestTargetHit = false,
   cycleWindowRemaining = '30m 00s',
   isTransitionWindow = false,
+  manualLotSize,
+  setManualLotSize,
+  pendingLimitOrder,
+  onCancelPendingLimitOrder,
+  sniperStrategyMode = 'UNIFIED_MTF_PULLBACK',
+  setSniperStrategyMode,
 }) => {
+  const isEma921Mode = (sniperStrategyMode || currentSignal.sniperStrategyMode) === 'EMA_9_21_MOMENTUM_5M';
   const isPaper = tradingMode === 'PAPER';
   const isBypassActive = Boolean(isPaper && (bypassHtfFilter || currentSignal.riskChecks.bypassActive));
   const isLiveUnverified = tradingMode === 'LIVE' && !isLiveApiAuthenticated;
@@ -403,14 +426,18 @@ export const IntradaySniperEngine: React.FC<IntradaySniperEngineProps> = React.m
   const isMicro50 = activeScalpTier === 'TIER_50' || effectiveExposureMode === 'MICRO_50';
   const isMicroScalp = isMicro15 || isMicro50;
 
+  const calculatedRiskLotSize = currentSignal.lotSize > 0 ? currentSignal.lotSize : defaultLotSize;
   const effectiveLotSize = isTradeForSelected && activeTrade
     ? activeTrade.lotSize
-    : currentSignal.lotSize > 0
-    ? currentSignal.lotSize
-    : defaultLotSize;
+    : typeof manualLotSize === 'number' && manualLotSize > 0
+    ? manualLotSize
+    : calculatedRiskLotSize;
   const effectiveContractsCount =
-    currentSignal.contractsCount ?? getContractsCount(selectedSymbol, effectiveLotSize);
+    typeof manualLotSize === 'number' && manualLotSize > 0
+      ? getContractsCount(selectedSymbol, effectiveLotSize)
+      : (currentSignal.contractsCount ?? getContractsCount(selectedSymbol, effectiveLotSize));
   const cleanSymbolBase = selectedSymbol.replace('USDT', '').replace('USD', '') || 'BTC';
+  const lotStep = selectedSymbol.startsWith('BTC') ? 0.001 : selectedSymbol.startsWith('ETH') ? 0.01 : 0.1;
 
   const deltaPrice = (isMicro15 ? 15 : 50) / Math.max(0.001, effectiveLotSize);
 
@@ -547,6 +574,7 @@ export const IntradaySniperEngine: React.FC<IntradaySniperEngineProps> = React.m
     currentSignal.isNarrow5mCprAutoRouted
   );
   const isWideCprBlocked = Boolean(
+    !isEma921Mode &&
     currentSignal.camarilla?.isWideCpr &&
     !narrowCprOverrideActive &&
     !isBypassActive
@@ -557,9 +585,14 @@ export const IntradaySniperEngine: React.FC<IntradaySniperEngineProps> = React.m
     !isBypassActive &&
     !currentSignal.riskChecks.signalValidationPassed
   );
+  const isNoTradeRegime = isEma921Mode
+    ? Boolean(currentSignal.ema921Cross && !currentSignal.ema921Cross.filtersPassed && !isBypassActive)
+    : Boolean(currentSignal.regimeRouter?.isNoTrade && !isBypassActive);
+  const isUtcCapBlocked = (currentSignal.utcDayTradesCount ?? 0) >= 3 && !isBypassActive;
+  const isPostSlBarsBlocked = (currentSignal.postSlCooldownBarsRemaining ?? 0) > 0 && !isBypassActive;
   const isHardBlocked = Boolean(
     !isTradeForSelected &&
-    (isLiveUnverified || isOverdue || isInvalidated || isWideCprBlocked || isGate1Fail || isMarginCapBlocked || isAntiChopBlocked)
+    (isLiveUnverified || isOverdue || isInvalidated || isNoTradeRegime || isUtcCapBlocked || isPostSlBarsBlocked || isWideCprBlocked || isGate1Fail || isMarginCapBlocked || isAntiChopBlocked)
   );
   const isExecutionBlocked = Boolean(
     !isTradeForSelected &&
@@ -570,14 +603,22 @@ export const IntradaySniperEngine: React.FC<IntradaySniperEngineProps> = React.m
     ? activeSignalValidity.breachType === 'SL_INVALIDATED'
       ? 'INVALIDATED (SL HIT)'
       : 'COMPLETED (TP HIT)'
+    : isNoTradeRegime
+    ? isEma921Mode
+      ? '5M EMA 9/21 FILTER'
+      : 'NO TRADE (CHOP / LOW VOLATILITY)'
+    : isUtcCapBlocked
+    ? 'UTC CAP REACHED (3/3)'
+    : isPostSlBarsBlocked
+    ? `POST-SL COOLDOWN (${currentSignal.postSlCooldownBarsRemaining}B)`
     : isOverdueOnly
     ? 'BLOCKED (OVERDUE)'
     : isMarginCapBlocked
     ? 'BLOCKED (MARGIN >= 65%)'
     : isAntiChopBlocked
     ? (currentSignal.riskChecks?.microSlCooldownRemainingSec ?? 0) > 0
-      ? 'COOLDOWN (10M POST-SL)'
-      : 'CAP REACHED (3/HR MICRO)'
+      ? 'COOLDOWN (POST-SL)'
+      : 'CAP REACHED'
     : isWideCprBlocked
     ? 'BLOCKED (WIDE CPR CHOP)'
     : isGate1Fail
@@ -588,14 +629,22 @@ export const IntradaySniperEngine: React.FC<IntradaySniperEngineProps> = React.m
     ? activeSignalValidity.breachType === 'SL_INVALIDATED'
       ? 'EXECUTION PAUSED · SL INVALIDATED (REFRESH)'
       : 'EXECUTION PAUSED · TARGET COMPLETED (REFRESH)'
+    : isNoTradeRegime
+    ? isEma921Mode
+      ? 'NO TRADE · 5M EMA 9/21 CHOP FILTER ACTIVE'
+      : 'NO TRADE (CHOP / LOW VOLATILITY)'
+    : isUtcCapBlocked
+    ? 'DAILY UTC LIMIT REACHED (3/3 TRADES)'
+    : isPostSlBarsBlocked
+    ? `POST-SL COOLDOWN (${currentSignal.postSlCooldownBarsRemaining} BARS REMAINING)`
     : isOverdueOnly
     ? 'EXECUTION PAUSED · SIGNAL OVERDUE (REFRESH)'
     : isMarginCapBlocked
     ? 'EXECUTION PAUSED · ACCOUNT MARGIN >= 65%'
     : isAntiChopBlocked
     ? (currentSignal.riskChecks?.microSlCooldownRemainingSec ?? 0) > 0
-      ? `ANTI-CHOP · 10M SL COOLDOWN (${Math.ceil((currentSignal.riskChecks?.microSlCooldownRemainingSec ?? 0) / 60)}m)`
-      : 'ANTI-CHOP · 3/HR MICRO CAP REACHED'
+      ? `ANTI-CHOP · POST-SL COOLDOWN (${Math.ceil((currentSignal.riskChecks?.microSlCooldownRemainingSec ?? 0) / 60)}m)`
+      : 'ANTI-CHOP · CAP REACHED'
     : isWideCprBlocked
     ? 'EXECUTION PAUSED · WIDE CPR CHOP FILTER'
     : isGate1Fail
@@ -606,12 +655,20 @@ export const IntradaySniperEngine: React.FC<IntradaySniperEngineProps> = React.m
     ? activeSignalValidity.breachType === 'SL_INVALIDATED'
       ? 'SL HIT · SETUP INVALIDATED'
       : 'TP REACHED · SETUP COMPLETED'
+    : isNoTradeRegime
+    ? isEma921Mode
+      ? 'NO TRADE (5M EMA 9/21 FILTER)'
+      : 'NO TRADE (CHOP / LOW VOLATILITY)'
+    : isUtcCapBlocked
+    ? 'BLOCKED · 3/3 UTC DAILY LIMIT'
+    : isPostSlBarsBlocked
+    ? 'BLOCKED · 3-BAR POST-SL COOLDOWN'
     : isOverdueOnly
     ? 'SIGNAL OVERDUE · REFRESH SETUP'
     : isMarginCapBlocked
     ? 'BLOCKED · MARGIN UTILIZATION >= 65%'
     : isAntiChopBlocked
-    ? 'BLOCKED · MICRO ANTI-CHOP GUARD'
+    ? 'BLOCKED · ANTI-CHOP GUARD'
     : isWideCprBlocked
     ? 'BLOCKED · WIDE CPR CHOP FILTER'
     : isGate1Fail
@@ -1019,12 +1076,12 @@ export const IntradaySniperEngine: React.FC<IntradaySniperEngineProps> = React.m
               </div>
             </div>
             <div className="min-w-0">
-              <div className="flex items-center gap-1.5 flex-wrap min-w-0">
+              <div className="flex items-center gap-2 flex-wrap min-w-0">
                 <span className="panel-delta-title" title="Sniper Execution Control">
-                  Sniper Execution Control
+                  Perpetuals Execution Control
                 </span>
-                <span className={`badge-delta font-mono-numbers ${isPaper ? 'badge-delta-paper' : 'badge-delta-live'}`}>
-                  {tradingMode}
+                <span className="text-[11px] font-mono-numbers text-slate-400">
+                  · {tradingMode} · {isEma921Mode ? '5m EMA 9/21 Momentum (100pt Scalp)' : '15m Post-Only Maker'}
                 </span>
                 <SignalFreshnessHeaderBadge
                   effectiveSignalTimestamp={effectiveSignalTimestamp}
@@ -1034,14 +1091,39 @@ export const IntradaySniperEngine: React.FC<IntradaySniperEngineProps> = React.m
                   onRefresh={handleRefreshSignalAction}
                 />
               </div>
-              <div className="text-[10px] text-slate-400 font-mono-numbers mt-0.5 break-words">
-                INR/USD ₹{liveUsdInrRate.toFixed(2)} · H4/L4 Breakout Auto-Pilot
+              <div className="text-[10px] text-slate-400 font-mono-numbers mt-0.5 break-words tabular-nums">
+                INR/USD ₹{liveUsdInrRate.toFixed(2)} · {isEma921Mode ? '5m Cross + 15m EMA50 + VWAP + ADX≥20' : '4H+1H+15M Regime Router'} · UTC Trades {currentSignal.utcDayTradesCount ?? 0}/3
               </div>
             </div>
           </div>
 
-          {/* Right Controls: Signal Direction + Bypass Toggle + Exposure Mode + Instrument + Timeframe + Auto-Pilot */}
+          {/* Right Controls: Strategy Switcher + Signal Direction + Bypass Toggle + Instrument + Timeframe + Auto-Pilot */}
           <div className="flex flex-wrap items-center gap-1.5 text-xs min-w-0 max-w-full">
+            {setSniperStrategyMode && (
+              <div className="inline-flex flex-wrap items-center p-1 bg-slate-900/90 border border-slate-800/80 rounded-lg text-xs gap-1 max-w-full">
+                <span className="text-slate-400 px-1.5 text-[10px] uppercase font-bold">Mode:</span>
+                <button
+                  type="button"
+                  onClick={() => setSniperStrategyMode('UNIFIED_MTF_PULLBACK')}
+                  className={`btn-delta-sm ${!isEma921Mode ? 'btn-toggle-active' : 'btn-secondary'}`}
+                  title="4H+1H+15M Multi-Timeframe Pullback + Post-Only Limit"
+                >
+                  <span>15m MTF Pullback</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setSniperStrategyMode('EMA_9_21_MOMENTUM_5M');
+                    setSelectedTimeframe('5m');
+                  }}
+                  className={`btn-delta-sm ${isEma921Mode ? 'btn-toggle-active' : 'btn-secondary'}`}
+                  title="5m EMA 9/21 Momentum Cross (60% @ +100pt 0.0236% Maker, Entry±$35 BE, 40% 5m EMA21 Trail -> +220pt)"
+                >
+                  <Zap className="w-3 h-3" />
+                  <span>5m EMA 9/21 Cross</span>
+                </button>
+              </div>
+            )}
             {/* Signal Direction Selector */}
             {setDirectionMode && (
               <div className="inline-flex flex-wrap items-center p-1 bg-slate-900/90 border border-slate-800/80 rounded-lg text-xs gap-1 max-w-full">
@@ -1059,7 +1141,7 @@ export const IntradaySniperEngine: React.FC<IntradaySniperEngineProps> = React.m
                   type="button"
                   onClick={() => setDirectionMode('LONG')}
                   className={`btn-delta-sm ${directionMode === 'LONG' ? 'btn-primary' : 'btn-secondary'}`}
-                  title="LONG: Force bullish breakout mode targeting H5/H6 ladder"
+                  title="LONG: Force bullish setup"
                 >
                   <ArrowUp className="w-3.5 h-3.5" />
                   <span>LONG</span>
@@ -1068,7 +1150,7 @@ export const IntradaySniperEngine: React.FC<IntradaySniperEngineProps> = React.m
                   type="button"
                   onClick={() => setDirectionMode('SHORT')}
                   className={`btn-delta-sm ${directionMode === 'SHORT' ? 'btn-danger' : 'btn-secondary'}`}
-                  title="SHORT: Force bearish breakdown mode targeting L5/L6 ladder"
+                  title="SHORT: Force bearish setup"
                 >
                   <ArrowDown className="w-3.5 h-3.5" />
                   <span>SHORT</span>
@@ -1103,50 +1185,8 @@ export const IntradaySniperEngine: React.FC<IntradaySniperEngineProps> = React.m
                   />
                 </div>
                 <span>Bypass HTF / VWAP (Paper)</span>
-                {isBypassActive && (
-                  <span className="badge-delta badge-delta-paper">
-                    ON
-                  </span>
-                )}
               </label>
             )}
-
-            {/* Exposure Mode & Scalp Tier Switch */}
-            <div className="inline-flex flex-wrap items-center p-1 bg-slate-900/90 border border-slate-800/80 rounded-lg gap-1 font-mono-numbers max-w-full">
-              <button
-                type="button"
-                onClick={() => {
-                  handleSetExposureMode('MICRO_50');
-                  if (propSetScalpTier) propSetScalpTier('TIER_50');
-                }}
-                className={`btn-delta-sm ${isMicro50 && !isMicro15 ? 'btn-toggle-active' : 'btn-secondary'}`}
-                title="Tier 1: Standard Sniper ($50 Max Risk) — 0.05-0.10 BTC sizing, TP1–TP4 +$25/+$50/+$100/+$150"
-              >
-                <Crosshair className="w-3 h-3" />
-                <span>$50 STANDARD</span>
-              </button>
-              <button
-                type="button"
-                onClick={() => {
-                  handleSetExposureMode('MICRO_15');
-                  if (propSetScalpTier) propSetScalpTier('TIER_15');
-                }}
-                className={`btn-delta-sm ${isMicro15 ? 'btn-toggle-active' : 'btn-secondary'}`}
-                title="Tier 2: Micro Sniper ($15 Max Risk) — Ultra-tight micro scalp (0.01-0.02 BTC), TP1–TP4 +$7.50/+$15/+$30/+$45"
-              >
-                <Zap className="w-3 h-3 text-amber-300" />
-                <span>$15 MICRO</span>
-              </button>
-              <button
-                type="button"
-                onClick={() => handleSetExposureMode('MACRO')}
-                className={`btn-delta-sm ${!isMicroScalp ? 'btn-toggle-active' : 'btn-secondary'}`}
-                title="Institutional Macro: Full sizing with H5/H6 & L5/L6 targets"
-              >
-                <Landmark className="w-3 h-3" />
-                <span>MACRO</span>
-              </button>
-            </div>
 
             {/* Instrument Selector */}
             <div className="flex items-center gap-1.5 bg-slate-900/90 border border-slate-800/80 rounded-lg px-2.5 h-7">
@@ -1822,73 +1862,121 @@ export const IntradaySniperEngine: React.FC<IntradaySniperEngineProps> = React.m
           <div className="space-y-2.5 font-mono-numbers min-w-0">
             {/* Header */}
             <div className="flex flex-wrap items-center justify-between gap-1.5 pb-2 border-b border-slate-800/80 min-w-0">
-              <div className="flex items-center gap-1.5 flex-wrap min-w-0">
+              <div className="flex items-center gap-2 flex-wrap min-w-0">
                 <Crosshair className="w-4 h-4 text-cyan-400 shrink-0" />
                 <h2 className="panel-delta-title">
                   Execution Cockpit
                 </h2>
-                <span className={`badge-delta ${
-                  isMicro15 ? 'badge-delta-paper' : isMicro50 ? 'badge-delta-armed' : 'badge-delta-standby'
-                }`}>
-                  {isMicro15 ? (
-                    <>
-                      <Zap className="w-2.5 h-2.5" />
-                      <span>TIER: $15 MICRO</span>
-                    </>
-                  ) : isMicro50 ? (
-                    <>
-                      <Crosshair className="w-2.5 h-2.5" />
-                      <span>TIER: $50 STANDARD</span>
-                    </>
-                  ) : (
-                    <>
-                      <Landmark className="w-2.5 h-2.5" />
-                      <span>MACRO</span>
-                    </>
-                  )}
+                <span className="text-[10px] text-slate-400 font-mono-numbers">
+                  · UTC {currentSignal.utcDayTradesCount ?? 0}/3
+                  {(currentSignal.postSlCooldownBarsRemaining ?? 0) > 0
+                    ? ` · Cooldown ${currentSignal.postSlCooldownBarsRemaining}b`
+                    : ''}
+                  {isTradeForSelected && activeTrade?.adoptedFromExchange ? ' · Exchange Synced' : ''}
                 </span>
-                {isTradeForSelected && activeTrade?.adoptedFromExchange && (
-                  <span className="badge-delta badge-delta-live" title="Hydrated & synced live with Delta Exchange India perpetual position">
-                    EXCHANGE SYNCED
-                  </span>
-                )}
               </div>
-              <div className="flex items-center gap-1.5 flex-wrap">
+              <div className="flex items-center gap-2 flex-wrap text-[10px] font-mono-numbers text-slate-400">
                 {setExecutionTriggerMode && (
                   <button
                     type="button"
                     onClick={() => setExecutionTriggerMode(executionTriggerMode === 'IMMEDIATE_TOUCH' ? 'CANDLE_CLOSE' : 'IMMEDIATE_TOUCH')}
                     className={`btn-delta-sm ${executionTriggerMode === 'IMMEDIATE_TOUCH' ? 'btn-secondary' : 'btn-toggle-active'}`}
-                    title="Toggle between Immediate Touch (disarms anti-wick lock) and 5m Close Guard"
+                    title="Toggle between Immediate Touch and 15m Close Confirmation"
                   >
                     <Clock className="w-3 h-3" />
-                    <span>{executionTriggerMode === 'IMMEDIATE_TOUCH' ? 'Immediate Touch' : '5m Close Guard'}</span>
+                    <span>{executionTriggerMode === 'IMMEDIATE_TOUCH' ? 'Immediate Touch' : 'Bar Close Guard'}</span>
                   </button>
                 )}
-                <span className={`badge-delta ${
-                  currentSignal.confidenceStatus === 'Ultra Strong' || currentSignal.confidenceStatus === 'Strong'
-                    ? 'badge-delta-live'
-                    : currentSignal.confidenceStatus === 'Confluence Active'
-                    ? 'badge-delta-armed'
-                    : currentSignal.confidenceStatus === 'No Trade'
-                    ? 'badge-delta-danger'
-                    : 'badge-delta-paper'
-                }`}>
-                  {currentSignal.confidenceStatus.toUpperCase()}
-                </span>
-                <span
-                  className={`badge-delta ${
-                    activeSignalValidity.status === 'OVERDUE'
-                      ? 'badge-delta-danger animate-pulse'
-                      : activeSignalValidity.status === 'AGING'
-                      ? 'badge-delta-paper'
-                      : 'badge-delta-live'
-                  }`}
-                >
-                  {activeSignalValidity.status} · Gen {signalGenTimeFormatted}
-                </span>
+                <span>Gen {signalGenTimeFormatted}</span>
               </div>
             </div>
+
+            {/* Strategy Status Card: 5m EMA 9/21 Momentum Cross OR Unified MTF Regime Router */}
+            {isEma921Mode ? (
+              <div
+                className={`p-2 rounded border text-[10.5px] font-mono-numbers ${
+                  currentSignal.ema921Cross?.filtersPassed
+                    ? 'bg-emerald-950/40 border-emerald-500/40 text-emerald-200'
+                    : 'bg-amber-950/50 border-amber-500/40 text-amber-200'
+                }`}
+              >
+                <div className="flex flex-wrap items-center justify-between gap-1.5">
+                  <span className="font-bold tracking-wide">
+                    {currentSignal.ema921Cross?.filtersPassed
+                      ? `5M EMA 9/21 ${currentSignal.ema921Cross.crossDirection} CROSSOVER CONFIRMED`
+                      : '5M EMA 9/21 MOMENTUM CROSS · AWAITING FILTERED CROSS'}
+                  </span>
+                  {currentSignal.ema921Cross && (
+                    <span className="text-[10px] text-slate-300 tabular-nums">
+                      ADX {currentSignal.ema921Cross.adx14_5m.toFixed(1)} · ATR5m ${currentSignal.ema921Cross.atr14_5m.toFixed(1)} · 60%@+100pt / 40%→+220pt
+                    </span>
+                  )}
+                </div>
+                {currentSignal.ema921Cross && !currentSignal.ema921Cross.filtersPassed && currentSignal.ema921Cross.rejectionReasons.length > 0 && (
+                  <div className="text-[10px] text-amber-300/85 mt-0.5">
+                    {currentSignal.ema921Cross.rejectionReasons.join(' · ')}
+                  </div>
+                )}
+              </div>
+            ) : (
+              <div
+                className={`p-2 rounded border text-[10.5px] font-mono-numbers ${
+                  currentSignal.regimeRouter?.isNoTrade
+                    ? 'bg-amber-950/50 border-amber-500/40 text-amber-200'
+                    : currentSignal.regimeRouter?.routeDestination === 'OPTIONS_DEBIT_SPREAD'
+                    ? 'bg-cyan-950/40 border-cyan-500/40 text-cyan-200'
+                    : 'bg-slate-950/80 border-slate-800 text-slate-200'
+                }`}
+              >
+                <div className="flex flex-wrap items-center justify-between gap-1.5">
+                  <span className="font-bold tracking-wide">
+                    {currentSignal.regimeStatusLabel ||
+                      (currentSignal.regimeRouter?.isNoTrade
+                        ? 'NO TRADE (CHOP / LOW VOLATILITY)'
+                        : '4H + 1H + 15M UNIFIED ROUTER ACTIVE')}
+                  </span>
+                  {currentSignal.regimeRouter && (
+                    <span className="text-[10px] text-slate-400 tabular-nums">
+                      ADX {currentSignal.regimeRouter.adx14_15m.toFixed(1)} · ATR {currentSignal.regimeRouter.atrPct_15m.toFixed(2)}% · CPR P{Math.round(currentSignal.regimeRouter.cprPercentile)}
+                    </span>
+                  )}
+                </div>
+                {currentSignal.regimeRouter?.isNoTrade && currentSignal.regimeRouter.noTradeReasons.length > 0 && (
+                  <div className="text-[10px] text-amber-300/80 mt-0.5">
+                    {currentSignal.regimeRouter.noTradeReasons.join(' · ')}
+                  </div>
+                )}
+                {currentSignal.regimeRouter && !currentSignal.regimeRouter.isNoTrade && currentSignal.regimeRouter.routeDestination === 'OPTIONS_DEBIT_SPREAD' && (
+                  <div className="text-[10px] text-cyan-300/90 mt-0.5">
+                    High Volatility / Wide CPR ({'>='}80th pct): Recommended Options Lab {currentSignal.regimeRouter.recommendedOptionsStrategy}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Resting Post-Only Maker Limit Order Banner (Auto-cancels after 3 bars / 45m) */}
+            {pendingLimitOrder && !isTradeForSelected && (
+              <div className="p-2 rounded bg-cyan-950/40 border border-cyan-500/40 text-[10.5px] font-mono-numbers flex items-center justify-between gap-2">
+                <div className="min-w-0">
+                  <div className="font-bold text-cyan-200 truncate">
+                    POST-ONLY LIMIT WORKING · {pendingLimitOrder.side} {pendingLimitOrder.lotSize.toFixed(3)} {cleanSymbolBase} @ ${fmtPrice(pendingLimitOrder.limitPrice)}
+                  </div>
+                  <div className="text-[10px] text-slate-400 tabular-nums">
+                    15m EMA 20 / VWAP Maker Zone · Auto-cancels in{' '}
+                    {Math.max(1, Math.ceil((pendingLimitOrder.expiresAtMs - Date.now()) / 60000))}m (3-bar TTL)
+                  </div>
+                </div>
+                {onCancelPendingLimitOrder && (
+                  <button
+                    type="button"
+                    onClick={onCancelPendingLimitOrder}
+                    className="btn-delta-sm btn-danger shrink-0"
+                  >
+                    Cancel Limit
+                  </button>
+                )}
+              </div>
+            )}
 
             {/* Signal & Conviction Row */}
             <div className="grid grid-cols-2 gap-2 text-xs">
@@ -1906,40 +1994,63 @@ export const IntradaySniperEngine: React.FC<IntradaySniperEngineProps> = React.m
                   )}
                 </div>
                 <span className="text-[9px] text-cyan-400/90 font-mono-numbers mt-0.5 block">
-                  Breakout Level: {isShort ? '<= L4' : '>= H4'}
+                  {isEma921Mode ? '5m Closed Bar EMA 9/21 Cross' : '15m EMA 20 / VWAP Retest (Post-Only)'}
                 </span>
               </div>
 
               <div className="p-2.5 bg-slate-950/80 rounded border border-slate-800">
-                <span className="text-slate-400 text-[10px] uppercase tracking-wider block">AI Confidence</span>
+                <span className="text-slate-400 text-[10px] uppercase tracking-wider block">Regime Bias</span>
                 <div className="flex items-baseline gap-1 mt-0.5">
-                  <span className="text-emerald-400 font-bold text-sm">{currentSignal.confidence}%</span>
+                  <span className="text-emerald-400 font-bold text-sm tabular-nums">{currentSignal.confidence}%</span>
                   <span className="text-[10px] text-slate-400">({currentSignal.confidenceStatus})</span>
                 </div>
-                <span className="text-[9px] text-emerald-400/80 font-mono-numbers mt-0.5 block">
-                  AI Consensus Pass
+                <span className="text-[9px] text-slate-400 font-mono-numbers mt-0.5 block">
+                  {isEma921Mode ? '5m EMA21 Slope · VWAP · 15m EMA50' : '4H EMA20/50 · 1H EMA50 & VWAP'}
                 </span>
               </div>
             </div>
 
-            {/* Sizing, Leverage & R:R */}
+            {/* Sizing (Direct Manual Lot Input + Risk Management), Leverage & R:R */}
             <div className="grid grid-cols-3 gap-2 text-xs">
               <div className="p-2 bg-slate-950/80 rounded border border-slate-800">
-                <span className="text-slate-400 text-[9.5px] uppercase block">Lot Size</span>
-                <div className="mt-0.5 text-white font-bold text-xs truncate">
-                  {effectiveLotSize.toFixed(3)} {cleanSymbolBase}
+                <div className="flex items-center justify-between gap-1">
+                  <span className="text-slate-400 text-[9.5px] uppercase">Lot Size ({cleanSymbolBase})</span>
+                  {typeof manualLotSize === 'number' && manualLotSize > 0 && setManualLotSize && !isTradeForSelected && (
+                    <button
+                      type="button"
+                      onClick={() => setManualLotSize(null)}
+                      className="text-[9px] text-cyan-400 hover:text-cyan-300 underline cursor-pointer"
+                      title="Reset to Risk Management calculated lot size"
+                    >
+                      Auto
+                    </button>
+                  )}
                 </div>
-                <span
-                  className="text-[9px] block truncate text-cyan-400"
-                  title={`${effectiveContractsCount} Delta Exchange contracts`}
-                >
-                  {effectiveContractsCount} cts · Risk-Scaled
+                <div className="mt-1 flex items-center gap-1">
+                  <input
+                    type="number"
+                    min={lotStep}
+                    step={lotStep}
+                    disabled={isTradeForSelected}
+                    value={Number.isFinite(effectiveLotSize) ? effectiveLotSize : lotStep}
+                    onChange={(e) => {
+                      const val = parseFloat(e.target.value);
+                      if (setManualLotSize) {
+                        setManualLotSize(Number.isFinite(val) && val > 0 ? val : null);
+                      }
+                    }}
+                    aria-label="Manual Lot Size"
+                    className="w-full bg-slate-900 border border-slate-700 focus:border-cyan-400 rounded px-1.5 py-0.5 text-white font-bold text-xs tabular-nums focus:outline-none disabled:opacity-60"
+                  />
+                </div>
+                <span className="text-[9px] block truncate text-cyan-400 mt-0.5 tabular-nums">
+                  {effectiveContractsCount} cts · {typeof manualLotSize === 'number' && manualLotSize > 0 ? 'Manual' : `Risk ${maxRiskPerTradePct}%`}
                 </span>
               </div>
 
               <div className="p-2 bg-slate-950/80 rounded border border-slate-800">
                 <span className="text-slate-400 text-[9.5px] uppercase block">Leverage</span>
-                <div className="mt-0.5 text-white font-bold text-xs truncate">
+                <div className="mt-0.5 text-white font-bold text-xs truncate tabular-nums">
                   {Math.min(currentSignal.leverage || 10, maxLeverageCap)}x
                 </div>
                 <span className="text-[9px] text-cyan-400 block truncate">
@@ -1948,12 +2059,12 @@ export const IntradaySniperEngine: React.FC<IntradaySniperEngineProps> = React.m
               </div>
 
               <div className="p-2 bg-slate-950/80 rounded border border-slate-800">
-                <span className="text-slate-400 text-[9.5px] uppercase block">R:R Ratio</span>
-                <div className="mt-0.5 text-emerald-400 font-bold text-xs truncate">
-                  {currentSignal.riskRewardRatio || `1 : ${currentSignal.riskRewardNumeric || 3.8}`}
+                <span className="text-slate-400 text-[9.5px] uppercase block">R:R Target</span>
+                <div className="mt-0.5 text-emerald-400 font-bold text-xs truncate tabular-nums">
+                  {currentSignal.riskRewardRatio || `1 : ${currentSignal.riskRewardNumeric || 2.85}`}
                 </div>
-                <span className="text-[9px] text-slate-500 block truncate">
-                  Asymmetric
+                <span className="text-[9px] text-slate-400 block truncate">
+                  {isEma921Mode ? '60%@+100pt · 40%→+220pt' : '2.50R–3.25R Trail'}
                 </span>
               </div>
             </div>
@@ -1963,13 +2074,13 @@ export const IntradaySniperEngine: React.FC<IntradaySniperEngineProps> = React.m
               <div className="p-2.5 bg-slate-950/80 rounded border border-slate-800">
                 <div className="flex items-center justify-between">
                   <span className="text-slate-400 text-[10px] uppercase tracking-wider">
-                    Entry Price
+                    {isEma921Mode ? '5m Cross Entry' : 'Post-Only Limit Entry'}
                   </span>
                   <span className="text-[9px] text-cyan-400 font-bold">
-                    {isShort ? '<= L4' : '>= H4'}
+                    {isEma921Mode ? '0.0236% TP Maker' : '0.02% Maker'}
                   </span>
                 </div>
-                <span className={`font-bold text-sm block mt-0.5 ${isTargetsHydrated ? 'text-white' : 'text-slate-500'}`}>
+                <span className={`font-bold text-sm block mt-0.5 tabular-nums ${isTargetsHydrated ? 'text-white' : 'text-slate-500'}`}>
                   {displayEntry}
                 </span>
               </div>
@@ -1979,25 +2090,21 @@ export const IntradaySniperEngine: React.FC<IntradaySniperEngineProps> = React.m
                   <span className="text-slate-400 text-[10px] uppercase tracking-wider">
                     Stop Loss
                   </span>
-                  {activeTrade?.riskStatus === 'RISK-FREE' ? (
-                    <span className="text-[9px] px-1.5 py-0.2 rounded bg-emerald-950 text-emerald-400 font-bold border border-emerald-700">
-                      BREAK-EVEN LOCK
-                    </span>
-                  ) : activeTrade?.riskStatus === 'PROFIT_LOCKED' ? (
-                    <span className="text-[9px] px-1 py-0.2 rounded bg-amber-950 text-amber-400 font-bold border border-amber-700">
-                      LOCKED @ TP2
-                    </span>
-                  ) : activeTrade?.trailingStopActive ? (
-                    <span className="text-[9px] px-1 py-0.2 rounded bg-cyan-950 text-cyan-400 font-bold border border-cyan-700">
-                      ATR TRAILING
-                    </span>
-                  ) : (
-                    <span className="text-[9px] text-rose-400 font-bold">
-                      {isShort ? '> L3' : '< H3'}
-                    </span>
-                  )}
+                  <span className={`text-[9px] font-bold ${
+                    activeTrade?.riskStatus === 'RISK-FREE' || activeTrade?.riskStatus === 'PROFIT_LOCKED'
+                      ? 'text-emerald-400'
+                      : activeTrade?.trailingStopActive
+                      ? 'text-cyan-400'
+                      : 'text-rose-400'
+                  }`}>
+                    {activeTrade?.riskStatus === 'RISK-FREE'
+                      ? (isEma921Mode ? 'ENTRY ± $35 BE' : 'FEE-ADJ BE (+1.35R)')
+                      : activeTrade?.trailingStopActive
+                      ? (isEma921Mode ? '5M EMA 21 TRAIL' : '15M EMA 20 TRAIL')
+                      : (isEma921Mode ? '1.2x 5M ATR' : '1.5x 15M ATR')}
+                  </span>
                 </div>
-                <span className={`font-bold text-sm block mt-0.5 ${
+                <span className={`font-bold text-sm block mt-0.5 tabular-nums ${
                   !isTargetsHydrated
                     ? 'text-slate-500'
                     : activeTrade?.riskStatus === 'RISK-FREE' || activeTrade?.riskStatus === 'PROFIT_LOCKED'
@@ -2078,36 +2185,65 @@ export const IntradaySniperEngine: React.FC<IntradaySniperEngineProps> = React.m
               </div>
             </div>
 
-            {/* Dual-TF $15 Micro Sniper Telemetry: Independent Slots, Margin <65%, Anti-Chop & EMA 9/20 */}
-            <div className="grid grid-cols-2 sm:grid-cols-4 gap-1.5 text-[9.5px] font-mono-numbers">
-              <div className="px-2 py-1 rounded bg-slate-950/90 border border-slate-800/90">
-                <span className="text-slate-500 block uppercase">EMA 9 / EMA 20</span>
-                <span className={`font-bold ${(currentSignal.ema9 ?? 0) >= (currentSignal.ema20 ?? 0) ? 'text-emerald-300' : 'text-rose-300'}`}>
-                  ${(currentSignal.ema9 ?? 0).toFixed(0)} / ${(currentSignal.ema20 ?? 0).toFixed(0)}
-                </span>
+            {/* Telemetry Grid: EMA 9/21 & VWAP/15m EMA50 in 5m Momentum mode OR Dual-TF CPR Telemetry */}
+            {isEma921Mode && currentSignal.ema921Cross ? (
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-1.5 text-[9.5px] font-mono-numbers">
+                <div className="px-2 py-1 rounded bg-slate-950/90 border border-slate-800/90">
+                  <span className="text-slate-500 block uppercase">5m EMA 9 / 21</span>
+                  <span className={`font-bold ${currentSignal.ema921Cross.ema9_5m >= currentSignal.ema921Cross.ema21_5m ? 'text-emerald-300' : 'text-rose-300'} tabular-nums`}>
+                    ${currentSignal.ema921Cross.ema9_5m.toFixed(0)} / ${currentSignal.ema921Cross.ema21_5m.toFixed(0)}
+                  </span>
+                </div>
+                <div className="px-2 py-1 rounded bg-slate-950/90 border border-slate-800/90">
+                  <span className="text-slate-500 block uppercase">15m EMA50 / VWAP</span>
+                  <span className={`font-bold ${currentSignal.ema921Cross.vwapAligned && currentSignal.ema921Cross.ema50Aligned ? 'text-emerald-300' : 'text-amber-300'} tabular-nums`}>
+                    ${currentSignal.ema921Cross.ema50_15m.toFixed(0)} / ${currentSignal.ema921Cross.sessionVwap.toFixed(0)}
+                  </span>
+                </div>
+                <div className="px-2 py-1 rounded bg-slate-950/90 border border-slate-800/90">
+                  <span className="text-slate-500 block uppercase">5m ADX(14) &amp; Slope</span>
+                  <span className={`font-bold ${currentSignal.ema921Cross.adx14_5m >= 20 && (currentSignal.ema921Cross.ema21SlopeUp || currentSignal.ema921Cross.ema21SlopeDown) ? 'text-emerald-300' : 'text-rose-400'} tabular-nums`}>
+                    {currentSignal.ema921Cross.adx14_5m.toFixed(1)} · {(currentSignal.ema921Cross.ema21_5m - currentSignal.ema921Cross.ema21Prev2_5m) >= 0 ? '+' : ''}{(currentSignal.ema921Cross.ema21_5m - currentSignal.ema921Cross.ema21Prev2_5m).toFixed(1)}
+                  </span>
+                </div>
+                <div className="px-2 py-1 rounded bg-slate-950/90 border border-slate-800/90">
+                  <span className="text-slate-500 block uppercase">Scalp Split / BE</span>
+                  <span className="font-bold text-cyan-300 tabular-nums">
+                    60% +100pt · ±$35 BE
+                  </span>
+                </div>
               </div>
-              <div className="px-2 py-1 rounded bg-slate-950/90 border border-slate-800/90">
-                <span className="text-slate-500 block uppercase">Parallel Slots</span>
-                <span className="font-bold text-cyan-300">
-                  Perp {currentSignal.riskChecks?.perpMicroSlotOccupied ? '1/1' : '0/1'} · Opt {currentSignal.riskChecks?.optionsSpreadSlotOccupied ? '1/1' : '0/1'}
-                </span>
+            ) : (
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-1.5 text-[9.5px] font-mono-numbers">
+                <div className="px-2 py-1 rounded bg-slate-950/90 border border-slate-800/90">
+                  <span className="text-slate-500 block uppercase">EMA 9 / EMA 21</span>
+                  <span className={`font-bold ${(currentSignal.ema9 ?? 0) >= (currentSignal.ema21 ?? currentSignal.ema20 ?? 0) ? 'text-emerald-300' : 'text-rose-300'}`}>
+                    ${(currentSignal.ema9 ?? 0).toFixed(0)} / ${(currentSignal.ema21 ?? currentSignal.ema20 ?? 0).toFixed(0)}
+                  </span>
+                </div>
+                <div className="px-2 py-1 rounded bg-slate-950/90 border border-slate-800/90">
+                  <span className="text-slate-500 block uppercase">Parallel Slots</span>
+                  <span className="font-bold text-cyan-300">
+                    Perp {currentSignal.riskChecks?.perpMicroSlotOccupied ? '1/1' : '0/1'} · Opt {currentSignal.riskChecks?.optionsSpreadSlotOccupied ? '1/1' : '0/1'}
+                  </span>
+                </div>
+                <div className="px-2 py-1 rounded bg-slate-950/90 border border-slate-800/90">
+                  <span className="text-slate-500 block uppercase">Margin Util (&lt;65%)</span>
+                  <span className={`font-bold ${(currentSignal.riskChecks?.marginUtilizationSafe ?? true) ? 'text-emerald-300' : 'text-rose-400'}`}>
+                    {(currentSignal.riskChecks?.accountMarginUtilizationPct ?? 0).toFixed(1)}% / 65%
+                  </span>
+                </div>
+                <div className="px-2 py-1 rounded bg-slate-950/90 border border-slate-800/90">
+                  <span className="text-slate-500 block uppercase">Micro Anti-Chop</span>
+                  <span className={`font-bold ${(currentSignal.riskChecks?.microAntiChopPassed ?? true) ? 'text-amber-300' : 'text-rose-400'}`}>
+                    {currentSignal.riskChecks?.microTradesLastHour ?? 0}/3 hr ·{' '}
+                    {(currentSignal.riskChecks?.microSlCooldownRemainingSec ?? 0) > 0
+                      ? `${Math.floor((currentSignal.riskChecks?.microSlCooldownRemainingSec ?? 0) / 60)}m${(currentSignal.riskChecks?.microSlCooldownRemainingSec ?? 0) % 60}s SL`
+                      : 'Ready'}
+                  </span>
+                </div>
               </div>
-              <div className="px-2 py-1 rounded bg-slate-950/90 border border-slate-800/90">
-                <span className="text-slate-500 block uppercase">Margin Util (&lt;65%)</span>
-                <span className={`font-bold ${(currentSignal.riskChecks?.marginUtilizationSafe ?? true) ? 'text-emerald-300' : 'text-rose-400'}`}>
-                  {(currentSignal.riskChecks?.accountMarginUtilizationPct ?? 0).toFixed(1)}% / 65%
-                </span>
-              </div>
-              <div className="px-2 py-1 rounded bg-slate-950/90 border border-slate-800/90">
-                <span className="text-slate-500 block uppercase">Micro Anti-Chop</span>
-                <span className={`font-bold ${(currentSignal.riskChecks?.microAntiChopPassed ?? true) ? 'text-amber-300' : 'text-rose-400'}`}>
-                  {currentSignal.riskChecks?.microTradesLastHour ?? 0}/3 hr ·{' '}
-                  {(currentSignal.riskChecks?.microSlCooldownRemainingSec ?? 0) > 0
-                    ? `${Math.floor((currentSignal.riskChecks?.microSlCooldownRemainingSec ?? 0) / 60)}m${(currentSignal.riskChecks?.microSlCooldownRemainingSec ?? 0) % 60}s SL`
-                    : 'Ready'}
-                </span>
-              </div>
-            </div>
+            )}
 
             {/* 15m Post-Stop Cooldown Active Notification */}
             {isPairInCooldown && (
@@ -2345,6 +2481,7 @@ export const IntradaySniperEngine: React.FC<IntradaySniperEngineProps> = React.m
             isShort={isShort}
             entryPrice={effectiveEntry}
             markPrice={livePrice}
+            stopLoss={effectiveStopLoss}
             tp1={effectiveTp1}
             tp2={effectiveTp2}
             tp3={effectiveTp3}
@@ -2356,6 +2493,7 @@ export const IntradaySniperEngine: React.FC<IntradaySniperEngineProps> = React.m
             symbol={selectedSymbol}
             liveUsdInrRate={liveUsdInrRate}
             currencyPrefix={currencyPrefix}
+            sniperStrategyMode={isEma921Mode ? 'EMA_9_21_MOMENTUM_5M' : 'UNIFIED_MTF_PULLBACK'}
             netBreakevenPrice={effectiveEntry > 0 ? (isShort ? effectiveEntry - (1.34 / Math.max(0.001, effectiveLotSize)) : effectiveEntry + (1.34 / Math.max(0.001, effectiveLotSize))) : undefined}
             totalFrictionUsd={1.34}
           />

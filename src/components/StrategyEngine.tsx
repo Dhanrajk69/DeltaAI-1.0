@@ -1,7 +1,7 @@
 import React, { useState, useCallback, useMemo, useEffect, useRef } from 'react';
 import { MarketTicker, TradingMode, AiAnalysisResult, SniperSignal, SniperExposureMode, Position } from '../types';
 import { Cpu, Crosshair, Sliders, Layers, ArrowUpRight, ShieldCheck, Terminal, X, Zap, ShieldAlert, ChevronDown, Activity, Sparkles } from 'lucide-react';
-import { IntradaySniperEngine } from './IntradaySniperEngine';
+import { CamarillaSniperHub } from './CamarillaSniperHub';
 import { useSniperScalpingEngine } from '../hooks/useSniperScalpingEngine';
 import { OptionsStrategyEngine } from './OptionsStrategyEngine';
 import { getMarketTicker, resolveLiveUsdInrRate, formatInrFirstPnl } from '../utils/marketUtils';
@@ -33,6 +33,8 @@ interface StrategyEngineProps {
   isLiveApiAuthenticated?: boolean;
   onOpenSettings?: () => void;
   positions?: Position[];
+  isExchangeHydrated?: boolean;
+  appBootTimestamp?: number;
   engineTabRequest?: { tab: 'SNIPER' | 'OPTIONS' | 'COMBINED'; nonce: number } | null;
   onActiveTabChange?: (tab: 'SNIPER' | 'OPTIONS' | 'COMBINED') => void;
 }
@@ -57,6 +59,8 @@ const StrategyEngineInner: React.FC<StrategyEngineProps & { baseSniper: any }> =
   isLiveApiAuthenticated = false,
   onOpenSettings,
   positions = [],
+  isExchangeHydrated = true,
+  appBootTimestamp,
   engineTabRequest,
   onActiveTabChange,
 }) => {
@@ -245,6 +249,60 @@ const StrategyEngineInner: React.FC<StrategyEngineProps & { baseSniper: any }> =
   // - Keep Camarilla reference levels (H4, H3, L3, L4, H5, L5) visible on the HUD at all times.
   const camarillaSniperSignal: SniperSignal = useMemo(() => {
     const base: SniperSignal = baseSniper.currentSignal;
+    if (base.sniperStrategyMode === 'EMA_9_21_MOMENTUM_5M') {
+      const manualOverride =
+        typeof baseSniper.manualLotSize === 'number' && baseSniper.manualLotSize > 0
+          ? baseSniper.manualLotSize
+          : null;
+      const lotSize = manualOverride ?? (base.lotSize > 0 ? base.lotSize : defaultLotSize);
+      const syncedContractsCount =
+        manualOverride !== null
+          ? getContractsCount(selectedAsset, lotSize)
+          : (base.contractsCount ?? getContractsCount(selectedAsset, lotSize));
+      const isPairInCooldown = Date.now() < (baseSniper.pairCooldowns?.[selectedAsset] || 0);
+      const isOverdueSignal = !activePosition && signalValidity?.status === 'OVERDUE';
+      const isBypassActive = tradingMode === 'PAPER' && (baseSniper.bypassHtfFilter ?? false);
+      const filtersPassed = base.ema921Cross?.filtersPassed ?? false;
+      const isHardBlocked = Boolean(
+        isLiveUnverified ||
+        isOverdueSignal ||
+        isPairInCooldown ||
+        base.riskChecks?.marginUtilizationSafe === false ||
+        (!filtersPassed && !isBypassActive)
+      );
+      const tradeApproved = !isHardBlocked && (Boolean(base.riskChecks?.tradeApproved) || isBypassActive);
+      const executionStatus: 'TRADE APPROVED' | 'ARMED_CONDITIONAL' | 'STANDBY' | 'TRADE BLOCKED' =
+        isHardBlocked
+          ? 'TRADE BLOCKED'
+          : tradeApproved
+          ? 'TRADE APPROVED'
+          : 'STANDBY';
+      return {
+        ...base,
+        symbol: selectedAsset,
+        lotSize,
+        contractsCount: syncedContractsCount,
+        requestedLotSize: base.requestedLotSize ?? defaultLotSize,
+        lotSizingMode: base.lotSizingMode ?? lotSizingMode,
+        manualLotSizeOverride: manualOverride ?? base.manualLotSizeOverride ?? null,
+        camarilla: {
+          ...camarilla,
+          cpr5mWidthPct: base.cpr5mWidthPct ?? base.camarilla?.cpr5mWidthPct ?? camarilla.cpr5mWidthPct,
+          cpr4hWidthPct: base.cpr4hWidthPct ?? base.camarilla?.cpr4hWidthPct ?? camarilla.cpr4hWidthPct,
+          cpr5m: base.camarilla?.cpr5m ?? camarilla.cpr5m,
+          cpr4h: base.camarilla?.cpr4h ?? camarilla.cpr4h,
+        },
+        isHydrated: !isHardBlocked && (!isSignalStandbyActive || baseSniper.isAutoSniperEnabled || isBypassActive),
+        isStandby: isSignalStandbyActive,
+        riskChecks: {
+          ...base.riskChecks,
+          cooldownPassed: !isPairInCooldown,
+          bypassActive: isBypassActive,
+          executionStatus,
+          tradeApproved,
+        },
+      };
+    }
     const isLong = effectiveDirection === 'LONG';
     const { entryPrice: rawEntryPrice, stopLoss: rawInitialStopLoss } = camarillaTargets;
 
@@ -269,12 +327,26 @@ const StrategyEngineInner: React.FC<StrategyEngineProps & { baseSniper: any }> =
         effectiveExpMode === 'MICRO_15'
     );
 
-    // Single Source of Truth: Strictly honor synced Risk Settings lot size from Sniper Engine / CapitalAllocationContext
-    const lotSize = base.lotSize > 0 ? base.lotSize : defaultLotSize;
-    const syncedContractsCount = base.contractsCount ?? getContractsCount(selectedAsset, lotSize);
+    // Single Source of Truth: Strictly honor manual lot override or Risk Settings lot size from Sniper Engine
+    const manualOverride =
+      typeof baseSniper.manualLotSize === 'number' && baseSniper.manualLotSize > 0
+        ? baseSniper.manualLotSize
+        : null;
+    const lotSize = manualOverride ?? (base.lotSize > 0 ? base.lotSize : defaultLotSize);
+    const syncedContractsCount =
+      manualOverride !== null
+        ? getContractsCount(selectedAsset, lotSize)
+        : (base.contractsCount ?? getContractsCount(selectedAsset, lotSize));
+
+    const hasUnifiedRouterBrackets =
+      Boolean(base.regimeRouter) &&
+      base.entryPrice > 0 &&
+      base.initialStopLoss > 0 &&
+      base.tp1 > 0 &&
+      base.tp2 > 0;
 
     const hasBaseMicroBrackets =
-      isNarrowCprAutoMicro &&
+      (hasUnifiedRouterBrackets || isNarrowCprAutoMicro) &&
       base.entryPrice > 0 &&
       base.initialStopLoss > 0 &&
       base.tp1 > 0 &&
@@ -285,12 +357,12 @@ const StrategyEngineInner: React.FC<StrategyEngineProps & { baseSniper: any }> =
     let rawTp3 = hasBaseMicroBrackets ? base.tp3 : camarillaTargets.tp3;
     let rawTp4 = hasBaseMicroBrackets ? base.tp4 : camarillaTargets.tp4;
 
-    if (effectiveExpMode === 'MICRO_15' && !hasBaseMicroBrackets) {
+    if (!hasUnifiedRouterBrackets && effectiveExpMode === 'MICRO_15' && !hasBaseMicroBrackets) {
       rawTp1 = formatCamarillaPrice(isLong ? rawEntryPrice * 1.0035 : rawEntryPrice * 0.9965, activeMarket.markPrice);
       rawTp2 = formatCamarillaPrice(isLong ? rawEntryPrice * 1.0065 : rawEntryPrice * 0.9935, activeMarket.markPrice);
       rawTp3 = formatCamarillaPrice(isLong ? rawEntryPrice * 1.0095 : rawEntryPrice * 0.9905, activeMarket.markPrice);
       rawTp4 = formatCamarillaPrice(isLong ? rawEntryPrice * 1.0125 : rawEntryPrice * 0.9875, activeMarket.markPrice);
-    } else if (effectiveExpMode === 'MICRO_50') {
+    } else if (!hasUnifiedRouterBrackets && effectiveExpMode === 'MICRO_50') {
       const d1 = 25.00 / lotSize;
       const d2 = 50.00 / lotSize;
       const d3 = 100.00 / lotSize;
@@ -412,13 +484,15 @@ const StrategyEngineInner: React.FC<StrategyEngineProps & { baseSniper: any }> =
     const isOverdueSignal = !activePosition && signalValidity?.status === 'OVERDUE';
     const isGate1Fail = !isBypassActive && !signalValidationPassed && !htfDivergenceWarning;
     const isWideCprBlocked = isWideCpr && !narrowCprOverrideActive && !isBypassActive;
+    const isUnifiedRouterNoTrade = Boolean(base.regimeRouter?.isNoTrade);
     const isHardBlocked =
       isLiveUnverified ||
       isOverdueSignal ||
       isGate1Fail ||
       isWideCprBlocked ||
       !marginUtilizationSafe ||
-      !microAntiChopPassed;
+      !microAntiChopPassed ||
+      (isUnifiedRouterNoTrade && !isBypassActive);
 
     // Gate #7: Strictly block execution when Overdue, Gate 1 fails, or Wide CPR suppresses breakouts (unless Narrow 5m/15m CPR override or Bypass is active)
     const tradeApproved = !isHardBlocked && (allRiskGatesPassed || (isBypassActive && otherGatesPassed));
@@ -440,6 +514,7 @@ const StrategyEngineInner: React.FC<StrategyEngineProps & { baseSniper: any }> =
 
     // Share exact lockedActiveSignal snapshot levels when active for this symbol & direction (no tick drift)
     const matchingLocked =
+      !hasUnifiedRouterBrackets &&
       lockedActiveSignal &&
       lockedActiveSignal.symbol === selectedAsset &&
       lockedActiveSignal.direction === effectiveDirection
@@ -454,36 +529,48 @@ const StrategyEngineInner: React.FC<StrategyEngineProps & { baseSniper: any }> =
         ? base
         : null;
 
-    const entryPrice = matchingLocked
+    const entryPrice = hasUnifiedRouterBrackets
+      ? base.entryPrice
+      : matchingLocked
       ? matchingLocked.entryPrice
       : matchingBaseFrozen
       ? matchingBaseFrozen.entryPrice
       : rawEntryPrice > 0
       ? rawEntryPrice
       : activeMarket.markPrice;
-    const initialStopLoss = matchingLocked
+    const initialStopLoss = hasUnifiedRouterBrackets
+      ? base.initialStopLoss
+      : matchingLocked
       ? matchingLocked.stopLoss
       : hasBaseMicroBrackets
       ? base.initialStopLoss
       : matchingBaseFrozen && matchingBaseFrozen.initialStopLoss > 0
       ? matchingBaseFrozen.initialStopLoss
       : rawInitialStopLoss;
-    const tp1 = matchingLocked
+    const tp1 = hasUnifiedRouterBrackets
+      ? base.tp1
+      : matchingLocked
       ? matchingLocked.tp1
       : matchingBaseFrozen && matchingBaseFrozen.tp1 > 0
       ? matchingBaseFrozen.tp1
       : rawTp1;
-    const tp2 = matchingLocked
+    const tp2 = hasUnifiedRouterBrackets
+      ? base.tp2
+      : matchingLocked
       ? matchingLocked.tp2
       : matchingBaseFrozen && matchingBaseFrozen.tp2 > 0
       ? matchingBaseFrozen.tp2
       : rawTp2;
-    const tp3 = matchingLocked
+    const tp3 = hasUnifiedRouterBrackets
+      ? base.tp3
+      : matchingLocked
       ? matchingLocked.tp3
       : matchingBaseFrozen && matchingBaseFrozen.tp3 > 0
       ? matchingBaseFrozen.tp3
       : rawTp3;
-    const tp4 = matchingLocked
+    const tp4 = hasUnifiedRouterBrackets
+      ? base.tp4
+      : matchingLocked
       ? matchingLocked.tp4
       : matchingBaseFrozen && matchingBaseFrozen.tp4 > 0
       ? matchingBaseFrozen.tp4
@@ -571,8 +658,7 @@ const StrategyEngineInner: React.FC<StrategyEngineProps & { baseSniper: any }> =
       contractsCount: syncedContractsCount,
       requestedLotSize: base.requestedLotSize ?? defaultLotSize,
       lotSizingMode: base.lotSizingMode ?? lotSizingMode,
-      wasLotClamped: base.wasLotClamped,
-      lotClampReason: base.lotClampReason,
+      manualLotSizeOverride: manualOverride ?? base.manualLotSizeOverride ?? null,
       entryPrice,
       initialStopLoss,
       tp1,
@@ -583,6 +669,12 @@ const StrategyEngineInner: React.FC<StrategyEngineProps & { baseSniper: any }> =
       camarilla: mergedCamarilla,
       isHydrated,
       isStandby: isSignalStandbyActive,
+      regimeRouter: base.regimeRouter,
+      regimeStatusLabel: base.regimeStatusLabel,
+      entryOrderType: base.entryOrderType,
+      feeAdjustedBePrice: base.feeAdjustedBePrice,
+      utcDayTradesCount: base.utcDayTradesCount,
+      postSlCooldownBarsRemaining: base.postSlCooldownBarsRemaining,
       validation: {
         ...base.validation,
         supportResistance: supportResistanceValid,
@@ -611,7 +703,7 @@ const StrategyEngineInner: React.FC<StrategyEngineProps & { baseSniper: any }> =
       },
       aiVerdict: camarillaVerdict,
     };
-  }, [baseSniper.currentSignal, baseSniper.signalSource, baseSniper.bypassHtfFilter, baseSniper.isAutoSniperEnabled, baseSniper.pairCooldowns, lockedActiveSignal, signalValidity?.status, selectedAsset, effectiveDirection, exposureMode, activeMarket, camarilla, camarillaTargets, isLiveUnverified, isSignalStandbyActive, liveUsdInrRate, activePosition, aiAnalysis, tradingMode]);
+  }, [baseSniper.currentSignal, baseSniper.manualLotSize, baseSniper.signalSource, baseSniper.bypassHtfFilter, baseSniper.isAutoSniperEnabled, baseSniper.pairCooldowns, lockedActiveSignal, signalValidity?.status, selectedAsset, effectiveDirection, exposureMode, activeMarket, camarilla, camarillaTargets, isLiveUnverified, isSignalStandbyActive, liveUsdInrRate, activePosition, aiAnalysis, tradingMode, defaultLotSize, getContractsCount, lotSizingMode]);
 
   // AI Command Signal Validator handler (computes, confirms, and hydrates H1-H5, L1-L5 structure)
   const handleValidateCamarillaSignal = useCallback(async () => {
@@ -723,8 +815,9 @@ const StrategyEngineInner: React.FC<StrategyEngineProps & { baseSniper: any }> =
     const currentPairCooldown = sniperPairCooldowns?.[selectedAsset] || 0;
     if (Date.now() < currentPairCooldown) return;
 
-    // Guard against wide CPR (> 0.35%) unless 5m/15m Narrow CPR override (<= 0.15%) or Bypass HTF / VWAP Guard is active
-    const isWideCpr = camarillaSniperSignal?.camarilla?.isWideCpr ?? false;
+    // Guard against wide CPR (> 0.35%) unless 5m/15m Narrow CPR override, EMA 9/21 5m Sniper mode, or Bypass HTF / VWAP Guard is active
+    const isEma921AutoMode = camarillaSniperSignal?.sniperStrategyMode === 'EMA_9_21_MOMENTUM_5M';
+    const isWideCpr = isEma921AutoMode ? false : (camarillaSniperSignal?.camarilla?.isWideCpr ?? false);
     const hasNarrowCprOverride = Boolean(
       camarillaSniperSignal?.riskChecks?.narrowCprOverrideActive ||
         camarillaSniperSignal?.isNarrow5mCprAutoRouted ||
@@ -805,26 +898,18 @@ const StrategyEngineInner: React.FC<StrategyEngineProps & { baseSniper: any }> =
             <Layers className="w-4 h-4 text-cyan-400" />
           </div>
           <div className="min-w-0">
-            <div className="flex items-center gap-1.5 flex-wrap min-w-0">
+            <div className="flex items-center gap-2 flex-wrap min-w-0">
               <h1 className="text-xs font-bold text-slate-200 tracking-wider uppercase truncate" title="DeltaAI Trading Cockpit">
                 DeltaAI Trading Cockpit
               </h1>
-              <span className="hidden sm:inline-flex badge-delta badge-delta-armed">
-                <span className="w-1.5 h-1.5 rounded-full bg-cyan-400 animate-pulse" />
-                <span>CAMARILLA H1–H6 / L1–L6</span>
-              </span>
               {(() => {
                 const matrixDir = activePosition ? activePosition.signal : effectiveDirection;
                 const isBearMatrix = matrixDir === 'SHORT';
                 return (
-                  <span
-                    className={`hidden md:inline-flex badge-delta font-mono-numbers ${
-                      isBearMatrix ? 'badge-delta-danger' : 'badge-delta-live'
-                    }`}
-                  >
-                    <Sparkles className={`w-2.5 h-2.5 ${isBearMatrix ? 'text-rose-300' : 'text-emerald-300'}`} />
-                    <span>
-                      MATRIX: {aiMatrixScore.total}/180 ({aiMatrixScore.convictionPct}% {isBearMatrix ? 'BEAR' : 'BULL'})
+                  <span className="hidden md:inline text-[11px] font-mono-numbers text-slate-400">
+                    · MTF Regime Router ·{' '}
+                    <span className={isBearMatrix ? 'text-rose-400 font-semibold' : 'text-emerald-400 font-semibold'}>
+                      Matrix {aiMatrixScore.total}/180 ({aiMatrixScore.convictionPct}% {isBearMatrix ? 'BEAR' : 'BULL'})
                     </span>
                   </span>
                 );
@@ -839,8 +924,8 @@ const StrategyEngineInner: React.FC<StrategyEngineProps & { baseSniper: any }> =
                 />
               )}
             </div>
-            <div className="flex items-center gap-2 text-[10px] text-slate-400 mt-0.5 break-words">
-              <span>H4/L4 Breakout · Dynamic R:R Ladder · 1 USD = ₹{liveUsdInrRate.toFixed(2)}</span>
+            <div className="flex items-center gap-2 text-[10px] text-slate-400 mt-0.5 break-words tabular-nums">
+              <span>15m Maker Pullback · 1.5x ATR Stop · 1 USD = ₹{liveUsdInrRate.toFixed(2)}</span>
             </div>
           </div>
         </div>
@@ -1167,7 +1252,7 @@ const StrategyEngineInner: React.FC<StrategyEngineProps & { baseSniper: any }> =
 
       {/* INTRADAY SNIPER SCALPING ENGINE */}
       {(activeEngineTab === 'SNIPER' || activeEngineTab === 'COMBINED') && (
-        <IntradaySniperEngine
+        <CamarillaSniperHub
           markets={markets}
           selectedSymbol={selectedAsset}
           setSelectedSymbol={setSelectedAsset}
@@ -1210,6 +1295,12 @@ const StrategyEngineInner: React.FC<StrategyEngineProps & { baseSniper: any }> =
           harvestTargetHit={baseSniper.harvestTargetHit}
           cycleWindowRemaining={baseSniper.cycleWindowRemaining}
           isTransitionWindow={baseSniper.isTransitionWindow}
+          manualLotSize={baseSniper.manualLotSize}
+          setManualLotSize={baseSniper.setManualLotSize}
+          pendingLimitOrder={baseSniper.pendingLimitOrder}
+          onCancelPendingLimitOrder={baseSniper.cancelPendingLimitOrder}
+          sniperStrategyMode={baseSniper.sniperStrategyMode}
+          setSniperStrategyMode={baseSniper.setSniperStrategyMode}
         />
       )}
 
@@ -1231,6 +1322,8 @@ const StrategyEngineInner: React.FC<StrategyEngineProps & { baseSniper: any }> =
           onOpenSettings={onOpenSettings}
           sniperSignal={camarillaSniperSignal}
           correlatedSignal={correlatedSignal}
+          isExchangeHydrated={isExchangeHydrated}
+          appBootTimestamp={appBootTimestamp}
         />
       </div>
 
@@ -1250,6 +1343,8 @@ const StrategyEngineWithFallback: React.FC<StrategyEngineProps> = (props) => {
     totalEquity: isLiveUnverified ? 0 : fallbackPortfolio.totalEquity,
     marginUsed: isLiveUnverified ? 0 : fallbackPortfolio.marginUsed,
     isLiveApiAuthenticated: Boolean(props.isLiveApiAuthenticated),
+    isExchangeHydrated: props.isExchangeHydrated ?? true,
+    appBootTimestamp: props.appBootTimestamp ?? Date.now(),
     onExecuteOrder: props.onExecuteTrade,
     onClosePosition: handleCloseFallback,
     onSendNotification: props.onSendNotification,

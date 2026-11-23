@@ -1,3 +1,5 @@
+import type { UnifiedRegimeRouterResult, Ema921MomentumCrossResult } from './utils/aiMatrixEngine';
+
 export type TradingMode = 'PAPER' | 'LIVE';
 
 export interface DeltaApiCredentials {
@@ -538,11 +540,16 @@ export interface SniperRiskChecks {
   microTradesLastHour?: number;
   microAntiChopPassed?: boolean;
   microSlCooldownRemainingSec?: number;
+  utcDayTradesCount?: number;
+  maxUtcDayTrades?: number;
+  postSlCooldownBarsRemaining?: number;
+  regimeStatusLabel?: string;
 }
 
 export type SniperScalpTier = 'TIER_50' | 'TIER_15';
 export type SniperExposureMode = 'MACRO' | 'MICRO_50' | 'MICRO_15';
 export type SniperExecutionTriggerMode = 'IMMEDIATE_TOUCH' | 'CANDLE_CLOSE';
+export type SniperStrategyMode = 'UNIFIED_MTF_PULLBACK' | 'EMA_9_21_MOMENTUM_5M';
 
 export interface SniperFrictionData {
   entryNotional: number;
@@ -662,6 +669,17 @@ export interface SniperSignal {
   microNotionalUsd?: number;
   microMarginUsd?: number;
   reason?: string;
+  regimeRouter?: UnifiedRegimeRouterResult | null;
+  regimeStatusLabel?: string;
+  entryOrderType?: 'post_only_limit' | 'market';
+  manualLotSizeOverride?: number | null;
+  utcDayTradesCount?: number;
+  postSlCooldownBarsRemaining?: number;
+  feeAdjustedBePrice?: number;
+  sniperStrategyMode?: SniperStrategyMode;
+  ema921Cross?: Ema921MomentumCrossResult | null;
+  partialTakeProfitPct?: number;
+  trailBasis?: '5M_EMA21' | '15M_EMA20';
 }
 
 export type SniperTradeStatus = 
@@ -868,6 +886,15 @@ export interface SniperActiveTrade {
   adjustmentCount?: number;
   adjustedBreakEvenPrice?: number;
   rescueAdjustment?: PerpetualRescueAdjustmentRecord | null;
+  entryOrderType?: 'post_only_limit' | 'market';
+  isPendingLimit?: boolean;
+  limitOrderId?: string | number;
+  limitPlacedAtMs?: number;
+  limitExpiresAfterBars?: number;
+  feeAdjustedBePrice?: number;
+  sniperStrategyMode?: SniperStrategyMode;
+  partialTakeProfitPct?: number;
+  trailBasis?: '5M_EMA21' | '15M_EMA20';
 }
 
 export interface SniperLogEntry {
@@ -987,6 +1014,8 @@ export interface OptionStrategyPosition {
   exitMode?: 'UNIFIED_BASKET' | 'SINGLE_LEG_TP_SL';
   exitReason?: string;
   aiVerdict: string;
+  netDebitPaidUsd?: number;
+  preExpiryCloseHours?: number;
 }
 
 export interface OptionStrategyTemplate {

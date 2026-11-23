@@ -333,9 +333,10 @@ export function buildOptionsProfitLadder(
       leg.entryPremium ?? leg.premiumEntry ?? leg.markPremium ?? leg.premiumCurrent ?? 0
     );
     const contracts = Math.max(0.001, Number(leg.contracts) || 1);
+    const contractMult = Number(leg.contractValue) > 0 ? Number(leg.contractValue) : (leg.symbol?.includes('ETH') ? 0.01 : 0.001);
     const signed = leg.action === 'SELL' ? entryPrem : -entryPrem;
     netUnitPremSigned += signed;
-    netPremTotal += signed * contracts;
+    netPremTotal += signed * contracts * contractMult;
     totalGrossUnitPrem += Math.abs(entryPrem);
   });
 
@@ -368,6 +369,10 @@ export function buildOptionsProfitLadder(
       ? maxRiskUsd
       : Math.max(25, safeMaxProfitUsd);
 
+  const isDebitSpread =
+    strategyName === 'Bull Call Spread' || strategyName === 'Bear Put Spread';
+  const netDebitPaidUsd = Math.max(0.5, Math.abs(netPremTotal) > 0.05 ? Math.abs(netPremTotal) : safeMaxRiskUsd);
+
   const step3TargetPct = Math.min(85, Math.max(55, Math.round(maxProfitTargetPercent || 65)));
 
   const rawDefs: Array<{
@@ -375,37 +380,73 @@ export function buildOptionsProfitLadder(
     stepLabel: string;
     shortTitle: string;
     targetPct: number;
+    targetDebitMultiple?: number;
     actionDescription: string;
-  }> = [
-    {
-      stepNumber: 1,
-      stepLabel: 'Step 01',
-      shortTitle: '25% Profit Milestone',
-      targetPct: 25,
-      actionDescription: 'Initial Partial Profit · Monitor Greeks Stability',
-    },
-    {
-      stepNumber: 2,
-      stepLabel: 'Step 02',
-      shortTitle: '50% Profit Lock',
-      targetPct: 50,
-      actionDescription: 'Lock Gains · Risk-Free Protection Cushion',
-    },
-    {
-      stepNumber: 3,
-      stepLabel: 'Step 03',
-      shortTitle: `${step3TargetPct}% Strategy Target`,
-      targetPct: step3TargetPct,
-      actionDescription: 'Primary Strategy Exit Zone · Avoid Tail Risk',
-    },
-    {
-      stepNumber: 4,
-      stepLabel: 'Step 04',
-      shortTitle: '90% Full Exit',
-      targetPct: 90,
-      actionDescription: 'Terminal Premium Harvest · Full Strategy Exit',
-    },
-  ];
+  }> = isDebitSpread
+    ? [
+        {
+          stepNumber: 1,
+          stepLabel: 'Step 01',
+          shortTitle: '1.5x Debit (+50% ROI)',
+          targetPct: 50,
+          targetDebitMultiple: 1.5,
+          actionDescription: '1.5x Net Debit · Trim 25% & Lock Breakeven',
+        },
+        {
+          stepNumber: 2,
+          stepLabel: 'Step 02',
+          shortTitle: '1.75x Debit (+75% ROI)',
+          targetPct: 75,
+          targetDebitMultiple: 1.75,
+          actionDescription: '1.75x Net Debit · Trail Spread Protection',
+        },
+        {
+          stepNumber: 3,
+          stepLabel: 'Step 03',
+          shortTitle: '2.0x Debit (+100% ROI)',
+          targetPct: 100,
+          targetDebitMultiple: 2.0,
+          actionDescription: '2.0x Net Debit · Primary Defined-Risk Harvest',
+        },
+        {
+          stepNumber: 4,
+          stepLabel: 'Step 04',
+          shortTitle: '2.2x Debit (+120% ROI)',
+          targetPct: 120,
+          targetDebitMultiple: 2.2,
+          actionDescription: '2.2x Net Debit · Full Pre-Expiry Target Exit',
+        },
+      ]
+    : [
+        {
+          stepNumber: 1,
+          stepLabel: 'Step 01',
+          shortTitle: '25% Profit Milestone',
+          targetPct: 25,
+          actionDescription: 'Initial Partial Profit · Monitor Greeks Stability',
+        },
+        {
+          stepNumber: 2,
+          stepLabel: 'Step 02',
+          shortTitle: '50% Profit Lock',
+          targetPct: 50,
+          actionDescription: 'Lock Gains · Risk-Free Protection Cushion',
+        },
+        {
+          stepNumber: 3,
+          stepLabel: 'Step 03',
+          shortTitle: `${step3TargetPct}% Strategy Target`,
+          targetPct: step3TargetPct,
+          actionDescription: 'Primary Strategy Exit Zone · Avoid Tail Risk',
+        },
+        {
+          stepNumber: 4,
+          stepLabel: 'Step 04',
+          shortTitle: '90% Full Exit',
+          targetPct: 90,
+          actionDescription: 'Terminal Premium Harvest · Full Strategy Exit',
+        },
+      ];
 
   // Live profit starts strictly at $0.00 when inactive / awaiting fill
   const liveProfitUsd =
@@ -413,7 +454,9 @@ export function buildOptionsProfitLadder(
   const liveProfitInr = +(liveProfitUsd * rate).toFixed(2);
 
   const liveProfitPct = isPositionActive
-    ? Number.isFinite(currentProfitPercent)
+    ? isDebitSpread
+      ? +((liveProfitUsd / netDebitPaidUsd) * 100).toFixed(2)
+      : Number.isFinite(currentProfitPercent)
       ? currentProfitPercent
       : safeMaxProfitUsd > 0
       ? (liveProfitUsd / safeMaxProfitUsd) * 100
@@ -439,7 +482,9 @@ export function buildOptionsProfitLadder(
 
   const steps: OptionsLadderStep[] = rawDefs.map((def) => {
     const frac = def.targetPct / 100;
-    const targetUsd = +(safeMaxProfitUsd * frac).toFixed(2);
+    const targetUsd = isDebitSpread && def.targetDebitMultiple
+      ? +(netDebitPaidUsd * (def.targetDebitMultiple - 1)).toFixed(2)
+      : +(safeMaxProfitUsd * frac).toFixed(2);
     const targetInr = +(targetUsd * rate).toFixed(2);
 
     // Achieved ONLY when live profit reaches >= 100% of this step's target

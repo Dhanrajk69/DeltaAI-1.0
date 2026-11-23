@@ -41,6 +41,7 @@ import { PnlHeatmapD3 } from './PnlHeatmapD3';
 import { DailyPnlChartD3 } from './DailyPnlChartD3';
 import { TelemetryWarehousePanel } from './TelemetryWarehousePanel';
 import { DeltaHistoricalBacktester } from './DeltaHistoricalBacktester';
+import { LiveAccountSyncDiagnosticsPanel } from './LiveAccountSyncDiagnosticsPanel';
 import {
   exportActiveResolvedStrategyStats,
   ExportedResolvedStrategyStats,
@@ -257,14 +258,14 @@ export const PerformanceAnalytics: React.FC<PerformanceAnalyticsProps> = ({
   const [timeframeFilter, setTimeframeFilter] = useState<'ALL' | '24H' | 'SNIPER_ONLY'>('ALL');
   const [d3AnalyticsView, setD3AnalyticsView] = useState<'BOTH' | 'HEATMAP' | 'CURVE'>('BOTH');
   const [calendarTimezone, setCalendarTimezone] = useState<'IST' | 'UTC'>('IST');
-  const [activeMetricTab, setActiveMetricTab] = useState<'EQUITY' | 'DRAWDOWN' | 'CORRELATION' | 'DISTRIBUTION' | 'BACKTESTER' | 'JOURNAL' | 'ENGINES'>('EQUITY');
+  const [activeMetricTab, setActiveMetricTab] = useState<'EQUITY' | 'DRAWDOWN' | 'CORRELATION' | 'DISTRIBUTION' | 'BACKTESTER' | 'JOURNAL' | 'ENGINES' | 'LIVE_SYNC'>('EQUITY');
   const [strategyExportCopied, setStrategyExportCopied] = useState<boolean>(false);
   const [correlationWindow, setCorrelationWindow] = useState<'1D' | '7D' | '30D'>('30D');
   const [selectedPair, setSelectedPair] = useState<{ asset1: string; asset2: string }>({ asset1: 'BTC', asset2: 'ETH' });
 
   // Strategy Backtester Interactive State
   const [backtestDataSource, setBacktestDataSource] = useState<'HISTORICAL_TRADES' | 'STRATEGY_SIMULATION'>('HISTORICAL_TRADES');
-  const [backtestStrategy, setBacktestStrategy] = useState<'HYBRID_LADDER' | 'CPR_CAMARILLA' | 'AI_MATRIX' | 'VWAP_MOMENTUM'>('HYBRID_LADDER');
+  const [backtestStrategy, setBacktestStrategy] = useState<'HYBRID_LADDER' | 'EMA_9_21_MOMENTUM_5M' | 'CPR_CAMARILLA' | 'AI_MATRIX' | 'VWAP_MOMENTUM'>('HYBRID_LADDER');
   const [backtestSymbol, setBacktestSymbol] = useState<string>('BTCUSDT');
   const [backtestPeriod, setBacktestPeriod] = useState<'30D' | '60D' | '90D'>('30D');
   const [selectedSimTradeId, setSelectedSimTradeId] = useState<string>('');
@@ -994,10 +995,30 @@ export const PerformanceAnalytics: React.FC<PerformanceAnalyticsProps> = ({
         const stage2Target = isLong ? +(entryPrice + stopDistance * 2.5).toFixed(2) : +(entryPrice - stopDistance * 2.5).toFixed(2);
         const profitStop = isLong ? +(entryPrice + stopDistance * 0.5).toFixed(2) : +(entryPrice - stopDistance * 0.5).toFixed(2);
 
+        const isEma921Sim = backtestStrategy === 'EMA_9_21_MOMENTUM_5M';
+        const btcLikeMultiplier = backtestSymbol === 'BTCUSDT' ? 1 : baseMarkPrice / 84250;
+        const ema921StopDist = +(90 * btcLikeMultiplier).toFixed(backtestSymbol.includes('XRP') ? 4 : 2);
+        const effStopDist = isEma921Sim ? ema921StopDist : stopDistance;
+        const effInitialStop = isEma921Sim
+          ? (isLong ? +(entryPrice - effStopDist).toFixed(2) : +(entryPrice + effStopDist).toFixed(2))
+          : initialStop;
+        const effStage1Target = isEma921Sim
+          ? (isLong ? +(entryPrice + 100 * btcLikeMultiplier).toFixed(2) : +(entryPrice - 100 * btcLikeMultiplier).toFixed(2))
+          : stage1Target;
+        const effCushionStop = isEma921Sim
+          ? (isLong ? +(entryPrice + 35 * btcLikeMultiplier).toFixed(2) : +(entryPrice - 35 * btcLikeMultiplier).toFixed(2))
+          : cushionStop;
+        const effStage2Target = isEma921Sim
+          ? (isLong ? +(entryPrice + 220 * btcLikeMultiplier).toFixed(2) : +(entryPrice - 220 * btcLikeMultiplier).toFixed(2))
+          : stage2Target;
+        const effProfitStop = isEma921Sim
+          ? (isLong ? +(entryPrice + 145 * btcLikeMultiplier).toFixed(2) : +(entryPrice - 145 * btcLikeMultiplier).toFixed(2))
+          : profitStop;
+
         let outcomeType: 'FULL_RUNNER' | 'STAGE2_STOP' | 'STAGE1_CUSHION_EXIT' | 'FULL_LOSS';
         const randSeed = (i * 37) % 100;
 
-        if (backtestStrategy === 'HYBRID_LADDER' || backtestStrategy === 'AI_MATRIX') {
+        if (backtestStrategy === 'HYBRID_LADDER' || backtestStrategy === 'AI_MATRIX' || isEma921Sim) {
           if (randSeed < 38) outcomeType = 'FULL_RUNNER';
           else if (randSeed < 65) outcomeType = 'STAGE2_STOP';
           else if (randSeed < 82) outcomeType = 'STAGE1_CUSHION_EXIT';
@@ -1015,7 +1036,39 @@ export const PerformanceAnalytics: React.FC<PerformanceAnalyticsProps> = ({
         let exitReason = '';
         let status: 'WIN' | 'LOSS' | 'SCRATCH_SAVED' = 'WIN';
 
-        if (outcomeType === 'FULL_RUNNER') {
+        if (isEma921Sim) {
+          if (outcomeType === 'FULL_RUNNER') {
+            // 60% @ +100pt (+1.11R) + 40% @ +220pt (+2.44R) minus 0.0236% maker fee incl. GST impact (~0.04R)
+            realisedR = +(0.60 * 1.11 + 0.40 * 2.44 - 0.04).toFixed(2);
+            realisedPnlUsd = +(riskPerTrade * realisedR).toFixed(2);
+            exitPrice = effStage2Target;
+            exitReason = '5m EMA 9/21: 60% @ +100pt (0.0236% Maker) + 40% EMA 21 Runner -> +220pt (2.5R)';
+            wins++;
+          } else if (outcomeType === 'STAGE2_STOP') {
+            // 60% @ +100pt (+1.11R) + 40% trailed behind 5m EMA 21 (~+1.6R)
+            realisedR = +(0.60 * 1.11 + 0.40 * 1.60 - 0.04).toFixed(2);
+            realisedPnlUsd = +(riskPerTrade * realisedR).toFixed(2);
+            exitPrice = effProfitStop;
+            exitReason = '5m EMA 9/21: 60% Banked @ +100pt, 40% Trailed Exit on 5m EMA 21';
+            wins++;
+          } else if (outcomeType === 'STAGE1_CUSHION_EXIT') {
+            // 60% @ +100pt (+1.11R) + 40% stopped at Entry ± $35 fee+GST BE (~+0.38R on runner leg)
+            realisedR = +(0.60 * 1.11 + 0.40 * 0.35 - 0.04).toFixed(2);
+            realisedPnlUsd = +(riskPerTrade * realisedR).toFixed(2);
+            exitPrice = effCushionStop;
+            exitReason = '5m EMA 9/21: 60% Banked @ +100pt, 40% Fee-Protected BE (Entry ± $35)';
+            scratchesSaved++;
+            wins++;
+            status = 'SCRATCH_SAVED';
+          } else {
+            realisedR = -1.00;
+            realisedPnlUsd = -riskPerTrade;
+            exitPrice = effInitialStop;
+            exitReason = '5m EMA 9/21 Initial Stop Loss Hit (1.2x 5m ATR)';
+            losses++;
+            status = 'LOSS';
+          }
+        } else if (outcomeType === 'FULL_RUNNER') {
           realisedR = +(2.85 + (i % 4) * 0.35).toFixed(2);
           realisedPnlUsd = +(riskPerTrade * realisedR).toFixed(2);
           exitPrice = isLong ? +(entryPrice + stopDistance * realisedR).toFixed(2) : +(entryPrice - stopDistance * realisedR).toFixed(2);
@@ -1060,26 +1113,36 @@ export const PerformanceAnalytics: React.FC<PerformanceAnalyticsProps> = ({
             stepPrice = entryPrice;
             event = `Entry ${side} @ $${entryPrice.toLocaleString()}`;
           } else if (s === 4) {
-            stepPrice = outcomeType === 'FULL_LOSS' ? (isLong ? entryPrice - stopDistance * 0.4 : entryPrice + stopDistance * 0.4) : stage1Target;
-            if (outcomeType !== 'FULL_LOSS') event = `Stage 1 Hit (+1.5R): Banked 30%, SL -> Half-Risk Cushion (-0.5R)`;
+            stepPrice = outcomeType === 'FULL_LOSS' ? (isLong ? entryPrice - effStopDist * 0.4 : entryPrice + effStopDist * 0.4) : effStage1Target;
+            if (outcomeType !== 'FULL_LOSS') {
+              event = isEma921Sim
+                ? `TP1 (+100pt / 1.1R): Banked 60% @ 0.0236% Maker Fee, SL -> Entry ± $35 BE`
+                : `Stage 1 Hit (+1.5R): Banked 30%, SL -> Half-Risk Cushion (-0.5R)`;
+            }
           } else if (s === 8) {
             if (outcomeType === 'STAGE1_CUSHION_EXIT') {
-              stepPrice = cushionStop;
-              event = `Retest to Cushion (-0.5R): Banked 30% (+0.45R) insulates 70% (-0.35R) -> Guaranteed +0.10R Win!`;
+              stepPrice = effCushionStop;
+              event = isEma921Sim
+                ? `Retest to Entry ± $35 BE: 60% (+100pt) + Fee-Protected BE Runner!`
+                : `Retest to Cushion (-0.5R): Banked 30% (+0.45R) insulates 70% (-0.35R) -> Guaranteed +0.10R Win!`;
             } else if (outcomeType === 'FULL_RUNNER' || outcomeType === 'STAGE2_STOP') {
-              stepPrice = stage2Target;
-              event = `Stage 2 Hit (+2.5R): Banked 30%, SL -> Profit-Lock (+0.5R)`;
+              stepPrice = effStage2Target;
+              event = isEma921Sim
+                ? `Runner Extension (+220pt / 2.5R): Trailing 40% behind 5m EMA 21`
+                : `Stage 2 Hit (+2.5R): Banked 30%, SL -> Profit-Lock (+0.5R)`;
             } else {
-              stepPrice = initialStop;
+              stepPrice = effInitialStop;
               event = `Stop Loss Hit (-1.0R)`;
             }
           } else if (s === 12) {
             if (outcomeType === 'FULL_RUNNER') {
-              stepPrice = isLong ? +(entryPrice + stopDistance * 3.2).toFixed(2) : +(entryPrice - stopDistance * 3.2).toFixed(2);
-              event = `Stage 3: Dynamic 1.5x ATR Volatility Trail Engaged`;
+              stepPrice = isEma921Sim
+                ? effStage2Target
+                : (isLong ? +(entryPrice + effStopDist * 3.2).toFixed(2) : +(entryPrice - effStopDist * 3.2).toFixed(2));
+              event = isEma921Sim ? `5m EMA 21 Trail: Capturing +220pt Target` : `Stage 3: Dynamic 1.5x ATR Volatility Trail Engaged`;
             } else if (outcomeType === 'STAGE2_STOP') {
-              stepPrice = profitStop;
-              event = `Retest to Profit-Lock (+0.5R) Exit`;
+              stepPrice = effProfitStop;
+              event = isEma921Sim ? `5m EMA 21 Trail Exit on remaining 40%` : `Retest to Profit-Lock (+0.5R) Exit`;
             } else {
               stepPrice = exitPrice;
             }
@@ -1088,7 +1151,7 @@ export const PerformanceAnalytics: React.FC<PerformanceAnalyticsProps> = ({
             event = `Final Exit: ${exitReason}`;
           } else {
             const progress = s / steps;
-            stepPrice = +(entryPrice + (exitPrice - entryPrice) * progress + (Math.sin(s * 1.5) * stopDistance * 0.2)).toFixed(2);
+            stepPrice = +(entryPrice + (exitPrice - entryPrice) * progress + (Math.sin(s * 1.5) * effStopDist * 0.2)).toFixed(2);
           }
 
           trajectoryPoints.push({
@@ -1105,13 +1168,13 @@ export const PerformanceAnalytics: React.FC<PerformanceAnalyticsProps> = ({
           symbol: backtestSymbol,
           side,
           entryPrice,
-          initialStop,
-          stage1Price: stage1Target,
+          initialStop: effInitialStop,
+          stage1Price: effStage1Target,
           stage1Executed: outcomeType !== 'FULL_LOSS',
-          cushionStop,
-          stage2Price: stage2Target,
+          cushionStop: effCushionStop,
+          stage2Price: effStage2Target,
           stage2Executed: outcomeType === 'FULL_RUNNER' || outcomeType === 'STAGE2_STOP',
-          profitStop,
+          profitStop: effProfitStop,
           exitPrice,
           exitReason,
           realisedPnlUsd,
@@ -1270,6 +1333,41 @@ export const PerformanceAnalytics: React.FC<PerformanceAnalyticsProps> = ({
                 <RefreshCw className="w-3.5 h-3.5" />
               </button>
             )}
+          </div>
+        </div>
+
+        {/* Trade Summary Card (Total Trades, Win Rate, Total Profit/Loss) */}
+        <div className="mt-3 pt-3 border-t border-slate-800/80 min-w-0">
+          <div className="p-3 rounded-lg bg-slate-950/90 border border-slate-800 flex flex-wrap items-center justify-between gap-4 font-mono-numbers">
+            <div className="min-w-0">
+              <span className="text-[11px] font-bold text-slate-300 uppercase tracking-wider block">
+                Trade Summary
+              </span>
+              <span className="text-[10px] text-slate-500">
+                Closed executions ({timeframeFilter === 'ALL' ? 'All Time' : timeframeFilter === '24H' ? '24H' : 'Scalper'})
+              </span>
+            </div>
+            <div className="flex flex-wrap items-center gap-6 tabular-nums">
+              <div>
+                <span className="text-[10px] text-slate-400 uppercase block">Total Trades</span>
+                <span className="text-base font-extrabold text-white">{filteredHistory.length}</span>
+              </div>
+              <div>
+                <span className="text-[10px] text-slate-400 uppercase block">Win Rate</span>
+                <span className={`text-base font-extrabold ${stats.winRate >= 50 ? 'text-emerald-400' : 'text-amber-300'}`}>
+                  {stats.winRate.toFixed(1)}%
+                </span>
+              </div>
+              <div>
+                <span className="text-[10px] text-slate-400 uppercase block">Total Profit / Loss</span>
+                <span className={`text-base font-extrabold ${stats.netPnlUsd >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                  {stats.netPnlUsd >= 0 ? '+' : '-'}
+                  {isCurrencyInr
+                    ? `₹${Math.abs(stats.netPnlInr).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+                    : `$${Math.abs(stats.netPnlUsd).toFixed(2)}`}
+                </span>
+              </div>
+            </div>
           </div>
         </div>
 
@@ -1904,6 +2002,17 @@ export const PerformanceAnalytics: React.FC<PerformanceAnalyticsProps> = ({
             >
               <BookOpen className="w-3.5 h-3.5" />
               <span>Trade Journal</span>
+            </button>
+            <button
+              onClick={() => setActiveMetricTab('LIVE_SYNC')}
+              className={`btn-delta ${
+                activeMetricTab === 'LIVE_SYNC'
+                  ? 'btn-primary'
+                  : 'btn-secondary'
+              }`}
+            >
+              <ShieldCheck className="w-3.5 h-3.5" />
+              <span>Live Account Sync</span>
             </button>
           </div>
 
@@ -2561,6 +2670,7 @@ export const PerformanceAnalytics: React.FC<PerformanceAnalyticsProps> = ({
                     className="w-full bg-slate-900 border border-slate-700 rounded px-2.5 py-1.5 text-white text-xs focus:outline-none focus:border-emerald-500 cursor-pointer"
                   >
                     <option value="HYBRID_LADDER">Hybrid Dynamic Cushion Ladder (Harvest 30% @ +1.5R, SL -0.5R; Harvest 30% @ +2.5R, SL +0.5R; 40% ATR Trail)</option>
+                    <option value="EMA_9_21_MOMENTUM_5M">EMA 9/21 Momentum Cross (5m Sniper: 60% @ +100pt 0.0236% Maker, Entry±$35 BE, 40% 5m EMA21 -&gt; +220pt)</option>
                     <option value="CPR_CAMARILLA">CPR & Camarilla Boundary Mean Reversion (CPR Width &lt; 0.35%)</option>
                     <option value="AI_MATRIX">AI Matrix 4-Engine Multi-Agent Alignment (Score &gt; 140/180)</option>
                     <option value="VWAP_MOMENTUM">Confirmed 5m Bar-Close VWAP Expansion</option>
@@ -2890,6 +3000,11 @@ export const PerformanceAnalytics: React.FC<PerformanceAnalyticsProps> = ({
             currencyPrefix={currencyPrefix}
             exchangeRate={effectiveRate}
           />
+        )}
+
+        {/* ─── TAB 8: LIVE ACCOUNT SYNC & DIAGNOSTICS ─── */}
+        {activeMetricTab === 'LIVE_SYNC' && (
+          <LiveAccountSyncDiagnosticsPanel />
         )}
       </div>
 

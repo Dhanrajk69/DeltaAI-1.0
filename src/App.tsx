@@ -3694,6 +3694,9 @@ export default function App() {
   const [livePortfolio, setLivePortfolio] = useState<PortfolioData>(ZERO_LIVE_PORTFOLIO);
   const [livePositions, setLivePositions] = useState<Position[]>([]);
   const [liveHistory, setLiveHistory] = useState<ClosedTrade[]>([]);
+  const appBootTimestampRef = useRef<number>(Date.now());
+  const [walletHydratedLive, setWalletHydratedLive] = useState(false);
+  const [positionsHydratedLive, setPositionsHydratedLive] = useState(false);
 
   // Active Mode Resolution:
   // - In PAPER mode: use isolated paperPortfolio, paperPositions, paperHistory
@@ -3773,6 +3776,9 @@ export default function App() {
           Number.isFinite(w.walletBalance) && (w.walletBalance as number) > 0
             ? (w.walletBalance as number)
             : +(w.totalEquity - (w.unrealisedPnlTotal || 0)).toFixed(2);
+        if (Number(w.totalEquity || 0) > 0) {
+          setWalletHydratedLive(true);
+        }
         setLivePortfolio((prev) => ({
           ...prev,
           totalEquity: w.totalEquity,
@@ -3820,6 +3826,7 @@ export default function App() {
 
       if (positionsResponse.status === 'success' && Array.isArray(positionsResponse.positions)) {
         setLivePositions(positionsResponse.positions);
+        setPositionsHydratedLive(true);
       }
     },
     [apiCredentials, serverHasCredentials, isCheckingAuth, refreshLiveWalletAndPositions, addNotification]
@@ -3961,6 +3968,9 @@ export default function App() {
                 setUsdInrRate(data.wallet.usdInrRate);
               }
 
+              if (netEq > 0) {
+                setWalletHydratedLive(true);
+              }
               setLivePortfolio((prev) => ({
                 ...prev,
                 totalEquity: netEq,
@@ -3976,6 +3986,7 @@ export default function App() {
             }
             if (Array.isArray(data.positions)) {
               setLivePositions(data.positions);
+              setPositionsHydratedLive(true);
             }
             if (data.config && data.config.globalLeverageConfig) {
               applyGlobalLeverageConfig(data.config.globalLeverageConfig);
@@ -4938,6 +4949,7 @@ export default function App() {
           .includes('LIMIT')
           ? 'limit_order'
           : 'market_order',
+      post_only: order.post_only === true || order.postOnly === true ? true : undefined,
       stop_loss_order:
         slPrice > 0
           ? {
@@ -5409,8 +5421,13 @@ export default function App() {
     []
   );
 
+  const isExchangeHydrated =
+    tradingMode === 'PAPER'
+      ? true
+      : Boolean(isLiveApiAuthenticated && walletHydratedLive && positionsHydratedLive);
+
   // Intraday Sniper Scalping Engine instance (Automatic Signal Validation, Entry, Profit Lock & Trailing Stop)
-  // Strictly isolated by tradingMode and gated by isLiveApiAuthenticated in LIVE mode
+  // Strictly isolated by tradingMode and gated by isLiveApiAuthenticated + hydration in LIVE mode
   const sniperEngine = useSniperScalpingEngine({
     markets,
     selectedSymbol,
@@ -5419,6 +5436,8 @@ export default function App() {
     totalEquity: portfolio.totalEquity,
     marginUsed: portfolio.marginUsed,
     isLiveApiAuthenticated,
+    isExchangeHydrated,
+    appBootTimestamp: appBootTimestampRef.current,
     onExecuteOrder: handleExecuteOrder,
     onClosePosition: handleClosePosition,
     onRecordClosedTrade: handleSniperRecordClosedTrade,
@@ -6003,6 +6022,8 @@ export default function App() {
             onPlaySound={playTradeFill}
             engineTabRequest={engineTabRequest}
             onActiveTabChange={setActiveStrategySubTab}
+            isExchangeHydrated={isExchangeHydrated}
+            appBootTimestamp={appBootTimestampRef.current}
           />
         </div>
 

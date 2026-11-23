@@ -30,6 +30,7 @@ type HistoricalTimeframe = '5m' | '15m' | '1h' | '4h';
 type StrategyMode =
   | 'CAMARILLA_CPR_SNIPER'
   | 'AI_MATRIX_CONSENSUS'
+  | 'EMA_9_21_MOMENTUM_5M'
   | 'WAREHOUSE_SIGNALS_REPLAY';
 
 interface BacktestEquityPoint {
@@ -146,6 +147,11 @@ const STRATEGY_MODES: Array<{ value: StrategyMode; label: string; desc: string }
     value: 'CAMARILLA_CPR_SNIPER',
     label: 'Camarilla CPR Sniper',
     desc: 'H4/L4 breakout + CPR width regime + VWAP & EMA9/20 alignment',
+  },
+  {
+    value: 'EMA_9_21_MOMENTUM_5M',
+    label: 'EMA 9/21 Momentum Cross (5m Sniper)',
+    desc: '5m bar-close EMA 9/21 cross + EMA21 slope + VWAP & 15m EMA50 + ADX>=20 · 1.2x ATR SL, 60% @ +100pt (0.0236% maker incl. GST), Entry±$35 BE, 40% EMA21 -> +220pt',
   },
   {
     value: 'AI_MATRIX_CONSENSUS',
@@ -423,7 +429,13 @@ export const DeltaHistoricalBacktester: React.FC<DeltaHistoricalBacktesterProps>
           </label>
           <select
             value={strategyMode}
-            onChange={(e) => setStrategyMode(e.target.value as StrategyMode)}
+            onChange={(e) => {
+              const nextMode = e.target.value as StrategyMode;
+              setStrategyMode(nextMode);
+              if (nextMode === 'EMA_9_21_MOMENTUM_5M') {
+                setTimeframe('5m');
+              }
+            }}
             className="w-full bg-slate-900 border border-slate-700 rounded-md px-2.5 py-1.5 text-xs font-semibold text-slate-100 focus:outline-none focus:border-cyan-500"
           >
             {STRATEGY_MODES.map((m) => (

@@ -35,8 +35,7 @@ const CircularProgress: React.FC<CircularProgressProps> = ({
   const clamped = isDormant && !isHit ? Math.min(100, Math.max(0, progress)) : Math.min(100, Math.max(0, progress));
   const strokeDashoffset = circumference - (clamped / 100) * circumference;
 
-  const showStroke = clamped > 0;
-  const glowFilter = showStroke || isHit || isActive || isHeader ? palette.ringGlow : 'none';
+  const showStroke = clamped >= 0;
   const label = displayLabel ?? `${Math.round(clamped)}%`;
 
   return (
@@ -48,20 +47,20 @@ const CircularProgress: React.FC<CircularProgressProps> = ({
       <svg
         className={`${isHeader ? 'w-11 h-11' : 'w-10 h-10'} -rotate-90 transform overflow-visible`}
         viewBox="0 0 44 44"
-        style={glowFilter !== 'none' ? { filter: glowFilter } : undefined}
+        style={{ filter: 'drop-shadow(0 0 8px rgba(56, 189, 248, 0.35))' }}
       >
         <defs>
           <linearGradient id={dynGradId} x1="0%" y1="0%" x2="100%" y2="100%">
-            <stop offset="0%" stopColor={palette.ringStart} />
-            <stop offset="50%" stopColor={palette.ringMid} />
-            <stop offset="100%" stopColor={palette.ringEnd} />
+            <stop offset="0%" stopColor="#38bdf8" />
+            <stop offset="50%" stopColor="#0ea5e9" />
+            <stop offset="100%" stopColor="#2563eb" />
           </linearGradient>
         </defs>
         <circle
           cx="22"
           cy="22"
           r={radius}
-          stroke="#162033"
+          stroke="rgba(255, 255, 255, 0.08)"
           strokeWidth={4.5}
           fill="none"
         />
@@ -75,15 +74,14 @@ const CircularProgress: React.FC<CircularProgressProps> = ({
             strokeDasharray={circumference}
             initial={{ strokeDashoffset: circumference }}
             animate={{ strokeDashoffset }}
-            transition={{ duration: 0.45, ease: 'easeOut' }}
+            transition={{ duration: 0.5, ease: 'easeOut' }}
             strokeLinecap="round"
             fill="none"
           />
         )}
       </svg>
       <span
-        className="absolute text-[9px] font-extrabold font-mono tabular-nums tracking-tight transition-colors duration-300"
-        style={{ color: clamped > 0 || isHit || isActive ? palette.text : '#94A3B8' }}
+        className="absolute text-[9.5px] font-extrabold font-mono tabular-nums tracking-tight transition-colors duration-300 text-cyan-200"
       >
         {label}
       </span>
@@ -110,6 +108,7 @@ export interface ProfitLadderDashdarkProps {
   currencyPrefix?: string;
   netBreakevenPrice?: number;
   totalFrictionUsd?: number;
+  sniperStrategyMode?: 'UNIFIED_MTF_PULLBACK' | 'EMA_9_21_MOMENTUM_5M';
   className?: string;
 }
 
@@ -130,8 +129,10 @@ export const ProfitLadderDashdark: React.FC<ProfitLadderDashdarkProps> = React.m
   symbol = 'BTCUSDT',
   liveUsdInrRate = 85.04,
   currencyPrefix = '$',
+  sniperStrategyMode,
   className = '',
 }) => {
+  const isEma921Ladder = (activeTrade?.sniperStrategyMode || sniperStrategyMode) === 'EMA_9_21_MOMENTUM_5M';
   const effectiveEntry =
     activeTrade?.entryPrice > 0
       ? Number(activeTrade.entryPrice)
@@ -308,7 +309,7 @@ export const ProfitLadderDashdark: React.FC<ProfitLadderDashdarkProps> = React.m
       step2: formatReward(s2),
       step3: formatReward(s3),
       step4: formatReward(s4),
-      rrRatios: ['1.25R', '2.00R', '2.75R', '3.50R'],
+      rrRatios: isEma921Ladder ? ['1.10R', '1.60R', '2.00R', '2.50R'] : ['1.25R', '2.00R', '2.75R', '3.50R'],
     };
   }, [
     effectiveEntry,
@@ -318,6 +319,7 @@ export const ProfitLadderDashdark: React.FC<ProfitLadderDashdarkProps> = React.m
     resolvedTp3,
     resolvedTp4,
     isMicro15,
+    isEma921Ladder,
     rate,
     currencyPrefix,
   ]);
@@ -513,7 +515,7 @@ export const ProfitLadderDashdark: React.FC<ProfitLadderDashdarkProps> = React.m
   const stepStates = [
     {
       num: 'STEP 01',
-      label: '50% Close · SL Held',
+      label: isEma921Ladder ? '70% (+ $15 Net) · SL → ±$35 BE' : '50% Close · SL Held',
       price: resolvedTp1,
       reward: rewards.step1,
       rr: rewards.rrRatios[0],
@@ -523,7 +525,7 @@ export const ProfitLadderDashdark: React.FC<ProfitLadderDashdarkProps> = React.m
     },
     {
       num: 'STEP 02',
-      label: '25% Close · SL → BE',
+      label: isEma921Ladder ? '5m EMA 21 Trail (30%)' : '25% Close · SL → BE',
       price: resolvedTp2,
       reward: rewards.step2,
       rr: rewards.rrRatios[1],
@@ -533,7 +535,7 @@ export const ProfitLadderDashdark: React.FC<ProfitLadderDashdarkProps> = React.m
     },
     {
       num: 'STEP 03',
-      label: 'Trail SL → TP2',
+      label: isEma921Ladder ? 'Runner Trail Extend' : 'Trail SL → TP2',
       price: resolvedTp3,
       reward: rewards.step3,
       rr: rewards.rrRatios[2],
@@ -543,7 +545,7 @@ export const ProfitLadderDashdark: React.FC<ProfitLadderDashdarkProps> = React.m
     },
     {
       num: 'STEP 04',
-      label: 'Terminal Runner Exit',
+      label: isEma921Ladder ? '30% EMA 21 → +220pt' : 'Terminal Runner Exit',
       price: resolvedTp4,
       reward: rewards.step4,
       rr: rewards.rrRatios[3],

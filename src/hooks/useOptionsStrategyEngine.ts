@@ -46,6 +46,15 @@ import {
 } from '../utils/camarillaUtils';
 import { queueAnalyticsSignal, queueAnalyticsEvent } from '../utils/analyticsWarehouseClient';
 import { getCachedDailyCandles, subscribeDailyAnchorUpdates } from '../utils/dailyAnchorUtils';
+import {
+  evaluateUnifiedRegimeRouter,
+  UnifiedRegimeRouterResult,
+  normalizeCandleTimeSec,
+} from '../utils/aiMatrixEngine';
+import {
+  MAX_TRADES_PER_UTC_DAY,
+  POST_SL_COOLDOWN_BARS,
+} from '../utils/backtestEngine';
 import { formatAssetNameForSpeech } from './useVoiceAlerts';
 import { speakVoiceAlert } from '../utils/voiceAlert';
 import {
@@ -594,6 +603,8 @@ interface UseOptionsStrategyEngineOptions {
   tradingMode: TradingMode;
   availableBalance?: number;
   isLiveApiAuthenticated?: boolean;
+  isExchangeHydrated?: boolean;
+  appBootTimestamp?: number;
   onExecuteTrade?: (order: any) => Promise<void>;
   onSendNotification: (title: string, message: string, type: 'INFO' | 'TRADE' | 'RISK' | 'AI') => void;
   onPlaySound?: () => void;
@@ -613,6 +624,8 @@ export function useOptionsStrategyEngine({
   tradingMode,
   availableBalance = 25000,
   isLiveApiAuthenticated = false,
+  isExchangeHydrated = true,
+  appBootTimestamp = Date.now(),
   onExecuteTrade,
   onSendNotification,
   onPlaySound,
@@ -709,16 +722,14 @@ export function useOptionsStrategyEngine({
     });
   }, [selectedSymbol, tradingMode]);
   const [isExecuting, setIsExecuting] = useState(false);
-  const [isAutoPilotEnabled, setIsAutoPilotEnabledState] = useState<boolean>(() => {
-    try {
-      return localStorage.getItem('delta_options_autopilot_enabled_v1') === 'true';
-    } catch {
-      return false;
-    }
-  });
+  // Boot safety: Auto-Pilot MUST initialize to false on every fresh boot
+  const hasUserArmedInSessionRef = useRef<boolean>(false);
+  const mountTimestampSecRef = useRef<number>(Math.floor(Date.now() / 1000));
+  const [isAutoPilotEnabled, setIsAutoPilotEnabledState] = useState<boolean>(false);
   const disarmReasonRef = useRef<string | null>(null);
 
   const setIsAutoPilotEnabled = useCallback((enabled: boolean, reason?: string) => {
+    hasUserArmedInSessionRef.current = enabled;
     if (!enabled && reason) {
       disarmReasonRef.current = reason;
     }
@@ -741,35 +752,85 @@ export function useOptionsStrategyEngine({
     });
   }, []);
 
-  // Sync with server on initial mount
+  // On mount, force server & local autopilot state to false unless explicitly armed in current session
   useEffect(() => {
-    let isMounted = true;
-    fetch('/api/options/autopilot-state')
-      .then((res) => res.json())
-      .then((data) => {
-        if (!isMounted || !data?.success || !data?.state) return;
-        const serverEnabled = Boolean(data.state.enabled);
-        const localSaved = (() => {
-          try {
-            return localStorage.getItem('delta_options_autopilot_enabled_v1') === 'true';
-          } catch {
-            return false;
-          }
-        })();
-        if (serverEnabled || localSaved) {
-          setIsAutoPilotEnabledState(true);
-          try {
-            localStorage.setItem('delta_options_autopilot_enabled_v1', 'true');
-          } catch {}
-        }
-      })
-      .catch((err) => {
-        console.warn('[AutoPilot] Initial server state sync failed:', err);
-      });
-    return () => {
-      isMounted = false;
-    };
+    if (!hasUserArmedInSessionRef.current) {
+      try {
+        localStorage.setItem('delta_options_autopilot_enabled_v1', 'false');
+      } catch {}
+      fetch('/api/options/autopilot-state', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          enabled: false,
+          armedAt: 0,
+          pauseReason: 'Boot safety reset',
+        }),
+      }).catch(() => {});
+    }
   }, []);
+
+  // Max 3 trades per UTC day + 3-bar (45m on 15m chart) post-SL cooldown
+  const optUtcDayStorageKey = `delta_options_utc_trades_v1_${tradingMode}`;
+  const getOptTodayUtcStr = () => new Date().toISOString().slice(0, 10);
+  const [optUtcDayState, setOptUtcDayState] = useState<{ date: string; count: number }>(() => {
+    const today = getOptTodayUtcStr();
+    try {
+      const raw = localStorage.getItem(optUtcDayStorageKey);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (parsed?.date === today) {
+          return { date: today, count: Math.max(0, Number(parsed.count) || 0) };
+        }
+      }
+    } catch {}
+    return { date: today, count: 0 };
+  });
+  const [optPostSlCooldownUntilMs, setOptPostSlCooldownUntilMs] = useState<number>(() => {
+    try {
+      return Number(localStorage.getItem(`delta_options_post_sl_v1_${tradingMode}`) || 0);
+    } catch {
+      return 0;
+    }
+  });
+  useEffect(() => {
+    const today = getOptTodayUtcStr();
+    try {
+      const raw = localStorage.getItem(optUtcDayStorageKey);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        setOptUtcDayState({ date: today, count: parsed?.date === today ? Math.max(0, Number(parsed.count) || 0) : 0 });
+      } else {
+        setOptUtcDayState({ date: today, count: 0 });
+      }
+      setOptPostSlCooldownUntilMs(Number(localStorage.getItem(`delta_options_post_sl_v1_${tradingMode}`) || 0));
+    } catch {}
+  }, [optUtcDayStorageKey, tradingMode]);
+
+  const utcDayTradesCount = optUtcDayState.date === getOptTodayUtcStr() ? optUtcDayState.count : 0;
+  const incrementUtcDayTradeCount = useCallback(() => {
+    const today = getOptTodayUtcStr();
+    setOptUtcDayState((prev) => {
+      const next = { date: today, count: (prev.date === today ? prev.count : 0) + 1 };
+      try {
+        localStorage.setItem(optUtcDayStorageKey, JSON.stringify(next));
+      } catch {}
+      return next;
+    });
+  }, [optUtcDayStorageKey]);
+
+  const triggerOptPostSlCooldown = useCallback(() => {
+    const until = Date.now() + POST_SL_COOLDOWN_BARS * 15 * 60 * 1000;
+    setOptPostSlCooldownUntilMs(until);
+    try {
+      localStorage.setItem(`delta_options_post_sl_v1_${tradingMode}`, String(until));
+    } catch {}
+  }, [tradingMode]);
+
+  const postSlCooldownBarsRemaining =
+    optPostSlCooldownUntilMs > Date.now()
+      ? Math.max(1, Math.ceil((optPostSlCooldownUntilMs - Date.now()) / (15 * 60 * 1000)))
+      : 0;
 
   const [armedAtTimestamp, setArmedAtTimestamp] = useState<number>(0);
   const [isAnalyzingAutoPilot, setIsAnalyzingAutoPilot] = useState<boolean>(false);
@@ -910,12 +971,14 @@ export function useOptionsStrategyEngine({
   const [exchangeSyncReady, setExchangeSyncReady] = useState<boolean>(false);
 
   const canTriggerAutomatedExit = useCallback((): boolean => {
+    if (!isExchangeHydrated) return false;
+    if (appBootTimestamp && Date.now() - appBootTimestamp < HYDRATION_GRACE_WINDOW_MS) return false;
     if (isHydratingExchangeStateRef.current) return false;
     if (!exchangeSyncReady) return false;
     if (exchangeSyncConfirmedAtRef.current === 0) return false;
     if (Date.now() - exchangeSyncConfirmedAtRef.current < HYDRATION_GRACE_WINDOW_MS) return false;
     return true;
-  }, [exchangeSyncReady]);
+  }, [exchangeSyncReady, isExchangeHydrated, appBootTimestamp]);
 
   useEffect(() => {
     isHydratingExchangeStateRef.current = true;
@@ -1168,61 +1231,92 @@ export function useOptionsStrategyEngine({
 
   const [autoHandoffEnabled, setAutoHandoffEnabled] = useState<boolean>(true);
 
+  const [candles15m, setCandles15m] = useState<any[]>([]);
+  const [candles1h, setCandles1h] = useState<any[]>([]);
   const [candles4h, setCandles4h] = useState<any[]>([]);
 
   useEffect(() => {
     let active = true;
-    const fetch4h = async () => {
+    const fetchMultiTf = async () => {
       try {
-        const res = await fetch(`/api/delta/candles?symbol=${encodeURIComponent(selectedSymbol)}&resolution=4h`);
-        if (res.ok) {
-          const json = await res.json();
-          if (active && Array.isArray(json?.candles)) {
-            setCandles4h(json.candles);
-          }
-        }
+        const [r15, r1h, r4h] = await Promise.all([
+          fetch(`/api/delta/candles?symbol=${encodeURIComponent(selectedSymbol)}&resolution=15m`).then((r) => (r.ok ? r.json() : null)).catch(() => null),
+          fetch(`/api/delta/candles?symbol=${encodeURIComponent(selectedSymbol)}&resolution=1h`).then((r) => (r.ok ? r.json() : null)).catch(() => null),
+          fetch(`/api/delta/candles?symbol=${encodeURIComponent(selectedSymbol)}&resolution=4h`).then((r) => (r.ok ? r.json() : null)).catch(() => null),
+        ]);
+        if (!active) return;
+        if (Array.isArray(r15?.candles) && r15.candles.length > 0) setCandles15m(r15.candles);
+        if (Array.isArray(r1h?.candles) && r1h.candles.length > 0) setCandles1h(r1h.candles);
+        if (Array.isArray(r4h?.candles) && r4h.candles.length > 0) setCandles4h(r4h.candles);
       } catch {
-        // Fallback to computed Camarilla CPR when offline
+        // Fallback cleanly when offline
       }
     };
-    fetch4h();
-    const timer = setInterval(fetch4h, 60000);
+    fetchMultiTf();
+    const timer = setInterval(fetchMultiTf, 45000);
     return () => {
       active = false;
       clearInterval(timer);
     };
   }, [selectedSymbol]);
 
+  const [dailyHistoryEpoch, setDailyHistoryEpoch] = useState<number>(0);
+  useEffect(() => {
+    return subscribeDailyAnchorUpdates(() => {
+      setDailyHistoryEpoch((v) => v + 1);
+    });
+  }, []);
+
+  const regimeRouter: UnifiedRegimeRouterResult = useMemo(() => {
+    const dailyCandles = getCachedDailyCandles(selectedSymbol, curMarket, markPrice);
+    return evaluateUnifiedRegimeRouter({
+      symbol: selectedSymbol,
+      markPrice,
+      candles15m,
+      candles1h,
+      candles4h,
+    });
+  }, [selectedSymbol, curMarket, markPrice, candles15m, candles1h, candles4h, dailyHistoryEpoch]);
+
+  const regimeStatusLabel = regimeRouter.statusLabel;
+
   const { camarilla: computedCamarilla } = computeCamarillaLevels(curMarket, 'LONG', '5m', undefined, undefined);
   const calcCprWidth = Math.abs((computedCamarilla.tc || 0) - (computedCamarilla.bc || 0));
   const calcDailyRange = Math.max((computedCamarilla.h1 || markPrice * 1.02) - (computedCamarilla.l1 || markPrice * 0.98), markPrice * 0.015);
   const cprStrengthRatio = calcCprWidth > 0 ? +(calcDailyRange / calcCprWidth).toFixed(1) : 3.5;
-  const isCprStretched = cprStrengthRatio >= 2.5;
+  const isCprStretched = regimeRouter.isWideCpr || cprStrengthRatio >= 2.5;
 
   const { cpr4hWidthPct, isWide4hCpr } = useMemo(() => {
     const cpr4h = computeCandleBlockCpr(candles4h, markPrice, 3);
-    const widthPct = cpr4h.widthPct > 0
+    const widthPct = regimeRouter.cprWidthPct > 0
+      ? regimeRouter.cprWidthPct
+      : cpr4h.widthPct > 0
       ? cpr4h.widthPct
       : (computedCamarilla.pivot > 0 ? +((calcCprWidth / computedCamarilla.pivot) * 100).toFixed(3) : 0.45);
     return {
       cpr4hWidthPct: widthPct,
-      isWide4hCpr: widthPct >= 0.45,
+      isWide4hCpr: regimeRouter.isWideCpr || widthPct >= 0.45,
     };
-  }, [candles4h, markPrice, computedCamarilla.pivot, calcCprWidth]);
+  }, [candles4h, markPrice, computedCamarilla.pivot, calcCprWidth, regimeRouter.cprWidthPct, regimeRouter.isWideCpr]);
 
   const executionLane: 'TRENDING_DIRECTIONAL' | 'NEUTRAL_THETA_HARVEST' =
-    autoHandoffEnabled && (isWide4hCpr || isCprStretched || (hasTimeframeConflict && !forceSpotDirection))
+    autoHandoffEnabled && (regimeRouter.routeDestination === 'OPTIONS_DEBIT_SPREAD' || isWide4hCpr || isCprStretched)
       ? 'NEUTRAL_THETA_HARVEST'
       : 'TRENDING_DIRECTIONAL';
 
   const isRegimeHandoffActive =
-    autoHandoffEnabled && isAutoPilotEnabled && executionLane === 'NEUTRAL_THETA_HARVEST';
+    autoHandoffEnabled && !regimeRouter.isNoTrade && regimeRouter.routeDestination === 'OPTIONS_DEBIT_SPREAD';
 
   const activeEngineMode: 'CAMARILLA_SNIPER' | 'OPTIONS_LAB_CREDIT' =
-    executionLane === 'NEUTRAL_THETA_HARVEST' ? 'OPTIONS_LAB_CREDIT' : 'CAMARILLA_SNIPER';
+    regimeRouter.routeDestination === 'OPTIONS_DEBIT_SPREAD' ? 'OPTIONS_LAB_CREDIT' : 'CAMARILLA_SNIPER';
 
+  // Route trending Wide CPR / High Volatility to Defined-Risk Debit Spreads (Bull Call Spread / Bear Put Spread)
   const effectiveResolvedStrategy: OptionStrategyName =
-    executionLane === 'NEUTRAL_THETA_HARVEST' ? 'Iron Condor' : resolvedStrategy;
+    candles15m.length >= 15 && !regimeRouter.isNoTrade && regimeRouter.recommendedOptionsStrategy
+      ? regimeRouter.recommendedOptionsStrategy
+      : regimeRouter.direction === 'SHORT'
+      ? 'Bear Put Spread'
+      : resolvedStrategy;
 
   useEffect(() => {
     if (effectiveResolvedStrategy) {
@@ -1242,13 +1336,6 @@ export function useOptionsStrategyEngine({
       strategyTag: effectiveResolvedStrategy.toUpperCase(),
     };
   }, [deltaMarketStructure, maSlopePct, effectiveResolvedStrategy]);
-
-  const [dailyHistoryEpoch, setDailyHistoryEpoch] = useState<number>(0);
-  useEffect(() => {
-    return subscribeDailyAnchorUpdates(() => {
-      setDailyHistoryEpoch((v) => v + 1);
-    });
-  }, []);
 
   const virginCprState = useMemo(() => {
     const zones = computeVirginCprZones(
@@ -1729,29 +1816,33 @@ export function useOptionsStrategyEngine({
     }
   }, [defaultLotSize, lotSizingMode]);
 
+  const accountEquityForOptions = useMemo(() => {
+    if (ctxTotalEquity > 0) return ctxTotalEquity;
+    return liveAvailableEquityUsd;
+  }, [ctxTotalEquity, liveAvailableEquityUsd]);
+
+  const maxNetDebitAllowedUsd = useMemo(() => {
+    return accountEquityForOptions > 0 ? +(accountEquityForOptions * 0.01).toFixed(2) : 0;
+  }, [accountEquityForOptions]);
+
   const optionsSafeLotResolution = useMemo(() => {
     const unit = getContractUnitValue(selectedSymbol);
-    const desiredRiskContracts =
-      lotSizingMode === 'RISK_BASED'
-        ? (() => {
-            const riskBudgetUsd =
-              liveAvailableEquityUsd > 0
-                ? Math.max(5, +(liveAvailableEquityUsd * (Math.max(0.25, maxRiskPerTradePct) / 100)).toFixed(2))
-                : 25;
-            return Math.max(1, Math.floor(riskBudgetUsd / Math.max(0.25, netSpreadMarginPerLotUsd)));
-          })()
-        : undefined;
+    // Max Net Debit <= 1% Account Equity (or user's global risk budget capped at 1% for debit spreads)
+    const debitBudgetUsd =
+      accountEquityForOptions > 0
+        ? +(accountEquityForOptions * (Math.min(1.0, Math.max(0.25, maxRiskPerTradePct)) / 100)).toFixed(2)
+        : 10;
+    const desiredRiskContracts = Math.max(1, Math.floor(debitBudgetUsd / Math.max(0.25, netSpreadMarginPerLotUsd)));
 
     return resolveSafeExecutionLot({
       symbol: selectedSymbol,
       markPrice,
       availableBalance: liveAvailableEquityUsd,
-      totalEquity: ctxTotalEquity > 0 ? ctxTotalEquity : liveAvailableEquityUsd,
+      totalEquity: accountEquityForOptions,
       leverage: effectiveGlobalLeverage,
       isOption: true,
       optionMarginPerContractUsd: netSpreadMarginPerLotUsd,
-      overrideLotSize:
-        desiredRiskContracts !== undefined ? +(desiredRiskContracts * unit).toFixed(4) : undefined,
+      overrideLotSize: +(desiredRiskContracts * unit).toFixed(4),
     });
   }, [
     resolveSafeExecutionLot,
@@ -1759,10 +1850,9 @@ export function useOptionsStrategyEngine({
     selectedSymbol,
     markPrice,
     liveAvailableEquityUsd,
-    ctxTotalEquity,
+    accountEquityForOptions,
     effectiveGlobalLeverage,
     netSpreadMarginPerLotUsd,
-    lotSizingMode,
     maxRiskPerTradePct,
   ]);
 
@@ -1792,19 +1882,23 @@ export function useOptionsStrategyEngine({
     setCustomBasketLots(null);
   }, []);
 
-  // Dynamic Equity-Safe Auto-Lot Sizing synced with Global RiskSettings (1:1 unified basket lots)
+  const estimatedNetDebitUsd = useMemo(() => {
+    return +(basketLots * netSpreadMarginPerLotUsd).toFixed(2);
+  }, [basketLots, netSpreadMarginPerLotUsd]);
+
+  // Dynamic Equity-Safe Auto-Lot Sizing synced with Global RiskSettings & <= 1% Max Net Debit
   const equitySizingSummary = useMemo(() => {
     const activeStrat: OptionStrategyName = (effectiveResolvedStrategy as OptionStrategyName) || selectedStrategyName;
     const legsExpected = activeStrat === 'Iron Condor' || activeStrat === 'Iron Butterfly' ? 4 : 2;
     const maxAllowedMarginUsd =
-      liveAvailableEquityUsd > 0 ? +(liveAvailableEquityUsd * 0.95).toFixed(2) : 35;
-    const estimatedMarginUsd = +(basketLots * netSpreadMarginPerLotUsd).toFixed(2);
+      maxNetDebitAllowedUsd > 0 ? maxNetDebitAllowedUsd : 15;
+    const estimatedMarginUsd = estimatedNetDebitUsd;
     const baseSummary = autoScaleToEquityCap({
       symbol: selectedSymbol,
       markPrice,
       availableBalance: liveAvailableEquityUsd,
       leverage: effectiveGlobalLeverage,
-      maxEquityPct: 0.95,
+      maxEquityPct: 0.01,
       requestedLotSize: basketLots * getContractUnitValue(selectedSymbol),
       isOption: true,
       optionPremiumUsd: markPrice > 0 ? markPrice * 0.011 : 120,
@@ -1815,10 +1909,10 @@ export function useOptionsStrategyEngine({
       lotSize: basketLots,
       contracts: basketLots,
       estimatedMarginUsd,
-      maxAllowedMarginUsd: Math.max(15, maxAllowedMarginUsd),
+      maxAllowedMarginUsd: Math.max(1, maxAllowedMarginUsd),
       netSpreadMarginPerLotUsd,
-      wasScaled: optionsSafeLotResolution.wasClamped || baseSummary.wasScaled,
-      scaleReason: optionsSafeLotResolution.clampReason || baseSummary.scaleReason,
+      wasScaled: false,
+      scaleReason: undefined,
     };
   }, [
     autoScaleToEquityCap,
@@ -1831,26 +1925,29 @@ export function useOptionsStrategyEngine({
     effectiveGlobalLeverage,
     basketLots,
     netSpreadMarginPerLotUsd,
-    optionsSafeLotResolution.wasClamped,
-    optionsSafeLotResolution.clampReason,
+    maxNetDebitAllowedUsd,
+    estimatedNetDebitUsd,
   ]);
 
-  // Pre-trade risk checks for Options Strategy Lab (respects Global Leverage, Margin Mode & 35% Equity Cap)
+  // Pre-trade risk checks for Options Strategy Lab (enforces Max Net Debit <= 1% Account Equity & Unified Router)
   const preTradeRiskChecks = useMemo(() => {
-    const confidenceMet =
-      executionLane === 'NEUTRAL_THETA_HARVEST'
-        ? aiDirective.confidence >= 75
-        : aiDirective.confidence >= 78;
-    const maxEquityBudgetUsd =
-      liveAvailableEquityUsd > 0 ? +(liveAvailableEquityUsd * 0.35).toFixed(2) : 0;
+    const confidenceMet = aiDirective.confidence >= 75;
+    const maxEquityBudgetUsd = maxNetDebitAllowedUsd;
+    const netDebitWithin1Pct =
+      accountEquityForOptions > 0 &&
+      estimatedNetDebitUsd <= Math.max(maxEquityBudgetUsd, netSpreadMarginPerLotUsd);
     const marginSafe =
       !isLiveUnverified &&
-      liveAvailableEquityUsd >= 15 &&
-      equitySizingSummary.estimatedMarginUsd <= Math.max(maxEquityBudgetUsd, 15) &&
+      liveAvailableEquityUsd >= Math.max(1, estimatedNetDebitUsd) &&
+      netDebitWithin1Pct &&
       (!activePosition || activePosition.marginStatus === 'Safe');
     const ivHealthy = !activePosition || activePosition.greeks.averageIv <= 85;
+    const regimeOk = !(candles15m.length >= 15 && regimeRouter.isNoTrade);
     const riskLimitsOk =
       !isLiveUnverified &&
+      regimeOk &&
+      utcDayTradesCount < MAX_TRADES_PER_UTC_DAY &&
+      optPostSlCooldownUntilMs <= Date.now() &&
       effectiveGlobalLeverage <= maxLeverageCap &&
       (!activePosition || activePosition.riskStatus === 'Normal');
     const allPassed = confidenceMet && marginSafe && ivHealthy && riskLimitsOk;
@@ -1858,19 +1955,27 @@ export function useOptionsStrategyEngine({
     return {
       confidenceMet,
       marginSafe,
+      netDebitWithin1Pct,
       ivHealthy,
+      regimeOk,
       riskLimitsOk,
       allPassed,
-      estimatedMarginUsd: equitySizingSummary.estimatedMarginUsd,
+      estimatedMarginUsd: estimatedNetDebitUsd,
       maxEquityBudgetUsd,
     };
   }, [
-    executionLane,
     aiDirective.confidence,
+    maxNetDebitAllowedUsd,
+    accountEquityForOptions,
+    estimatedNetDebitUsd,
+    netSpreadMarginPerLotUsd,
     isLiveUnverified,
     liveAvailableEquityUsd,
-    equitySizingSummary.estimatedMarginUsd,
     activePosition,
+    candles15m.length,
+    regimeRouter.isNoTrade,
+    utcDayTradesCount,
+    optPostSlCooldownUntilMs,
     effectiveGlobalLeverage,
     maxLeverageCap,
   ]);
@@ -1983,8 +2088,9 @@ export function useOptionsStrategyEngine({
         }
 
         case 'Bull Call Spread': {
+          // Defined-risk debit spread: ~0.50–0.55 delta long leg + ~0.25–0.30 delta short leg
           const longStrike = atm;
-          const shortStrike = atm + step;
+          const shortStrike = atm + step * 2;
           const expiry = intradayMode ? deltaMarketStructure.nextDailyExpiryDateStr : expiryStr;
           const dte = intradayMode ? 1 : dteVal;
 
@@ -2000,9 +2106,9 @@ export function useOptionsStrategyEngine({
               dte,
               premiumEntry: p1 > 0 ? p1 : 124.50,
               premiumCurrent: p1 > 0 ? p1 : 124.50,
-              delta: 0.52,
+              delta: 0.53,
               gamma: 0.00014,
-              theta: -52.00,
+              theta: -48.00,
               vega: 38.00,
               iv: 49.0,
               contracts,
@@ -2014,12 +2120,12 @@ export function useOptionsStrategyEngine({
               strike: shortStrike,
               expiry,
               dte,
-              premiumEntry: p2 > 0 ? p2 : 68.20,
-              premiumCurrent: p2 > 0 ? p2 : 68.20,
-              delta: -0.30,
+              premiumEntry: p2 > 0 ? p2 : 58.40,
+              premiumCurrent: p2 > 0 ? p2 : 58.40,
+              delta: -0.27,
               gamma: -0.00009,
-              theta: 31.00,
-              vega: -22.00,
+              theta: 29.50,
+              vega: -21.00,
               iv: 48.2,
               contracts,
             },
@@ -2027,21 +2133,27 @@ export function useOptionsStrategyEngine({
         }
 
         case 'Bear Put Spread': {
-          const p1 = getPrem('PUT', atm, true, false);
-          const p2 = getPrem('PUT', atm - step, false, false);
+          // Defined-risk debit spread: ~0.50–0.55 delta long leg + ~0.25–0.30 delta short leg
+          const longStrike = atm;
+          const shortStrike = atm - step * 2;
+          const expiry = intradayMode ? deltaMarketStructure.nextDailyExpiryDateStr : expiryStr;
+          const dte = intradayMode ? 1 : dteVal;
+
+          const p1 = getPrem('PUT', longStrike, true, false);
+          const p2 = getPrem('PUT', shortStrike, false, false);
           return [
             {
               id: 'leg-1',
               type: 'PUT',
               action: 'BUY',
-              strike: atm,
-              expiry: expiryStr,
-              dte: dteVal,
-              premiumEntry: p1,
-              premiumCurrent: p1,
-              delta: -0.54,
+              strike: longStrike,
+              expiry,
+              dte,
+              premiumEntry: p1 > 0 ? p1 : 122.00,
+              premiumCurrent: p1 > 0 ? p1 : 122.00,
+              delta: -0.52,
               gamma: 0.00013,
-              theta: -50.00,
+              theta: -47.00,
               vega: 36.50,
               iv: 50.5,
               contracts,
@@ -2050,16 +2162,16 @@ export function useOptionsStrategyEngine({
               id: 'leg-2',
               type: 'PUT',
               action: 'SELL',
-              strike: atm - step,
-              expiry: expiryStr,
-              dte: dteVal,
-              premiumEntry: p2,
-              premiumCurrent: p2,
-              delta: 0.31,
+              strike: shortStrike,
+              expiry,
+              dte,
+              premiumEntry: p2 > 0 ? p2 : 56.80,
+              premiumCurrent: p2 > 0 ? p2 : 56.80,
+              delta: 0.28,
               gamma: -0.00008,
-              theta: 29.50,
-              vega: -21.00,
-              iv: 52.0,
+              theta: 28.50,
+              vega: -20.50,
+              iv: 51.5,
               contracts,
             },
           ];
@@ -3081,70 +3193,65 @@ export function useOptionsStrategyEngine({
         };
       }
 
-      // Intraday Risk Rules (Leg Defense, Invalidation & Max Loss)
-      if (intradayMode) {
-        const bullInvalidationFloor = pos.entryUnderlyingPrice * 0.992;
-        if (pos.strategyName === 'Bull Call Spread' && markPrice < bullInvalidationFloor) {
-          newStatus = 'CLOSED_RISK';
-          exitReason = `Invalidation Breached (Spot < $${bullInvalidationFloor.toFixed(2)}). Bull Call Spread auto-stopped.`;
-        }
+      // Intraday Risk Rules: Defined-Risk Debit Spreads use 1.5x–2.2x Debit Ladder (+50% to +120% ROI) & -50% SL
+      const isDebitSpread = pos.strategyName === 'Bull Call Spread' || pos.strategyName === 'Bear Put Spread';
+      if (isDebitSpread) {
+        const debitBasis = Math.max(0.5, pos.netDebitPaidUsd || Math.abs(pos.netPremiumCollectedOrPaid || pos.maxRiskUsd || 10));
+        const debitRoiPct = +((currentPnl / debitBasis) * 100).toFixed(2);
+        profitPct = debitRoiPct;
 
-        // Bull Call Spread Profit Target: +$15.00 net or 50% max profit
-        if (pos.strategyName === 'Bull Call Spread' && (currentPnl >= 15.00 || profitPct >= 50)) {
+        if (debitRoiPct >= 120) {
           newStatus = 'CLOSED_PROFIT';
-          exitReason = 'Profit Target Hit: +$15.00 net / 50% max profit reached.';
+          exitReason = `Stage 4 Target Hit: 2.2x Debit (+${debitRoiPct.toFixed(1)}% ROI) reached.`;
+        } else if (debitRoiPct <= -50) {
+          newStatus = 'CLOSED_RISK';
+          exitReason = `Defined-Risk Debit Stop-Loss Hit (${debitRoiPct.toFixed(1)}% of Net Debit Paid).`;
+          triggerOptPostSlCooldown();
         }
-
+      } else if (intradayMode) {
         const shortCallWall = pos.legs.find((l) => l.type === 'CALL' && l.action === 'SELL')?.strike;
         const bearInvalidationCeil = shortCallWall ? Math.max(shortCallWall, pos.entryUnderlyingPrice * 1.006) : pos.entryUnderlyingPrice * 1.006;
         if (pos.strategyName === 'Bear Call Spread' && markPrice > bearInvalidationCeil) {
           newStatus = 'CLOSED_RISK';
           exitReason = `Resistance Wall Breached (Spot > $${bearInvalidationCeil.toLocaleString()}). Bear Call Spread auto-stopped.`;
+          triggerOptPostSlCooldown();
         }
 
-        // Bear Call Spread Profit Target: +$15.00 net or 50% max profit
         if (pos.strategyName === 'Bear Call Spread' && (currentPnl >= 15.00 || profitPct >= 50)) {
           newStatus = 'CLOSED_PROFIT';
           exitReason = 'Profit Target Hit: +$15.00 net / 50% max profit reached.';
         }
 
-        // Individual Short Leg Stop-Loss (25% premium expansion)
         const legBreached = updatedLegs.some(
           (leg) => leg.action === 'SELL' && (leg.premiumCurrent / leg.premiumEntry - 1) >= 0.25
         );
         if (legBreached && newStatus === pos.status) {
           newStatus = 'CLOSED_RISK';
           exitReason = 'Intraday Short Leg premium expanded ≥ 25%. Auto-stop triggered.';
+          triggerOptPostSlCooldown();
         }
-        
-        // Combined Strategy Max Loss Cap ($15 for micro, $50 for standard)
+
         if (currentPnl <= -15 && newStatus === pos.status) {
           newStatus = 'CLOSED_RISK';
           exitReason = 'Combined Strategy Drawdown Limit Breached (-$15.00)';
-        }
-        
-        // Session Square-off (23:45 UTC)
-        const now = new Date();
-        if (now.getUTCHours() === 23 && now.getUTCMinutes() >= 45) {
-          newStatus = 'CLOSED_EXPIRY';
-          exitReason = 'Intraday Square-off Timer (23:45 UTC)';
+          triggerOptPostSlCooldown();
         }
       }
 
-      if (pos.strategyName === 'Iron Condor') {
+      if (!isDebitSpread && pos.strategyName === 'Iron Condor') {
         if (profitPct >= 65) {
           newStatus = 'CLOSED_PROFIT';
           exitReason = `65% Max Profit Target Achieved. Preferred Exit Triggered.`;
         }
-      } else if (pos.strategyName === 'Iron Butterfly') {
+      } else if (!isDebitSpread && pos.strategyName === 'Iron Butterfly') {
         if (profitPct >= 75) {
           newStatus = 'CLOSED_PROFIT';
           exitReason = `75% Profit Achieved. Mandatory Pin Exit Executed.`;
         }
-      } else if (pos.category === 'DIRECTIONAL') {
-        if (profitPct >= 100) {
+      } else if (!isDebitSpread && pos.category === 'DIRECTIONAL') {
+        if (profitPct >= 120) {
           newStatus = 'CLOSED_PROFIT';
-          exitReason = '100%+ Premium Expansion Target Achieved.';
+          exitReason = '2.2x Debit (+120%) Expansion Target Achieved.';
         }
       }
 
@@ -3258,6 +3365,18 @@ export function useOptionsStrategyEngine({
     setSelectedStrategyName(stratName);
 
     try {
+      if (candles15m.length >= 15 && regimeRouter.isNoTrade && source === 'AUTO_PILOT') {
+        return;
+      }
+      if (utcDayTradesCount >= MAX_TRADES_PER_UTC_DAY || optPostSlCooldownUntilMs > Date.now()) {
+        addAuditLog(
+          'RISK_TRIGGER',
+          utcDayTradesCount >= MAX_TRADES_PER_UTC_DAY ? 'UTC DAILY CAP REACHED (3/3)' : '3-BAR POST-SL COOLDOWN ACTIVE',
+          'Options entry suppressed by daily trade cap or post-SL cooldown.'
+        );
+        return;
+      }
+
       const template = ALL_OPTION_STRATEGIES.find((s) => s.name === stratName)!;
       const activeCycle =
         selectedExpiryCycle && selectedExpiryCycle.timestamp > Date.now()
@@ -3266,7 +3385,6 @@ export function useOptionsStrategyEngine({
       if (activeCycle.dateStr !== selectedExpiryCycle.dateStr) {
         setSelectedExpiryCycle(activeCycle);
       }
-      // Allow 4 defined-risk legs for Iron Condor / Iron Butterfly, 2 legs for Spreads/Strangles
       const maxLegsAllowed = stratName === 'Iron Condor' || stratName === 'Iron Butterfly' ? 4 : 2;
       const isRatioStrategy = /Ratio/i.test(stratName);
       const unifiedBasketLots = Math.max(1, Math.round(basketLots));
@@ -3279,13 +3397,28 @@ export function useOptionsStrategyEngine({
       }));
       const greeks = calculateGreeksSummary(legs);
 
-      const netPremium = legs.reduce((acc, leg) => {
-        return acc + (leg.action === 'SELL' ? leg.premiumEntry * leg.contracts : -leg.premiumEntry * leg.contracts);
+      const contractMult = getContractUnitValue(selectedSymbol);
+      const netPremiumRaw = legs.reduce((acc, leg) => {
+        return acc + (leg.action === 'SELL' ? leg.premiumEntry * leg.contracts * contractMult : -leg.premiumEntry * leg.contracts * contractMult);
       }, 0);
+      const netPremium = Math.abs(netPremiumRaw) > 0 ? netPremiumRaw : -estimatedNetDebitUsd;
+      const netDebitPaidUsd = netPremium < 0 ? +Math.abs(netPremium).toFixed(2) : estimatedNetDebitUsd;
+
+      if (maxNetDebitAllowedUsd > 0 && netDebitPaidUsd > Math.max(maxNetDebitAllowedUsd, netSpreadMarginPerLotUsd) && (stratName === 'Bull Call Spread' || stratName === 'Bear Put Spread')) {
+        addAuditLog(
+          'RISK_TRIGGER',
+          'MAX NET DEBIT > 1% EQUITY CAP',
+          `Net debit $${netDebitPaidUsd.toFixed(2)} exceeds 1% account equity limit ($${maxNetDebitAllowedUsd.toFixed(2)}). Reduce lots.`
+        );
+        onSendNotification('Max Net Debit > 1% Equity', `Estimated spread debit $${netDebitPaidUsd.toFixed(2)} exceeds 1% account equity ($${maxNetDebitAllowedUsd.toFixed(2)}).`, 'RISK');
+        return;
+      }
 
       const legExpiryList = legs
         .map((l) => l.expiryTimestampUtc ?? parseOptionSymbolExpiryUtcMs(l.symbol, l.expiry))
         .filter((ms): ms is number => typeof ms === 'number' && Number.isFinite(ms));
+
+      const isDebitSpreadStrat = stratName === 'Bull Call Spread' || stratName === 'Bear Put Spread';
 
       const newPos: OptionStrategyPosition = {
         id: `opt-${Date.now()}`,
@@ -3301,13 +3434,15 @@ export function useOptionsStrategyEngine({
         lotSize: unifiedBasketLots,
         leverage: effectiveGlobalLeverage,
         marginMode,
-        maxProfitTargetPercent: template.defaultMaxProfitTarget,
+        maxProfitTargetPercent: isDebitSpreadStrat ? 120 : template.defaultMaxProfitTarget,
         currentProfitPercent: 0,
         netPremiumCollectedOrPaid: +netPremium.toFixed(2),
+        netDebitPaidUsd,
+        preExpiryCloseHours: 4,
         unrealisedPnlUsd: 0,
         realisedPnlUsd: cumulativeRealisedPnlRef.current,
-        maxRiskUsd: Math.min(380, Math.max(15, +(liveAvailableEquityUsd * 0.35).toFixed(2) || 380)),
-        maxProfitUsd: Math.abs(netPremium) > 0 ? Math.abs(+netPremium.toFixed(2)) : 500,
+        maxRiskUsd: netDebitPaidUsd,
+        maxProfitUsd: isDebitSpreadStrat ? +(netDebitPaidUsd * 1.2).toFixed(2) : Math.abs(netPremium) > 0 ? Math.abs(+netPremium.toFixed(2)) : 500,
         legs,
         greeks,
         riskStatus: 'Normal',
@@ -3318,8 +3453,8 @@ export function useOptionsStrategyEngine({
         expiryTimestampUtc: legExpiryList.length > 0 ? Math.min(...legExpiryList) : activeCycle.timestamp,
         status: 'ACTIVE',
         aiVerdict: source === 'AUTO_PILOT'
-          ? `AUTO-PILOT DISPATCHED (${aiDirective.confidence}% CONVICTION · ${executionLane === 'NEUTRAL_THETA_HARVEST' ? 'NEUTRAL THETA HARVEST' : aiDirective.regime.toUpperCase()}): ${stratName.toUpperCase()} ACTIVE ON DELTA EXCHANGE INDIA (1:1 BALANCED ${unifiedBasketLots} CTS/LEG · 1/1 MAX SPREAD LOCK · ≤35% EQUITY CAP).`
-          : `MANUAL STAGED TRADE: ${stratName.toUpperCase()} ACTIVE (1:1 BALANCED ${unifiedBasketLots} CTS/LEG). EXIT AT ${template.defaultMaxProfitTarget}% TARGET OR UPON VOLATILITY INVALIDATION.`,
+          ? `AUTO-PILOT DISPATCHED (${stratName.toUpperCase()}): 4-Stage Ladder 1.5x–2.2x Debit · Max Debit <= 1% Equity ($${netDebitPaidUsd.toFixed(2)}) · Auto-Close 4h Pre-Expiry.`
+          : `STAGED ${stratName.toUpperCase()}: 4-Stage Ladder 1.5x–2.2x Debit ($${netDebitPaidUsd.toFixed(2)} Net Debit) · Auto-Close 4h Pre-Expiry.`,
       };
 
       const logPrefix = source === 'AUTO_PILOT' ? '[AUTO-PILOT]' : '[MANUAL STAGE]';
@@ -3447,6 +3582,7 @@ export function useOptionsStrategyEngine({
         const nowExecTs = Date.now();
         lastAutoExecRef.current = nowExecTs;
         setLastAutoExecutionAt(nowExecTs);
+        incrementUtcDayTradeCount();
 
         setActivePosition(newPos);
         if (onPlaySound) onPlaySound();
@@ -3533,9 +3669,65 @@ export function useOptionsStrategyEngine({
   useEffect(() => {
     if (!activePosition || activePosition.status !== 'ACTIVE') return;
 
+    const FOUR_HOURS_MS = 4 * 60 * 60 * 1000;
+
     const checkExpirySettlement = () => {
       const expiryMs = resolvePositionExpiryUtcMs(activePosition);
-      if (expiryMs !== null && Date.now() >= expiryMs) {
+      if (expiryMs === null) return;
+      const remainingToExpiryMs = expiryMs - Date.now();
+
+      // Mandatory 4-Hour Pre-Expiry Auto-Close (prevents gamma/settlement pin risk)
+      if (remainingToExpiryMs > 0 && remainingToExpiryMs <= FOUR_HOURS_MS && canTriggerAutomatedExit()) {
+        const fxRate = usdInrRate && usdInrRate > 0 ? usdInrRate : 85.0;
+        const settledPnlUsd = +(activePosition.unrealisedPnlUsd || 0).toFixed(4);
+        const settledPnlInr = +(settledPnlUsd * fxRate).toFixed(2);
+        const legLabels = activePosition.legs
+          .map((l) => l.symbol || `${l.type}-${l.strike}`)
+          .join(', ');
+
+        if (tradingMode === 'LIVE' && !mtmExitInFlightRef.current) {
+          mtmExitInFlightRef.current = true;
+          const storedCreds = getStoredDeltaCredentials();
+          void closeDeltaOptionsBasket(
+            {
+              strategyName: activePosition.strategyName,
+              reason: 'Auto-Closed 4 Hours Before Expiry',
+              mode: 'LIVE',
+              legs: activePosition.legs.map((l) => ({
+                productId: l.productId,
+                symbol: l.symbol,
+                action: l.action,
+                contracts: l.contracts,
+              })),
+            },
+            storedCreds
+          ).finally(() => {
+            mtmExitInFlightRef.current = false;
+            setActivePosition(null);
+            void refreshPositions(storedCreds);
+            void refreshWallet(storedCreds);
+          });
+        } else if (tradingMode !== 'LIVE') {
+          archiveAndClearOptionsPosition(
+            activePosition,
+            'EXPIRED_SETTLED',
+            `Auto-Closed 4 Hours Before Expiry (${legLabels})`
+          );
+        }
+        addAuditLogRef.current(
+          'EXIT',
+          'Auto-Closed 4 Hours Before Expiry',
+          `${activePosition.strategyName} (${legLabels}) closed inside 4h pre-expiry safety window at ${settledPnlInr >= 0 ? '+' : ''}₹${settledPnlInr.toFixed(2)}.`
+        );
+        onSendNotificationRef.current(
+          'Auto-Closed 4 Hours Before Expiry',
+          `${activePosition.strategyName} closed automatically 4 hours prior to contract expiration.`,
+          'INFO'
+        );
+        return;
+      }
+
+      if (Date.now() >= expiryMs) {
         const fxRate = usdInrRate && usdInrRate > 0 ? usdInrRate : 85.0;
         const settledPnlUsd = +(activePosition.unrealisedPnlUsd || 0).toFixed(4);
         const settledPnlInr = +(settledPnlUsd * fxRate).toFixed(2);
@@ -3569,7 +3761,7 @@ export function useOptionsStrategyEngine({
     checkExpirySettlement();
     const timer = setInterval(checkExpirySettlement, 5000);
     return () => clearInterval(timer);
-  }, [activePosition, resolvePositionExpiryUtcMs, archiveAndClearOptionsPosition, usdInrRate]);
+  }, [activePosition, tradingMode, canTriggerAutomatedExit, resolvePositionExpiryUtcMs, archiveAndClearOptionsPosition, refreshPositions, refreshWallet, usdInrRate]);
 
   // ═══════════════════════════════════════════════════════════
   // 5-SECOND LIVE MTM MONITOR & EXCHANGE RECONCILIATION AGAINST /api/delta/positions
@@ -3742,8 +3934,10 @@ export function useOptionsStrategyEngine({
         }
       }
 
-      // Startup hydration grace guard for automated MTM TP/SL market exits (10s)
+      // Startup hydration grace guard (10s + exchange hydration) for automated MTM exits
       if (
+        !isExchangeHydrated ||
+        (appBootTimestamp && Date.now() - appBootTimestamp < HYDRATION_GRACE_WINDOW_MS) ||
         isHydratingExchangeStateRef.current ||
         !exchangeSyncReady ||
         exchangeSyncConfirmedAtRef.current === 0 ||
@@ -3767,51 +3961,73 @@ export function useOptionsStrategyEngine({
           ? liveExchangeUpnlUsd
           : activePosition?.unrealisedPnlUsd || 0;
       const combinedUpnlInr = +(combinedUpnlUsd * fxRate).toFixed(2);
+      const isDebitSpreadLive =
+        activePosition?.strategyName === 'Bull Call Spread' ||
+        activePosition?.strategyName === 'Bear Put Spread';
       const baseCapitalUsd =
-        liveExchangeMarginUsd > 0
+        isDebitSpreadLive && activePosition?.netDebitPaidUsd && activePosition.netDebitPaidUsd > 0
+          ? activePosition.netDebitPaidUsd
+          : liveExchangeMarginUsd > 0
           ? liveExchangeMarginUsd
           : activePosition?.maxRiskUsd && activePosition.maxRiskUsd > 0
           ? activePosition.maxRiskUsd
           : Math.max(10, Math.abs(activePosition?.netPremiumCollectedOrPaid || 100));
       const combinedProfitPct = +((combinedUpnlUsd / baseCapitalUsd) * 100).toFixed(2);
 
-      // Unified Basket Milestone Tracker: TP1 (25%), TP2 (50%), TP3 (65%), Basket Stop-Loss (-50%)
       const basketKey = activePosition?.id || livePosList.map((p) => p.product_symbol || p.symbol).join('|');
       if (basketMilestonesLoggedRef.current.key !== basketKey) {
         basketMilestonesLoggedRef.current = { key: basketKey, tp1: false, tp2: false };
       }
 
-      if (combinedProfitPct >= 25 && !basketMilestonesLoggedRef.current.tp1) {
+      const tp1MilestonePct = isDebitSpreadLive ? 50 : 25;
+      const tp2MilestonePct = isDebitSpreadLive ? 75 : 50;
+      const finalTargetPct = isDebitSpreadLive ? 120 : 65;
+
+      if (combinedProfitPct >= tp1MilestonePct && !basketMilestonesLoggedRef.current.tp1) {
         basketMilestonesLoggedRef.current.tp1 = true;
         speakVoiceAlert('Target 1 reached. Profit locked.', `${basketKey}:TP1`);
         addAuditLogRef.current(
           'PROFIT_LOCK',
-          '[UNIFIED BASKET · TP1 25% REACHED]',
-          `Combined net UPNL across all legs reached +${combinedProfitPct.toFixed(1)}% (${combinedUpnlInr >= 0 ? '+' : ''}₹${combinedUpnlInr.toFixed(2)}). Holding basket for TP2 (50%) / TP3 (65%).`
+          `[UNIFIED BASKET · TP1 +${tp1MilestonePct}% REACHED]`,
+          `Combined net UPNL reached +${combinedProfitPct.toFixed(1)}% (${combinedUpnlInr >= 0 ? '+' : ''}₹${combinedUpnlInr.toFixed(2)}).`
         );
       }
 
-      if (combinedProfitPct >= 50 && !basketMilestonesLoggedRef.current.tp2) {
+      if (combinedProfitPct >= tp2MilestonePct && !basketMilestonesLoggedRef.current.tp2) {
         basketMilestonesLoggedRef.current.tp2 = true;
         speakVoiceAlert('Target 2 reached. Profit locked.', `${basketKey}:TP2`);
         addAuditLogRef.current(
           'PROFIT_LOCK',
-          '[UNIFIED BASKET · TP2 50% REACHED]',
-          `Combined net UPNL across all legs reached +${combinedProfitPct.toFixed(1)}% (${combinedUpnlInr >= 0 ? '+' : ''}₹${combinedUpnlInr.toFixed(2)}). Closing in on TP3 (65%) full basket exit.`
+          `[UNIFIED BASKET · TP2 +${tp2MilestonePct}% REACHED]`,
+          `Combined net UPNL reached +${combinedProfitPct.toFixed(1)}% (${combinedUpnlInr >= 0 ? '+' : ''}₹${combinedUpnlInr.toFixed(2)}).`
         );
       }
 
-      const hitTp3BasketExit = combinedProfitPct >= 65;
+      const activeExpMs = activePosition ? resolvePositionExpiryUtcMs(activePosition) : null;
+      const preExpiryCloseTriggered = Boolean(
+        activeExpMs !== null &&
+          activeExpMs - Date.now() <= 4 * 60 * 60 * 1000 &&
+          Date.now() < activeExpMs
+      );
+      const hitTp3BasketExit = combinedProfitPct >= finalTargetPct;
       const hitBasketStopLoss = combinedProfitPct <= -50;
 
-      if (!hitTp3BasketExit && !hitBasketStopLoss) {
+      if (!hitTp3BasketExit && !hitBasketStopLoss && !preExpiryCloseTriggered) {
         return;
+      }
+
+      if (hitBasketStopLoss) {
+        triggerOptPostSlCooldown();
       }
 
       mtmExitInFlightRef.current = true;
       try {
-        const exitTypeLabel = hitTp3BasketExit
-          ? 'UNIFIED BASKET TP3 (+65%) HIT'
+        const exitTypeLabel = preExpiryCloseTriggered
+          ? 'AUTO-CLOSED 4 HOURS BEFORE EXPIRY'
+          : hitTp3BasketExit
+          ? isDebitSpreadLive
+            ? 'DEBIT SPREAD 2.2x (+120%) TARGET HIT'
+            : 'UNIFIED BASKET TP3 (+65%) HIT'
           : 'UNIFIED BASKET STOP-LOSS (-50%) TRIGGERED';
 
         const basketCloseRes = await closeDeltaOptionsBasket(
@@ -3893,6 +4109,9 @@ export function useOptionsStrategyEngine({
     exchangeSyncReady,
     resolvePositionExpiryUtcMs,
     archiveAndClearOptionsPosition,
+    isExchangeHydrated,
+    appBootTimestamp,
+    triggerOptPostSlCooldown,
   ]);
 
   // ═══════════════════════════════════════════════════════════
@@ -3919,6 +4138,22 @@ export function useOptionsStrategyEngine({
       };
     }
 
+    if (candles15m.length >= 15) {
+      const fallbackDebitSpread: OptionStrategyName =
+        regimeRouter.recommendedOptionsStrategy ||
+        (regimeRouter.direction === 'SHORT' ? 'Bear Put Spread' : 'Bull Call Spread');
+      if (regimeRouter.isNoTrade) {
+        return {
+          strategy: fallbackDebitSpread,
+          reason: `NO TRADE (CHOP / LOW VOLATILITY): ${regimeRouter.noTradeReasons.join(', ')}`,
+        };
+      }
+      return {
+        strategy: fallbackDebitSpread,
+        reason: `Unified Router: ${regimeRouter.statusLabel} (1.5x–2.2x debit target)`,
+      };
+    }
+
     if (signalOptionsCorrelation.hasActiveSignal && signalOptionsCorrelation.signalSide !== 'NEUTRAL' && signalOptionsCorrelation.convictionPct >= 75) {
       return {
         strategy: signalOptionsCorrelation.recommendedStrategy,
@@ -3926,18 +4161,9 @@ export function useOptionsStrategyEngine({
       };
     }
 
-    const { camarilla } = computeCamarillaLevels(targetMarket, 'LONG', '5m');
-    const { cprRegime } = computeCprRegime(camarilla.pivot, camarilla.tc || 0, camarilla.bc || 0);
-    const price = targetMarket.markPrice;
-    const isRangeBound = price >= camarilla.l3 && price <= camarilla.h3;
-
-    if (isRangeBound || cprRegime === 'WIDE') {
-      return { strategy: 'Iron Condor', reason: 'Range-bound regime detected via CPR/Camarilla -> Neutral Theta Harvest' };
-    } else {
-      const direction = price > camarilla.h3 ? 'Bull Call Spread' : 'Bear Put Spread';
-      return { strategy: direction, reason: 'Momentum regime detected outside H3/L3' };
-    }
-  }, [executionLane, isWide4hCpr, cpr4hWidthPct, isCprStretched, cprStrengthRatio, intradayCalibration, signalOptionsCorrelation]);
+    const direction = targetMarket.markPrice >= (targetMarket.low24h || targetMarket.markPrice) ? 'Bull Call Spread' : 'Bear Put Spread';
+    return { strategy: direction, reason: 'Defined-risk debit spread alignment' };
+  }, [candles15m.length, regimeRouter, signalOptionsCorrelation]);
 
   // Computed Single-Position Lock & Cooldown status (decoupled: Options 1/1 Spread Slot ONLY checks option positions)
   const isSinglePositionLocked = Boolean(
@@ -4008,7 +4234,12 @@ export function useOptionsStrategyEngine({
     const zeroPositions =
       liveExchangePositionsCount === 0 && liveOptionPositions.length === 0 && (!activePosition || activePosition.status !== 'ACTIVE');
 
-    const cooldownClear = autoCooldownRemaining === 0 && postCloseCooldownRemaining === 0;
+    const cooldownClear =
+      autoCooldownRemaining === 0 &&
+      postCloseCooldownRemaining === 0 &&
+      optPostSlCooldownUntilMs <= Date.now();
+    const utcCapOk = utcDayTradesCount < MAX_TRADES_PER_UTC_DAY;
+    const regimeApproved = !(candles15m.length >= 15 && regimeRouter.isNoTrade);
     const timeframeAligned = isNeutralLane ? true : (!hasTimeframeConflict || forceSpotDirection);
     const totalAccountEq = ctxTotalEquity > 0 ? ctxTotalEquity : liveAvailableEquityUsd + ctxMarginUsed;
     const accountMarginUtilizationPct = totalAccountEq > 0
@@ -4025,6 +4256,8 @@ export function useOptionsStrategyEngine({
       trendAligned,
       zeroPositions,
       cooldownClear,
+      utcCapOk,
+      regimeApproved,
       timeframeAligned,
       equityMarginSafe,
       accountMarginUtilizationPct,
@@ -4035,6 +4268,8 @@ export function useOptionsStrategyEngine({
         trendAligned &&
         zeroPositions &&
         cooldownClear &&
+        utcCapOk &&
+        regimeApproved &&
         timeframeAligned &&
         equityMarginSafe,
       signalAgeSec,
@@ -4057,6 +4292,10 @@ export function useOptionsStrategyEngine({
     activePosition,
     autoCooldownRemaining,
     postCloseCooldownRemaining,
+    optPostSlCooldownUntilMs,
+    utcDayTradesCount,
+    candles15m.length,
+    regimeRouter.isNoTrade,
     hasTimeframeConflict,
     forceSpotDirection,
     liveAvailableEquityUsd,
@@ -4077,7 +4316,16 @@ export function useOptionsStrategyEngine({
     if (!autoPilotGates.zeroPositions) {
       return 'Active Live Options Position in Play (1/1 Options Spread Slot) — awaiting basket exit';
     }
+    if (!autoPilotGates.utcCapOk) {
+      return `Daily UTC limit reached (${utcDayTradesCount}/${MAX_TRADES_PER_UTC_DAY} trades today)`;
+    }
+    if (!autoPilotGates.regimeApproved) {
+      return regimeRouter.statusLabel || 'NO TRADE (CHOP / LOW VOLATILITY)';
+    }
     if (!autoPilotGates.cooldownClear) {
+      if (optPostSlCooldownUntilMs > Date.now()) {
+        return `3-bar Post-SL Cooldown (${postSlCooldownBarsRemaining} bars remaining)`;
+      }
       if (postCloseCooldownRemaining > 0) {
         const mins = Math.floor(postCloseCooldownRemaining / 60);
         const secs = postCloseCooldownRemaining % 60;
@@ -4115,6 +4363,10 @@ export function useOptionsStrategyEngine({
     autoPilotLockReason,
     isAnalyzingAutoPilot,
     autoPilotGates,
+    utcDayTradesCount,
+    regimeRouter.statusLabel,
+    optPostSlCooldownUntilMs,
+    postSlCooldownBarsRemaining,
     postCloseCooldownRemaining,
     autoCooldownRemaining,
     liveAvailableEquityUsd,
@@ -4261,15 +4513,35 @@ export function useOptionsStrategyEngine({
   // or if within 15-minute cooldown or awaiting explicit signal direction change (Directional Lane).
   // ═══════════════════════════════════════════════════════════
   useEffect(() => {
-    if (!isAutoPilotEnabled || isLiveUnverified || isExecuting || autoPilotCheckInFlightRef.current) return;
+    const withinBootGuard = Boolean(appBootTimestamp && Date.now() - appBootTimestamp < 10_000);
+    if (
+      !isAutoPilotEnabled ||
+      isLiveUnverified ||
+      !isExchangeHydrated ||
+      withinBootGuard ||
+      isExecuting ||
+      autoPilotCheckInFlightRef.current
+    ) {
+      return;
+    }
     if (!autoPilotGates.allPassed) return;
+    if (utcDayTradesCount >= MAX_TRADES_PER_UTC_DAY || optPostSlCooldownUntilMs > Date.now()) return;
+
+    // Require Unified Regime Router approval & route destination to OPTIONS_DEBIT_SPREAD when trending
+    if (candles15m.length >= 15) {
+      if (regimeRouter.isNoTrade) return;
+      const latest15mSec = normalizeCandleTimeSec(candles15m[candles15m.length - 1]?.time);
+      if (latest15mSec > 0 && latest15mSec <= mountTimestampSecRef.current - 900 && Date.now() - mountTimestampSecRef.current * 1000 < 10_000) {
+        return;
+      }
+    }
 
     // 1. Strictly block if any active position is already in play locally or in PortfolioContext
     if (isSinglePositionLocked) {
       return;
     }
 
-    // 2. Enforce 15-minute cooldown + explicit signal direction change after a full close (Trending Lane)
+    // 2. Enforce 15-minute cooldown + explicit signal direction change after a full close
     const FIFTEEN_MINUTES_MS = 15 * 60 * 1000;
     if (lastFullCloseAtRef.current > 0 && Date.now() - lastFullCloseAtRef.current < FIFTEEN_MINUTES_MS) {
       return;
@@ -4278,7 +4550,7 @@ export function useOptionsStrategyEngine({
       return;
     }
 
-    // 3. In PAPER mode, enforce simulated pre-trade risk checks
+    // 3. Enforce pre-trade risk checks (including Max Net Debit <= 1% Account Equity)
     if (tradingMode !== 'LIVE' && (aiDirective.confidence < 75 || !preTradeRiskChecks.allPassed)) {
       return;
     }
@@ -4289,9 +4561,13 @@ export function useOptionsStrategyEngine({
       return;
     }
 
-    const recommended = intradayMode
-      ? getRecommendedIntradayStrategy(curMarket).strategy
-      : aiDirective.recommendedStrategy;
+    const recommended: OptionStrategyName =
+      candles15m.length >= 15
+        ? regimeRouter.recommendedOptionsStrategy ||
+          (regimeRouter.direction === 'SHORT' ? 'Bear Put Spread' : 'Bull Call Spread')
+        : intradayMode
+        ? getRecommendedIntradayStrategy(curMarket).strategy
+        : aiDirective.recommendedStrategy;
 
     autoPilotCheckInFlightRef.current = true;
     const storedCreds = getStoredDeltaCredentials();
@@ -4380,6 +4656,12 @@ export function useOptionsStrategyEngine({
     intradayCalibration,
     addAuditLog,
     tradingMode,
+    isExchangeHydrated,
+    appBootTimestamp,
+    utcDayTradesCount,
+    optPostSlCooldownUntilMs,
+    candles15m,
+    regimeRouter,
   ]);
 
   // ═══════════════════════════════════════════════════════════
@@ -4807,5 +5089,11 @@ export function useOptionsStrategyEngine({
     liveAvailableEquityUsd,
     nearMissReason,
     ivRvPositive,
+    regimeRouter,
+    regimeStatusLabel,
+    maxNetDebitAllowedUsd,
+    estimatedNetDebitUsd,
+    utcDayTradesCount,
+    postSlCooldownBarsRemaining,
   };
 }

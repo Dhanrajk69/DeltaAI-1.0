@@ -16,6 +16,7 @@ import {
   PerpetualRescueAdjustmentRecord,
   PerpetualRescueOptionQuote,
   PerpetualRescueRecommendation,
+  SniperStrategyMode,
 } from '../types';
 import { getMarketTicker } from '../utils/marketUtils';
 import {
@@ -51,6 +52,49 @@ import {
   enforceMaxEquityRiskContracts,
 } from '../utils/drawdownRescueUtils';
 import { queueAnalyticsSignal, queueAnalyticsEvent } from '../utils/analyticsWarehouseClient';
+import {
+  evaluateUnifiedRegimeRouter,
+  UnifiedRegimeRouterResult,
+  evaluateEma921MomentumCross5m,
+  Ema921MomentumCrossResult,
+  normalizeCandleTimeSec,
+} from '../utils/aiMatrixEngine';
+import {
+  DELTA_MAKER_FEE_RATE,
+  DELTA_GST_RATE_UNIFIED,
+  EMA921_PARTIAL_PTS_BTC,
+  EMA921_RUNNER_PTS_BTC,
+  FEE_ADJUSTED_BE_BUFFER,
+  MAX_TRADES_PER_UTC_DAY,
+  POST_SL_COOLDOWN_BARS,
+  PENDING_LIMIT_TTL_BARS,
+} from '../utils/backtestEngine';
+
+export interface PendingSniperLimitOrder {
+  id: string;
+  orderId?: string | number;
+  symbol: string;
+  side: 'LONG' | 'SHORT';
+  limitPrice: number;
+  stopLoss: number;
+  tp1: number;
+  tp2: number;
+  tp3: number;
+  tp4: number;
+  lotSize: number;
+  contracts: number;
+  leverage: number;
+  placedAtMs: number;
+  expiresAtMs: number;
+  signalId: string;
+  feeAdjustedBePrice: number;
+  friction?: any;
+  camarilla?: any;
+  exposureMode?: SniperExposureMode;
+  scalpTier?: SniperScalpTier;
+  confidence?: number;
+  confidenceStatus?: SniperConfidenceStatus;
+}
 
 export interface SniperPositionSyncUpdate {
   symbol: string;
@@ -70,6 +114,8 @@ interface UseSniperScalpingEngineOptions {
   tradingMode: TradingMode;
   availableBalance: number;
   isLiveApiAuthenticated?: boolean;
+  isExchangeHydrated?: boolean;
+  appBootTimestamp?: number;
   onExecuteOrder: (order: any) => Promise<any>;
   onClosePosition: (positionId: string, reason?: string) => Promise<void>;
   onRecordClosedTrade?: (trade: ClosedTrade, posUpdate?: SniperPositionSyncUpdate) => void;
@@ -536,6 +582,8 @@ export function useSniperScalpingEngine({
   tradingMode,
   availableBalance,
   isLiveApiAuthenticated = false,
+  isExchangeHydrated = true,
+  appBootTimestamp = Date.now(),
   onExecuteOrder: onExecuteOrderProp,
   onClosePosition: onClosePositionProp,
   onRecordClosedTrade: onRecordClosedTradeProp,
@@ -592,21 +640,17 @@ export function useSniperScalpingEngine({
     []
   );
 
-  const [paperAutoSniperEnabled, setPaperAutoSniperEnabled] = useState<boolean>(() => {
-    try {
-      return localStorage.getItem('delta_sniper_autopilot_armed_v1') === 'true';
-    } catch {
-      return false;
-    }
-  });
-  const [liveAutoSniperEnabled, setLiveAutoSniperEnabled] = useState<boolean>(() => {
-    try {
-      return localStorage.getItem('delta_sniper_autopilot_armed_v1') === 'true';
-    } catch {
-      return false;
-    }
-  });
+  // Requirement 4: Auto-Pilot MUST initialize to false on every fresh boot
+  const [paperAutoSniperEnabled, setPaperAutoSniperEnabled] = useState<boolean>(false);
+  const [liveAutoSniperEnabled, setLiveAutoSniperEnabled] = useState<boolean>(false);
+  const hasUserArmedInSessionRef = useRef<boolean>(false);
+  const mountTimestampSecRef = useRef<number>(Math.floor(Date.now() / 1000));
+  const [manualLotSize, setManualLotSizeState] = useState<number | null>(null);
+  const [pendingLimitOrder, setPendingLimitOrder] = useState<PendingSniperLimitOrder | null>(null);
+  const pendingLimitOrderRef = useRef<PendingSniperLimitOrder | null>(null);
+  pendingLimitOrderRef.current = pendingLimitOrder;
   const [directionMode, setDirectionMode] = useState<'AUTO' | 'LONG' | 'SHORT'>('AUTO');
+  const [sniperStrategyMode, setSniperStrategyMode] = useState<SniperStrategyMode>('UNIFIED_MTF_PULLBACK');
   const [exposureMode, setExposureMode] = useState<SniperExposureMode>('MICRO_50');
   const [scalpTier, setScalpTierState] = useState<SniperScalpTier>('TIER_50');
   const [signalSource, setSignalSource] = useState<'COMMAND_CENTER' | 'QUANT_ALGO'>('COMMAND_CENTER');
@@ -839,23 +883,44 @@ export function useSniperScalpingEngine({
     setIsSignalStandby(false);
   }, [selectedSymbol, directionMode, exposureMode, signalSource, setIsSignalStandby]);
 
-  // Real 5m, 15m, and 4h Candles for Dual-Timeframe CPR Regime Classifier + EMA 9/20
+  // Real 5m, 15m, 1h, and 4h Candles for Unified Multi-Timeframe Regime Router
   const [candles5m, setCandles5m] = useState<any[]>([]);
   const [candles15m, setCandles15m] = useState<any[]>([]);
+  const [candles1h, setCandles1h] = useState<any[]>([]);
   const [candles4h, setCandles4h] = useState<any[]>([]);
+
+  // Reset manual lot override if symbol or risk sizing config changes
+  const prevRiskConfigSigRef = useRef<string>(`${selectedSymbol}:${capitalAlloc.defaultLotSize}:${capitalAlloc.lotSizingMode}`);
+  useEffect(() => {
+    const sig = `${selectedSymbol}:${capitalAlloc.defaultLotSize}:${capitalAlloc.lotSizingMode}`;
+    if (prevRiskConfigSigRef.current !== sig) {
+      prevRiskConfigSigRef.current = sig;
+      setManualLotSizeState(null);
+    }
+  }, [selectedSymbol, capitalAlloc.defaultLotSize, capitalAlloc.lotSizingMode]);
+
+  const setManualLotSize = useCallback((val: number | null) => {
+    if (val === null || !Number.isFinite(val) || val <= 0) {
+      setManualLotSizeState(null);
+      return;
+    }
+    setManualLotSizeState(+Number(val).toFixed(4));
+  }, []);
 
   useEffect(() => {
     let active = true;
     const fetchMultiTfCandles = async () => {
       try {
-        const [r5, r15, r4h] = await Promise.all([
+        const [r5, r15, r1h, r4h] = await Promise.all([
           fetch(`/api/delta/candles?symbol=${encodeURIComponent(selectedSymbol)}&resolution=5m`).then((r) => r.json()).catch(() => null),
           fetch(`/api/delta/candles?symbol=${encodeURIComponent(selectedSymbol)}&resolution=15m`).then((r) => r.json()).catch(() => null),
+          fetch(`/api/delta/candles?symbol=${encodeURIComponent(selectedSymbol)}&resolution=1h`).then((r) => r.json()).catch(() => null),
           fetch(`/api/delta/candles?symbol=${encodeURIComponent(selectedSymbol)}&resolution=4h`).then((r) => r.json()).catch(() => null),
         ]);
         if (!active) return;
         if (Array.isArray(r5?.candles) && r5.candles.length > 0) setCandles5m(r5.candles);
         if (Array.isArray(r15?.candles) && r15.candles.length > 0) setCandles15m(r15.candles);
+        if (Array.isArray(r1h?.candles) && r1h.candles.length > 0) setCandles1h(r1h.candles);
         if (Array.isArray(r4h?.candles) && r4h.candles.length > 0) setCandles4h(r4h.candles);
       } catch {}
     };
@@ -867,7 +932,63 @@ export function useSniperScalpingEngine({
     };
   }, [selectedSymbol, manualRefreshEpoch]);
 
-  // Anti-Chop Micro Protection: Max 3 Micro trades per rolling hour + 10m post-SL cooldown
+  // Max 3 trades per UTC day + 3-bar (45m on 15m timeframe) post-SL cooldown
+  const utcDayStorageKey = `delta_sniper_utc_trades_v1_${tradingMode}`;
+  const getTodayUtcStr = () => new Date().toISOString().slice(0, 10);
+  const [utcDayState, setUtcDayState] = useState<{ date: string; count: number }>(() => {
+    const today = getTodayUtcStr();
+    try {
+      const raw = localStorage.getItem(utcDayStorageKey);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (parsed?.date === today) {
+          return { date: today, count: Math.max(0, Number(parsed.count) || 0) };
+        }
+      }
+    } catch {}
+    return { date: today, count: 0 };
+  });
+  const [postSlCooldownUntilMs, setPostSlCooldownUntilMs] = useState<number>(() => {
+    try {
+      const raw = localStorage.getItem(`delta_sniper_post_sl_v1_${tradingMode}`);
+      return Number(raw || 0);
+    } catch {
+      return 0;
+    }
+  });
+
+  useEffect(() => {
+    const today = getTodayUtcStr();
+    try {
+      const raw = localStorage.getItem(utcDayStorageKey);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (parsed?.date === today) {
+          setUtcDayState({ date: today, count: Math.max(0, Number(parsed.count) || 0) });
+        } else {
+          setUtcDayState({ date: today, count: 0 });
+        }
+      } else {
+        setUtcDayState({ date: today, count: 0 });
+      }
+      setPostSlCooldownUntilMs(Number(localStorage.getItem(`delta_sniper_post_sl_v1_${tradingMode}`) || 0));
+    } catch {}
+  }, [utcDayStorageKey, tradingMode]);
+
+  const utcDayTradesCount = utcDayState.date === getTodayUtcStr() ? utcDayState.count : 0;
+  const incrementUtcDayTradeCount = useCallback(() => {
+    const today = getTodayUtcStr();
+    setUtcDayState((prev) => {
+      const nextCount = (prev.date === today ? prev.count : 0) + 1;
+      const next = { date: today, count: nextCount };
+      try {
+        localStorage.setItem(utcDayStorageKey, JSON.stringify(next));
+      } catch {}
+      return next;
+    });
+  }, [utcDayStorageKey]);
+
+  // Anti-Chop Micro Protection: Max 3 Micro trades per rolling hour + 3-bar post-SL cooldown
   const chopStorageKey = `delta_micro_chop_v1_${tradingMode}`;
   const [microTradeTimestamps, setMicroTradeTimestamps] = useState<number[]>(() => {
     try {
@@ -926,8 +1047,13 @@ export function useSniperScalpingEngine({
   }, [microSlCooldownUntil, persistMicroChopState]);
 
   const triggerMicroSlCooldown = useCallback(() => {
-    const until = Date.now() + 10 * 60 * 1000; // 10 minutes
+    const threeBarCooldownMs = POST_SL_COOLDOWN_BARS * 15 * 60 * 1000; // 3 x 15m bars = 45m
+    const until = Date.now() + threeBarCooldownMs;
     setMicroSlCooldownUntil(until);
+    setPostSlCooldownUntilMs(until);
+    try {
+      localStorage.setItem(`delta_sniper_post_sl_v1_${tradingMode}`, String(until));
+    } catch {}
     setMicroTradeTimestamps((prev) => {
       const oneHrAgo = Date.now() - 3600_000;
       const pruned = prev.filter((t) => t >= oneHrAgo);
@@ -988,6 +1114,10 @@ export function useSniperScalpingEngine({
   const isAutoSniperEnabled = isLiveMode ? liveAutoSniperEnabled : paperAutoSniperEnabled;
 
   const syncSniperAutoPilotFromServer = useCallback((armed: boolean) => {
+    // Boot safety: ignore remote armed=true unless explicitly armed in current browser session
+    if (armed && !hasUserArmedInSessionRef.current) {
+      return;
+    }
     setLiveAutoSniperEnabled(armed);
     setPaperAutoSniperEnabled(armed);
     if (armed) {
@@ -999,25 +1129,11 @@ export function useSniperScalpingEngine({
     } catch {}
   }, []);
 
-  // Hydrate sniperAutoPilotArmed from ~/.deltaai-data/config.json on mount and cross-device sync events
+  // Ensure server-side sniperAutoPilotArmed stays reset to false on initial boot
   useEffect(() => {
-    let isMounted = true;
-    fetch('/api/delta/autopilot-state')
-      .then((res) => res.json())
-      .then((data) => {
-        if (!isMounted || !data?.success) return;
-        const serverArmed =
-          typeof data.sniperAutoPilotArmed === 'boolean'
-            ? data.sniperAutoPilotArmed
-            : typeof data.state?.sniperAutoPilotArmed === 'boolean'
-            ? data.state.sniperAutoPilotArmed
-            : undefined;
-        if (typeof serverArmed === 'boolean') {
-          syncSniperAutoPilotFromServer(serverArmed);
-        }
-      })
-      .catch(() => {});
-
+    try {
+      localStorage.setItem('delta_sniper_autopilot_armed_v1', 'false');
+    } catch {}
     const handleSyncEvent = (ev: Event) => {
       const detail = (ev as CustomEvent)?.detail;
       if (detail && typeof detail.sniperAutoPilotArmed === 'boolean') {
@@ -1028,7 +1144,6 @@ export function useSniperScalpingEngine({
       window.addEventListener('delta:sync-autopilot-config', handleSyncEvent);
     }
     return () => {
-      isMounted = false;
       if (typeof window !== 'undefined') {
         window.removeEventListener('delta:sync-autopilot-config', handleSyncEvent);
       }
@@ -1037,6 +1152,7 @@ export function useSniperScalpingEngine({
 
   const setIsAutoSniperEnabled = useCallback(
     (val: boolean) => {
+      hasUserArmedInSessionRef.current = val;
       if (val) {
         lastAttemptTsRef.current = 0;
         lastAutoExecutedSignalId.current = null;
@@ -1691,6 +1807,44 @@ export function useSniperScalpingEngine({
       timeframe
     ).camarilla;
 
+    // Unified Multi-Timeframe Regime & Volatility Router (4H + 1H + 15M + Daily CPR)
+    const toOhlc = (arr: any[]) =>
+      (Array.isArray(arr) ? arr : [])
+        .filter((c) => c && Number(c.close) > 0)
+        .map((c) => ({
+          time: Number(c.time || c.timestamp || Date.now() / 1000),
+          open: Number(c.open || c.close),
+          high: Number(c.high || c.close),
+          low: Number(c.low || c.close),
+          close: Number(c.close),
+          volume: Number(c.volume || 1),
+        }));
+
+    const dailyCprPctInput = preliminaryCamarilla.cprWidthRatio
+      ? +(preliminaryCamarilla.cprWidthRatio * 100).toFixed(4)
+      : undefined;
+
+    const regimeRouter: UnifiedRegimeRouterResult = evaluateUnifiedRegimeRouter({
+      symbol: selectedSymbol,
+      markPrice,
+      candles15m: toOhlc(candles15m),
+      candles1h: toOhlc(candles1h),
+      candles4h: toOhlc(candles4h),
+      candles5m: toOhlc(candles5m),
+      dailyCprWidthPct: dailyCprPctInput,
+    });
+
+    const isEma921Mode = sniperStrategyMode === 'EMA_9_21_MOMENTUM_5M';
+    const evalLotBtc = manualLotSize && manualLotSize > 0 ? manualLotSize : 0.09;
+    const ema921Cross: Ema921MomentumCrossResult = evaluateEma921MomentumCross5m({
+      symbol: selectedSymbol,
+      markPrice,
+      candles5m: toOhlc(candles5m),
+      candles15m: toOhlc(candles15m),
+      useLastClosedBar: true,
+      lotSizeBtc: evalLotBtc,
+    });
+
     // Dual-Timeframe CPR Regime Classifier (5m/15m Narrow <= 0.15% vs 4h Wide >= 0.45%)
     const dualCpr = classifyDualTimeframeCprRegime({
       markPrice,
@@ -2048,6 +2202,23 @@ export function useSniperScalpingEngine({
         }
       }
     }
+    if (isEma921Mode) {
+      if (directionMode === 'AUTO') {
+        dir = ema921Cross.crossDirection !== 'NEUTRAL'
+          ? ema921Cross.crossDirection
+          : ema921Cross.ema9_5m >= ema921Cross.ema21_5m
+          ? 'LONG'
+          : 'SHORT';
+      }
+      rangeSwingTrigger = {
+        tag: `[5m EMA 9/21 MOMENTUM CROSS ${dir}]`,
+        type: dir === 'LONG' ? 'FIB_BOUNCE' : 'PDL_BREAKDOWN',
+        direction: dir,
+        entryPrice: ema921Cross.entryPrice > 0 ? ema921Cross.entryPrice : markPrice,
+        description: ema921Cross.statusLabel,
+        isInsideRange: true,
+      };
+    }
     const isLong = dir === 'LONG';
 
     // Compute Camarilla Pivot Levels (H1–H6, L1–L6), CPR, ATR14, and Camarilla-mapped targets
@@ -2116,16 +2287,18 @@ export function useSniperScalpingEngine({
       : `${camarilla.cprRegime || 'AVERAGE'} CPR (BREAKOUT ARMED)`;
 
     // ─────────────────────────────────────────────────────────
-    // 3. Anti-Chop Protection & Harvest Lockout Check:
-    // - Max 3 Micro trades per hour
-    // - 10-minute cooldown after Stop-Loss hit
+    // 3. Unified Anti-Chop, Daily UTC Cap (3/day) & 3-Bar Post-SL Cooldown
     // ─────────────────────────────────────────────────────────
     const nowTs = Date.now();
     const oneHourAgoTs = nowTs - 3600_000;
     const microTradesLastHour = microTradeTimestamps.filter((ts) => ts >= oneHourAgoTs).length;
+    const activeSlCooldownUntil = Math.max(microSlCooldownUntil, postSlCooldownUntilMs);
     const microSlCooldownRemainingSec =
-      microSlCooldownUntil > nowTs ? Math.ceil((microSlCooldownUntil - nowTs) / 1000) : 0;
-    const microAntiChopPassed = !isMicro15 || (microTradesLastHour < 3 && microSlCooldownRemainingSec === 0);
+      activeSlCooldownUntil > nowTs ? Math.ceil((activeSlCooldownUntil - nowTs) / 1000) : 0;
+    const postSlCooldownBarsRemaining =
+      microSlCooldownRemainingSec > 0 ? Math.ceil(microSlCooldownRemainingSec / 900) : 0;
+    const utcDayCapPassed = utcDayTradesCount < MAX_TRADES_PER_UTC_DAY;
+    const microAntiChopPassed = utcDayCapPassed && microSlCooldownRemainingSec === 0 && (!isMicro15 || microTradesLastHour < 3);
 
     const isLockoutActive = harvestTargetHit && (lockoutExpiry !== null && nowTs < lockoutExpiry);
     const cooldownPassed = !isLockoutActive && microAntiChopPassed;
@@ -2372,7 +2545,7 @@ export function useSniperScalpingEngine({
       perpOnlyPositions.some((pos) => (pos.mode || 'PAPER') === tradingMode);
     const optionsSpreadSlotOccupied = optionsOnlyPositions.some((pos) => (pos.mode || 'PAPER') === tradingMode);
 
-    const signalCoreSignature = `${selectedSymbol}-${dir}-${effectiveExposureMode}-${signalSource}-${manualRefreshEpoch}-${isCommandCenterActive && commandCard?.symbol ? `${commandCard.symbol}-${aiAnalysisVersionRef.current}` : 'QUANT'}`;
+    const signalCoreSignature = `${selectedSymbol}-${sniperStrategyMode}-${dir}-${effectiveExposureMode}-${signalSource}-${manualRefreshEpoch}-${isCommandCenterActive && commandCard?.symbol ? `${commandCard.symbol}-${aiAnalysisVersionRef.current}` : 'QUANT'}`;
     if (
       prevSignalCoreSignatureRef.current !== signalCoreSignature ||
       (prevSignalStandbyRef.current && !isSignalStandby)
@@ -2420,32 +2593,61 @@ export function useSniperScalpingEngine({
         ? lockedSignalLevelsRef.current
         : null;
 
-    // Final guarantee: enforce >= max(1.5x 5m ATR, 0.55% BTC) + $35 wick buffer and 1.25R / 2.00R TP1 / TP2 on hydrated levels
-    const entryPrice = lockedLevels ? lockedLevels.entryPrice : candidateEntry;
-    const finalBrackets = enforceMinimumSniperStopBuffer({
-      entryPrice,
-      side: dir,
-      symbol: selectedSymbol,
-      stopLoss: lockedLevels ? lockedLevels.initialStopLoss : rawInitialStopLoss,
-      tp1: lockedLevels ? lockedLevels.tp1 : rawTp1,
-      tp2: lockedLevels ? lockedLevels.tp2 : rawTp2,
-      tp3: lockedLevels ? lockedLevels.tp3 : rawTp3,
-      tp4: lockedLevels ? lockedLevels.tp4 : rawTp4,
-      atr5m: realAtr5m,
-      h3: camarilla.h3,
-      l3: camarilla.l3,
-      swingLow: recent5mLow,
-      swingHigh: recent5mHigh,
-    });
-    const initialStopLoss = finalBrackets.stopLoss;
-    const tp1 = finalBrackets.tp1;
-    const tp2 = finalBrackets.tp2;
-    const tp3 = finalBrackets.tp3;
-    const tp4 = finalBrackets.tp4;
+    // Final guarantee: either 5m EMA 9/21 Momentum Cross OR 15m Maker Pullback brackets
+    const resolvedEntryPrice = isEma921Mode
+      ? (ema921Cross.entryPrice > 0 ? ema921Cross.entryPrice : markPrice)
+      : (lockedLevels
+        ? lockedLevels.entryPrice
+        : (directionMode === 'AUTO' &&
+          candles15m.length >= 15 &&
+          regimeRouter.routeDestination === 'PERPETUALS' &&
+          regimeRouter.pullbackEntryZone > 0
+            ? regimeRouter.pullbackEntryZone
+            : candidateEntry));
+    const entryPrice = resolvedEntryPrice;
 
-    const finalStopLossDist = finalBrackets.slDistance || (markPrice * MIN_SNIPER_SL_BUFFER_PCT);
+    const minSlPctFloor = isBtcSymbol ? 0.0055 : 0.0045;
+    const atr15mRiskDist = Math.max(
+      (regimeRouter.atr14_15m > 0 ? regimeRouter.atr14_15m : realAtr5m) * 1.5,
+      entryPrice * minSlPctFloor
+    );
+    const swingBasedSl = isLong
+      ? Math.min(entryPrice - atr15mRiskDist, (regimeRouter.swingInvalidation || entryPrice) - (regimeRouter.atr14_15m * 0.25))
+      : Math.max(entryPrice + atr15mRiskDist, (regimeRouter.swingInvalidation || entryPrice) + (regimeRouter.atr14_15m * 0.25));
+    const initialStopLoss = isEma921Mode
+      ? (ema921Cross.stopLoss > 0
+        ? ema921Cross.stopLoss
+        : formatCamarillaPrice(isLong ? entryPrice - 95 : entryPrice + 95, entryPrice))
+      : formatCamarillaPrice(
+          candles15m.length >= 15 ? swingBasedSl : (lockedLevels ? lockedLevels.initialStopLoss : rawInitialStopLoss),
+          entryPrice
+        );
+    const actualRiskDist = isEma921Mode
+      ? Math.max(Math.abs(entryPrice - initialStopLoss), ema921Cross.slDistancePts || 85)
+      : Math.max(Math.abs(entryPrice - initialStopLoss), atr15mRiskDist);
+    // Delayed Fee-Adjusted BE (+1.35R Step 01) & EMA 20 runner targets OR 5m EMA 9/21 (+100pt / +220pt)
+    const tp1 = isEma921Mode
+      ? ema921Cross.tp1Target
+      : formatCamarillaPrice(isLong ? entryPrice + actualRiskDist * 1.35 : entryPrice - actualRiskDist * 1.35, entryPrice);
+    const tp2 = isEma921Mode
+      ? ema921Cross.tp2Target
+      : formatCamarillaPrice(isLong ? entryPrice + actualRiskDist * 2.5 : entryPrice - actualRiskDist * 2.5, entryPrice);
+    const tp3 = isEma921Mode
+      ? ema921Cross.tp3Target
+      : formatCamarillaPrice(isLong ? entryPrice + actualRiskDist * 2.85 : entryPrice - actualRiskDist * 2.85, entryPrice);
+    const tp4 = isEma921Mode
+      ? ema921Cross.tp4Target
+      : formatCamarillaPrice(isLong ? entryPrice + actualRiskDist * 3.25 : entryPrice - actualRiskDist * 3.25, entryPrice);
+    const feeAdjustedBePrice = isEma921Mode
+      ? ema921Cross.feeAdjustedBePrice
+      : formatCamarillaPrice(
+          isLong ? entryPrice * (1 + FEE_ADJUSTED_BE_BUFFER) : entryPrice * (1 - FEE_ADJUSTED_BE_BUFFER),
+          entryPrice
+        );
 
-    // Resolve exact lot size & contract quantity scaled automatically to stay strictly within riskSettings.maxRiskPerTradePct (1%)
+    const finalStopLossDist = actualRiskDist || (markPrice * MIN_SNIPER_SL_BUFFER_PCT);
+
+    // Resolve exact lot size & contract quantity (supports direct manual lot input edits)
     const safeLotRes = capitalAlloc.resolveSafeExecutionLot({
       symbol: selectedSymbol,
       markPrice: entryPrice > 0 ? entryPrice : refEntry,
@@ -2453,21 +2655,25 @@ export function useSniperScalpingEngine({
       totalEquity: derivedTotalEq,
       stopLossDistance: finalStopLossDist,
       leverage: deltaLeverage,
+      overrideLotSize: manualLotSize !== null && manualLotSize > 0 ? manualLotSize : undefined,
     });
 
-    const lotSize = safeLotRes.lotSize;
-    const requestedLotSize = safeLotRes.requestedLotSize;
-    const contractsCount = safeLotRes.contracts;
-    const microContractsCount = safeLotRes.contracts;
+    const hasManualLot = manualLotSize !== null && manualLotSize > 0;
+    const lotSize = hasManualLot ? manualLotSize! : safeLotRes.lotSize;
+    const requestedLotSize = hasManualLot ? manualLotSize! : safeLotRes.requestedLotSize;
+    const contractsCount = hasManualLot ? capitalAlloc.getContractsCount(selectedSymbol, lotSize) : safeLotRes.contracts;
+    const microContractsCount = contractsCount;
     const microNotionalUsd = +(lotSize * (entryPrice > 0 ? entryPrice : refEntry)).toFixed(2);
-    const microMarginUsd = safeLotRes.estimatedMarginUsd;
+    const microMarginUsd = hasManualLot
+      ? capitalAlloc.getMarginRequirement(entryPrice > 0 ? entryPrice : refEntry, lotSize, deltaLeverage)
+      : safeLotRes.estimatedMarginUsd;
 
     const minRrThreshold = isMicroScalp ? 1.0 : 1.5;
     const grossReward = Math.max(0, +(Math.abs(tp4 - entryPrice) * lotSize).toFixed(2));
     const grossRisk = Math.max(0.01, +(Math.abs(entryPrice - initialStopLoss) * lotSize).toFixed(2));
     const riskRewardThreshold = (grossRisk > 0 ? (grossReward / grossRisk) : 0) >= minRrThreshold;
 
-    const marginReq = safeLotRes.estimatedMarginUsd;
+    const marginReq = microMarginUsd;
     const marginDeficit = Math.max(0, marginReq - effectiveBalance);
 
     const accountMarginUtilizationPct =
@@ -2476,48 +2682,81 @@ export function useSniperScalpingEngine({
 
     const sufficientMargin = !isLiveUnverified && marginUtilizationSafe && (effectiveBalance >= marginReq || isBypassActive);
     const pointValue = capitalAlloc.getPointValue(lotSize);
-    const safeClampedLot = safeLotRes.lotSize;
+    const safeClampedLot = lotSize;
 
     // ═══════════════════════════════════════════════════════════
-    // RISK PROTECTION LAYER (7 PRE-ENTRY GATES)
+    // RISK PROTECTION LAYER (7 PRE-ENTRY GATES + UNIFIED REGIME ROUTER / 5M EMA 9/21)
     // ═══════════════════════════════════════════════════════════
-    const signalValidationPassed =
-      (isBypassActive && !antiChaseGuard.chopZoneBlocked) ||
-      (!htfTrendLock &&
-        higherTimeframeTrend &&
-        vwapAlignment &&
-        emaStructure &&
-        volumeConfirmation &&
-        rsiMomentum &&
-        marketSentiment &&
-        supportResistance &&
-        riskRewardThreshold &&
-        confidenceAboveMin &&
-        candleConfirmed &&
-        cprFilterPassed);
+    const ema921ChopBlocked =
+      isEma921Mode &&
+      !isBypassActive &&
+      (!ema921Cross.filtersPassed || (directionMode !== 'AUTO' && ema921Cross.direction !== dir));
+    const regimeNoTradeBlocked = isEma921Mode
+      ? ema921ChopBlocked
+      : candles15m.length >= 15 && regimeRouter.isNoTrade && !isBypassActive;
+
+    const effectiveCandleConfirmed = isEma921Mode
+      ? isBypassActive || (ema921Cross.hasConfirmedCross && ema921Cross.barBodyConfirmed)
+      : candleConfirmed;
+    const effectiveCprFilterPassed = isEma921Mode ? true : cprFilterPassed;
+    const effectiveHtfTrendPass = isEma921Mode
+      ? isBypassActive || (ema921Cross.ema50Aligned && (isLong ? ema921Cross.ema21SlopeUp : ema921Cross.ema21SlopeDown))
+      : higherTimeframeTrend;
+    const effectiveVwapPass = isEma921Mode
+      ? isBypassActive || ema921Cross.vwapAligned
+      : vwapAlignment;
+    const effectiveConfidence = isEma921Mode
+      ? (ema921Cross.filtersPassed ? Math.max(confidence, ema921Cross.adx14_5m >= 26 ? 90 : 84) : Math.min(confidence, 68))
+      : confidence;
+    const effectiveConfidenceStatus: SniperConfidenceStatus = isEma921Mode
+      ? (ema921Cross.filtersPassed ? (effectiveConfidence >= 90 ? 'Ultra Strong' : 'Strong') : 'No Trade')
+      : confidenceStatus;
+    const effectiveConfidenceAboveMin = isEma921Mode
+      ? isBypassActive || (ema921Cross.filtersPassed && effectiveConfidence >= 75)
+      : confidenceAboveMin;
+
+    const signalValidationPassed = isEma921Mode
+      ? (isBypassActive || (ema921Cross.filtersPassed && !ema921ChopBlocked))
+      : (!regimeNoTradeBlocked &&
+        ((isBypassActive && !antiChaseGuard.chopZoneBlocked) ||
+          (!htfTrendLock &&
+            higherTimeframeTrend &&
+            vwapAlignment &&
+            emaStructure &&
+            volumeConfirmation &&
+            rsiMomentum &&
+            marketSentiment &&
+            supportResistance &&
+            riskRewardThreshold &&
+            confidenceAboveMin &&
+            candleConfirmed &&
+            cprFilterPassed)));
 
     const signalValidationStatus: 'PASS' | 'PASS_OVERRIDE' | 'AWAITING_CANDLE' | 'WARNING' | 'FAIL' =
-      isExplicitPaperHtfBypass
+      regimeNoTradeBlocked
+        ? 'FAIL'
+        : isExplicitPaperHtfBypass
         ? 'PASS_OVERRIDE'
-        : !candleConfirmed
+        : !effectiveCandleConfirmed
         ? 'AWAITING_CANDLE'
         : isBypassActive
         ? 'PASS_OVERRIDE'
-        : htfDivergenceWarning
+        : (!isEma921Mode && htfDivergenceWarning)
         ? 'WARNING'
         : signalValidationPassed
         ? 'PASS'
         : 'FAIL';
 
-    const confidenceThresholdMet = confidence >= 75 && confidenceStatus !== 'No Trade';
+    const confidenceThresholdMet = effectiveConfidence >= 75 && effectiveConfidenceStatus !== 'No Trade';
     const positionSizeReceived = lotSize > 0;
     const leverageWithinCap = deltaLeverage > 0 && deltaLeverage <= capitalAlloc.maxLeverageCap;
     const deltaLeverageAvailable = deltaLeverage > 0 && leverageWithinCap;
-    const riskLimitsNotBreached = !isLiveUnverified && leverageWithinCap && marginUtilizationSafe && microAntiChopPassed;
+    const riskLimitsNotBreached = !isLiveUnverified && leverageWithinCap && marginUtilizationSafe && microAntiChopPassed && utcDayCapPassed;
 
     const allRiskGatesPassed =
       !isLiveUnverified &&
-      !htfTrendLock &&
+      !regimeNoTradeBlocked &&
+      (isEma921Mode || !htfTrendLock) &&
       signalValidationPassed &&
       confidenceThresholdMet &&
       positionSizeReceived &&
@@ -2526,10 +2765,11 @@ export function useSniperScalpingEngine({
       sufficientMargin &&
       marginUtilizationSafe &&
       riskLimitsNotBreached &&
-      candleConfirmed &&
-      cprFilterPassed &&
+      effectiveCandleConfirmed &&
+      effectiveCprFilterPassed &&
       cooldownPassed &&
-      microAntiChopPassed;
+      microAntiChopPassed &&
+      utcDayCapPassed;
 
     const otherGatesPassed =
       confidenceThresholdMet &&
@@ -2539,15 +2779,18 @@ export function useSniperScalpingEngine({
       marginUtilizationSafe &&
       riskLimitsNotBreached &&
       microAntiChopPassed &&
+      utcDayCapPassed &&
       !isLiveUnverified;
 
     let executionGateStatus: 'TRADE APPROVED' | 'ARMED_CONDITIONAL' | 'STANDBY' | 'TRADE BLOCKED';
     let tradeApproved = false;
 
-    const isHardGateFail =
-      antiChaseGuard.chopZoneBlocked
-        ? !isExplicitPaperHtfBypass
-        : !isBypassActive && (!signalValidationPassed || !cprFilterPassed || !candleConfirmed);
+    const isHardGateFail = isEma921Mode
+      ? (!isBypassActive && (ema921ChopBlocked || !signalValidationPassed))
+      : (regimeNoTradeBlocked ||
+        (antiChaseGuard.chopZoneBlocked
+          ? !isExplicitPaperHtfBypass
+          : !isBypassActive && (!signalValidationPassed || !effectiveCprFilterPassed || !effectiveCandleConfirmed)));
 
     if (isBypassActive && !isHardGateFail && otherGatesPassed) {
       executionGateStatus = 'TRADE APPROVED';
@@ -2555,7 +2798,7 @@ export function useSniperScalpingEngine({
     } else if (allRiskGatesPassed) {
       executionGateStatus = 'TRADE APPROVED';
       tradeApproved = true;
-    } else if (!isHardGateFail && otherGatesPassed && htfDivergenceWarning) {
+    } else if (!isEma921Mode && !isHardGateFail && otherGatesPassed && htfDivergenceWarning) {
       executionGateStatus = 'ARMED_CONDITIONAL';
       tradeApproved = true;
     } else if (isSignalStandby && !isLiveUnverified && !isHardGateFail) {
@@ -2571,108 +2814,75 @@ export function useSniperScalpingEngine({
       !isHardGateFail &&
       (allRiskGatesPassed || (isBypassActive && !isHardGateFail) || executionGateStatus === 'ARMED_CONDITIONAL');
 
-    const camarillaSummary = isMicro15
-      ? isLong
-        ? `$15 Micro Scalp LONG (${lotSize} ${selectedSymbol.replace('USDT', '').replace('USD', '')} · ${microContractsCount} cts @ ${deltaLeverage}x · $${microMarginUsd.toFixed(2)} Margin): Entry $${entryPrice.toLocaleString()} (>= H4 $${camarilla.h4.toLocaleString()}) · SL $${initialStopLoss.toLocaleString()} (-${finalBrackets.slPct.toFixed(2)}%) · TP1 $${tp1.toLocaleString()} (1.25R) · TP2 $${tp2.toLocaleString()} (2.0R BE)`
-        : `$15 Micro Scalp SHORT (${lotSize} ${selectedSymbol.replace('USDT', '').replace('USD', '')} · ${microContractsCount} cts @ ${deltaLeverage}x · $${microMarginUsd.toFixed(2)} Margin): Entry $${entryPrice.toLocaleString()} (<= L4 $${camarilla.l4.toLocaleString()}) · SL $${initialStopLoss.toLocaleString()} (+${finalBrackets.slPct.toFixed(2)}%) · TP1 $${tp1.toLocaleString()} (1.25R) · TP2 $${tp2.toLocaleString()} (2.0R BE)`
-      : isMicro50
-      ? isLong
-        ? `$50 Standard Sniper LONG (${lotSize} ${selectedSymbol.replace('USDT', '').replace('USD', '')} · ${contractsCount} cts): Entry >= H4 ($${camarilla.h4.toLocaleString()}) · SL $${initialStopLoss.toLocaleString()} (-${finalBrackets.slPct.toFixed(2)}%) · TP1 $${tp1.toLocaleString()} (1.25R) · TP2 $${tp2.toLocaleString()} (2.0R BE) · TP3 $${tp3.toLocaleString()} · TP4 $${tp4.toLocaleString()}`
-        : `$50 Standard Sniper SHORT (${lotSize} ${selectedSymbol.replace('USDT', '').replace('USD', '')} · ${contractsCount} cts): Entry <= L4 ($${camarilla.l4.toLocaleString()}) · SL $${initialStopLoss.toLocaleString()} (+${finalBrackets.slPct.toFixed(2)}%) · TP1 $${tp1.toLocaleString()} (1.25R) · TP2 $${tp2.toLocaleString()} (2.0R BE) · TP3 $${tp3.toLocaleString()} · TP4 $${tp4.toLocaleString()}`
-      : isLong
-      ? `Institutional Macro LONG (${lotSize} ${selectedSymbol.replace('USDT', '').replace('USD', '')}): Entry >= H4 ($${camarilla.h4.toLocaleString()}) · SL $${initialStopLoss.toLocaleString()} (-${finalBrackets.slPct.toFixed(2)}%) · TP1 $${tp1.toLocaleString()} · TP2 $${tp2.toLocaleString()} (2.0R BE) · TP4 $${tp4.toLocaleString()}`
-      : `Institutional Macro SHORT (${lotSize} ${selectedSymbol.replace('USDT', '').replace('USD', '')}): Entry <= L4 ($${camarilla.l4.toLocaleString()}) · SL $${initialStopLoss.toLocaleString()} (+${finalBrackets.slPct.toFixed(2)}%) · TP1 $${tp1.toLocaleString()} · TP2 $${tp2.toLocaleString()} (2.0R BE) · TP4 $${tp4.toLocaleString()}`;
+    const ema921Summary = `5m EMA 9/21 Cross ${dir} (${lotSize} ${selectedSymbol.replace('USDT', '').replace('USD', '')} · ${contractsCount} cts): Entry $${entryPrice.toLocaleString()} · 1.2x ATR SL $${initialStopLoss.toLocaleString()} · 60% Bank@+${ema921Cross.tp1DistancePts}pt ($${tp1.toLocaleString()}, 0.0236% Maker) · BE $${feeAdjustedBePrice.toLocaleString()} · 40% EMA21 Trail -> $${tp4.toLocaleString()}`;
+    const camarillaSummary = isEma921Mode
+      ? ema921Summary
+      : `15m Maker Pullback ${dir} (${lotSize} ${selectedSymbol.replace('USDT', '').replace('USD', '')} · ${contractsCount} cts @ ${deltaLeverage}x): post_only Limit $${entryPrice.toLocaleString()} · 1.5x ATR SL $${initialStopLoss.toLocaleString()} · BE@+1.35R $${tp1.toLocaleString()} (Fee-Adj $${feeAdjustedBePrice.toLocaleString()}) · Runner $${tp2.toLocaleString()}–$${tp4.toLocaleString()}`;
 
     let aiVerdict: string;
     if (isLiveUnverified) {
       aiVerdict = 'API Keys Required · Balances Inactive — Connect Delta Exchange API Keys in Settings to trade live.';
+    } else if (isEma921Mode && regimeNoTradeBlocked) {
+      aiVerdict = `${ema921Cross.statusLabel}: ${ema921Cross.rejectionReasons.join(' · ')}`;
+    } else if (!isEma921Mode && regimeNoTradeBlocked) {
+      aiVerdict = `NO TRADE (CHOP / LOW VOLATILITY): ${regimeRouter.noTradeReasons.join(' · ')}`;
+    } else if (!utcDayCapPassed) {
+      aiVerdict = `DAILY LIMIT REACHED (${utcDayTradesCount}/${MAX_TRADES_PER_UTC_DAY} UTC DAY): Max 3 trades per UTC day enforced.`;
+    } else if (microSlCooldownRemainingSec > 0) {
+      aiVerdict = `3-BAR POST-SL COOLDOWN (${postSlCooldownBarsRemaining} bars · ${Math.floor(microSlCooldownRemainingSec / 60)}m ${microSlCooldownRemainingSec % 60}s): Post-stop cooldown active.`;
+    } else if (!isEma921Mode && regimeRouter.routeDestination === 'OPTIONS_DEBIT_SPREAD' && !isBypassActive) {
+      aiVerdict = `${regimeRouter.statusLabel}: Wide CPR (${regimeRouter.cprWidthPct.toFixed(2)}% / ${regimeRouter.cprPercentile}th pct) or High Volatility — routed to Options Lab Defined-Risk ${regimeRouter.recommendedOptionsStrategy}.`;
     } else if (isBypassActive) {
       aiVerdict = `PAPER DEMO OVERRIDE: [Bypass HTF / VWAP Guard (Paper)] active. Signal ${dir} armed for execution testing.`;
-    } else if (isMicro15 && microSlCooldownRemainingSec > 0) {
-      aiVerdict = `ANTI-CHOP COOLDOWN (${Math.floor(microSlCooldownRemainingSec / 60)}m ${microSlCooldownRemainingSec % 60}s): 10-minute Stop-Loss cooldown active.`;
-    } else if (isMicro15 && microTradesLastHour >= 3) {
-      aiVerdict = `ANTI-CHOP LIMIT (3/3 HR): Hourly Micro trade cap reached. Preserving edge until rolling hour resets.`;
     } else if (!marginUtilizationSafe) {
       aiVerdict = `MARGIN CAP GUARD (${accountMarginUtilizationPct.toFixed(1)}% >= 65%): Total account margin utilization limit enforced across Perp + Options slots.`;
-    } else if (htfTrendLock) {
+    } else if (!isEma921Mode && htfTrendLock) {
       aiVerdict = isLong
         ? `${htfVetoReason} — AUTO-PILOT SAFEGUARD: Suppressed Long setup due to 1H Bearish Trend & Sub-VWAP drift`
         : htfVetoReason;
-    } else if (isWideCpr && !isMicro15 && !isMicro50 && !isInsideRange) {
-      aiVerdict = 'WIDE CPR - CHOP RISK - BREAKOUT SUPPRESSED';
-    } else if (isMicro15 && harvestTargetHit) {
-      aiVerdict = 'HOURLY HARVEST COMPLETE (+$15.00 BANKED) — Engine paused until next hour window.';
-    } else if (isMicro15 && isTransitionWindow) {
-      aiVerdict = 'STANDBY: Hourly Transition Window (No New Entries) — Entries paused between :45 and :59.';
-    } else if (isLockoutActive) {
-      const remainingSec = lockoutExpiry ? Math.max(0, Math.ceil((lockoutExpiry - Date.now()) / 1000)) : 0;
-      aiVerdict = `HARVEST LOCKOUT ACTIVE (${Math.floor(remainingSec / 60)}m ${remainingSec % 60}s remaining) — Active 30m candle lockout.`;
-    } else if (!candleConfirmed) {
-      aiVerdict =
-        antiChaseGuard.rejectionReason ||
-        (isLong
-          ? `ANTI-CHASE GUARD (LONG): Waiting for price >= H4 ($${camarilla.h4.toLocaleString()}) on a non-red 5m candle.`
-          : `ANTI-CHASE GUARD (SHORT): Waiting for price <= L4 ($${camarilla.l4.toLocaleString()}) on a non-green / non-rebounding 5m candle.`);
-    } else if (executionGateStatus === 'ARMED_CONDITIONAL') {
-      aiVerdict = `ARMED / CONDITIONAL (${confidence}% AI Conviction): Divergence under review. All capital & risk limits PASS. Execution unlocked for ${dir}.`;
-    } else if (isSignalStandby) {
-      aiVerdict = 'STANDBY / SCANNING — Previous trade levels cleared. Validate or confirm next signal (PASS) to hydrate Entry, SL, and TP1–TP4 targets.';
     } else if (!tradeApproved) {
-      aiVerdict = 'TRADE BLOCKED / STANDBY: Conviction (< 75%) or pre-entry risk protection gates not satisfied. Execution targets cleared.';
-    } else if (isNarrowCprAutoMicro) {
-      aiVerdict = `DUAL-TF NARROW 5M CPR ROUTER ARMED: ${camarillaSummary}`;
-    } else if (isCommandCenterActive) {
-      aiVerdict = `AI Command Signal Validator: ${camarillaSummary}. Trap Exit armed on 5m close ${isLong ? `below H3 ($${camarilla.h3.toLocaleString()})` : `above L3 ($${camarilla.l3.toLocaleString()})`}.`;
+      aiVerdict = 'TRADE BLOCKED / STANDBY: Conviction (< 75%) or pre-entry risk protection gates not satisfied.';
+    } else if (isEma921Mode) {
+      aiVerdict = ema921Summary;
     } else {
-      aiVerdict = `CAMARILLA EXECUTION ARMED: ${camarillaSummary}. Hold until ${isMicro15 ? 'TP2 (2.0R) target' : isMicro50 ? '+$50.00 TP4 target' : 'H6/L6 terminal target'} or trailing stop.`;
+      aiVerdict = `${regimeRouter.statusLabel}: ${camarillaSummary}`;
     }
 
-    if (virginConfluence.hasWarning && virginConfluence.warningMessage) {
+    if (!isEma921Mode && virginConfluence.hasWarning && virginConfluence.warningMessage) {
       aiVerdict = `${aiVerdict} [⚠ ${virginConfluence.warningMessage}]`;
-    } else if (virginConfluence.hasConfluence) {
-      aiVerdict = `${aiVerdict} [${virginConfluence.summary}]`;
     }
 
+    // post_only Maker Fee calculation (0.02% maker rate = 0.0236% incl. 18% GST vs 0.059% taker)
     const friction = calculateSniperFriction({
       entryPrice,
       direction: dir,
       lotSize,
-      isTaker: true,
+      isTaker: false,
     });
 
-    const feeThreshold15 = 15 * 0.12; // $1.80 (12% of $15 risk envelope)
+    const feeThreshold15 = 15 * 0.12;
     const frictionWarning = (isMicro15 && friction.totalFrictionUsd > feeThreshold15)
       ? `Tight-Spread Alert: Roundtrip fees ($${friction.totalFrictionUsd.toFixed(2)}) exceed 12% ($${feeThreshold15.toFixed(2)}) of $15 risk envelope`
       : undefined;
 
-    let ladderPayouts: ReturnType<typeof capitalAlloc.getLadderPayouts>;
-    if (isMicro15 || isMicro50) {
-      const p1 = +(Math.abs(tp1 - entryPrice) * lotSize).toFixed(2);
-      const p2 = +(Math.abs(tp2 - entryPrice) * lotSize).toFixed(2);
-      const p3 = +(Math.abs(tp3 - entryPrice) * lotSize).toFixed(2);
-      const p4 = +(Math.abs(tp4 - entryPrice) * lotSize).toFixed(2);
-      ladderPayouts = {
-        tp1Payout: p1,
-        tp2Payout: p2,
-        tp3Payout: p3,
-        tp4Payout: p4,
-        tp1Gross: p1,
-        tp1Net: +(p1 - friction.totalFrictionUsd * 0.25).toFixed(2),
-        tp2Gross: p2,
-        tp2Net: +(p2 - friction.totalFrictionUsd * 0.50).toFixed(2),
-        tp3Gross: p3,
-        tp3Net: +(p3 - friction.totalFrictionUsd * 0.75).toFixed(2),
-        tp4Gross: p4,
-        tp4Net: +(p4 - friction.totalFrictionUsd).toFixed(2),
-      };
-    } else {
-      ladderPayouts = capitalAlloc.getLadderPayouts(
-        entryPrice,
-        { tp1, tp2, tp3, tp4 },
-        lotSize,
-        !isLong
-      );
-    }
+    const p1 = +(Math.abs(tp1 - entryPrice) * lotSize).toFixed(2);
+    const p2 = +(Math.abs(tp2 - entryPrice) * lotSize).toFixed(2);
+    const p3 = +(Math.abs(tp3 - entryPrice) * lotSize).toFixed(2);
+    const p4 = +(Math.abs(tp4 - entryPrice) * lotSize).toFixed(2);
+    const ladderPayouts: ReturnType<typeof capitalAlloc.getLadderPayouts> = {
+      tp1Payout: p1,
+      tp2Payout: p2,
+      tp3Payout: p3,
+      tp4Payout: p4,
+      tp1Gross: p1,
+      tp1Net: +(p1 - friction.totalFrictionUsd * 0.25).toFixed(2),
+      tp2Gross: p2,
+      tp2Net: +(p2 - friction.totalFrictionUsd * 0.50).toFixed(2),
+      tp3Gross: p3,
+      tp3Net: +(p3 - friction.totalFrictionUsd * 0.75).toFixed(2),
+      tp4Gross: p4,
+      tp4Net: +(p4 - friction.totalFrictionUsd).toFixed(2),
+    };
 
     const netRr = calculateNetRiskReward(
       entryPrice,
@@ -2687,14 +2897,14 @@ export function useSniperScalpingEngine({
       symbol: selectedSymbol,
       signal: dir,
       exposureMode: effectiveExposureMode,
-      confidence,
-      confidenceStatus,
+      confidence: effectiveConfidence,
+      confidenceStatus: effectiveConfidenceStatus,
       lotSize,
       requestedLotSize,
       contractsCount,
-      lotSizingMode: safeLotRes.lotSizingMode,
-      wasLotClamped: safeLotRes.wasClamped,
-      lotClampReason: safeLotRes.clampReason,
+      lotSizingMode: hasManualLot ? 'FIXED_LOT' : safeLotRes.lotSizingMode,
+      wasLotClamped: false,
+      lotClampReason: undefined,
       leverage: deltaLeverage,
       entryPrice,
       initialStopLoss,
@@ -2705,26 +2915,26 @@ export function useSniperScalpingEngine({
       camarilla,
       isHydrated,
       isStandby: isSignalStandby,
-      antiChaseBlocked: !antiChaseGuard.passed,
-      l3h3ChopBlocked: antiChaseGuard.chopZoneBlocked,
-      l3h3ChopReason: antiChaseGuard.chopZoneBlocked ? antiChaseGuard.rejectionReason : undefined,
-      virginCprMagnetBlocked: virginConfluence.hasWarning,
+      antiChaseBlocked: isEma921Mode ? false : !antiChaseGuard.passed,
+      l3h3ChopBlocked: isEma921Mode ? false : antiChaseGuard.chopZoneBlocked,
+      l3h3ChopReason: !isEma921Mode && antiChaseGuard.chopZoneBlocked ? antiChaseGuard.rejectionReason : undefined,
+      virginCprMagnetBlocked: !isEma921Mode && virginConfluence.hasWarning,
       validation: {
         entryExecutionType,
-        higherTimeframeTrend,
-        higherTimeframeTrendStatus,
-        vwapAlignment,
-        vwapAlignmentStatus,
-        emaStructure,
+        higherTimeframeTrend: effectiveHtfTrendPass,
+        higherTimeframeTrendStatus: effectiveHtfTrendPass ? 'PASS' : higherTimeframeTrendStatus,
+        vwapAlignment: effectiveVwapPass,
+        vwapAlignmentStatus: effectiveVwapPass ? 'PASS' : vwapAlignmentStatus,
+        emaStructure: isEma921Mode ? (ema921Cross.hasConfirmedCross && (isLong ? ema921Cross.ema21SlopeUp : ema921Cross.ema21SlopeDown)) : emaStructure,
         volumeConfirmation,
-        rsiMomentum,
+        rsiMomentum: isEma921Mode ? (ema921Cross.adx14_5m >= 20) : rsiMomentum,
         marketSentiment,
         supportResistance,
         riskRewardThreshold,
-        confidenceAboveMin,
-        candleConfirmed,
-        cprFilterPassed,
-        htfDivergenceWarning,
+        confidenceAboveMin: effectiveConfidenceAboveMin,
+        candleConfirmed: effectiveCandleConfirmed,
+        cprFilterPassed: effectiveCprFilterPassed,
+        htfDivergenceWarning: isEma921Mode ? false : htfDivergenceWarning,
         bypassActive: isBypassActive,
         fibonacciConfluence: fibConfluence.hasConfluence,
         fibonacciConfluenceStatus: fibConfluence.status,
@@ -2739,24 +2949,24 @@ export function useSniperScalpingEngine({
         leverageWithinCap,
         sufficientMargin,
         riskLimitsNotBreached,
-        candleConfirmed,
-        cprFilterPassed,
+        candleConfirmed: effectiveCandleConfirmed,
+        cprFilterPassed: effectiveCprFilterPassed,
         cooldownPassed,
-        cprStatus,
+        cprStatus: isEma921Mode ? ema921Cross.statusLabel : cprStatus,
         tradeApproved,
         executionStatus: executionGateStatus,
         bypassActive: isBypassActive,
-        htfDivergenceWarning,
+        htfDivergenceWarning: isEma921Mode ? false : htfDivergenceWarning,
         requiredMargin: marginReq,
         availableBalance: effectiveBalance,
         marginDeficit,
         autoClampedLot: safeClampedLot,
         requestedLotSize,
         contractsCount,
-        lotSizingMode: safeLotRes.lotSizingMode,
-        wasLotClamped: safeLotRes.wasClamped,
-        lotClampReason: safeLotRes.clampReason,
-        sizingMode: safeLotRes.lotSizingMode === 'FIXED_LOT' ? 'FIXED_LOT' : capitalAlloc.sizingMethod,
+        lotSizingMode: hasManualLot ? 'FIXED_LOT' : safeLotRes.lotSizingMode,
+        wasLotClamped: false,
+        lotClampReason: undefined,
+        sizingMode: hasManualLot ? 'FIXED_LOT' : (safeLotRes.lotSizingMode === 'FIXED_LOT' ? 'FIXED_LOT' : capitalAlloc.sizingMethod),
         cpr5mWidthPct: dualCpr.cpr5mWidthPct,
         cpr4hWidthPct: dualCpr.cpr4hWidthPct,
         isNarrow5mCpr,
@@ -2769,6 +2979,10 @@ export function useSniperScalpingEngine({
         microTradesLastHour,
         microAntiChopPassed,
         microSlCooldownRemainingSec,
+        utcDayTradesCount,
+        maxUtcDayTrades: MAX_TRADES_PER_UTC_DAY,
+        postSlCooldownBarsRemaining,
+        regimeStatusLabel: isEma921Mode ? ema921Cross.statusLabel : regimeRouter.statusLabel,
       },
       aiVerdict,
       signalScore: totalSignalScore,
@@ -2781,7 +2995,7 @@ export function useSniperScalpingEngine({
       commandCenterCatalyst: aiAnalysis?.sentiment?.summary,
       commandCenterSentiment: aiAnalysis?.sentiment,
       commandCenterFearGreed: aiAnalysis ? { score: aiAnalysis.fearGreedScore, label: aiAnalysis.fearGreedLabel } : undefined,
-      riskRewardRatio: isMicroScalp ? '1 : 2.17' : netRr.netRrRatio,
+      riskRewardRatio: netRr.netRrRatio,
       riskRewardNumeric: netRr.netRrNumeric,
       estimatedMargin: marginReq,
       pointValue,
@@ -2796,10 +3010,10 @@ export function useSniperScalpingEngine({
         ...rangeSwingTrigger,
         entryPrice,
       },
-      ema9,
-      ema20,
-      ema21,
-      vwap5m,
+      ema9: isEma921Mode ? ema921Cross.ema9_5m : ema9,
+      ema20: regimeRouter.ema20_15m || ema20,
+      ema21: isEma921Mode ? ema921Cross.ema21_5m : ema21,
+      vwap5m: isEma921Mode ? ema921Cross.sessionVwap : (regimeRouter.sessionVwap || vwap5m),
       cpr5mWidthPct: dualCpr.cpr5mWidthPct,
       cpr4hWidthPct: dualCpr.cpr4hWidthPct,
       isNarrow5mCpr,
@@ -2809,7 +3023,18 @@ export function useSniperScalpingEngine({
       microContractsCount: contractsCount,
       microNotionalUsd,
       microMarginUsd,
-      reason: rangeSwingTrigger?.description || aiVerdict,
+      reason: isEma921Mode ? ema921Cross.statusLabel : (rangeSwingTrigger?.description || aiVerdict),
+      regimeRouter,
+      regimeStatusLabel: isEma921Mode ? ema921Cross.statusLabel : regimeRouter.statusLabel,
+      entryOrderType: isEma921Mode ? 'market' : 'post_only_limit',
+      manualLotSizeOverride: manualLotSize,
+      utcDayTradesCount,
+      postSlCooldownBarsRemaining,
+      feeAdjustedBePrice,
+      sniperStrategyMode,
+      ema921Cross,
+      partialTakeProfitPct: isEma921Mode ? 60 : 50,
+      trailBasis: isEma921Mode ? '5M_EMA21' : '15M_EMA20',
     };
   }, [
     curMarket,
@@ -2824,12 +3049,17 @@ export function useSniperScalpingEngine({
     optionsOnlyPositions,
     candles5m,
     candles15m,
+    candles1h,
     candles4h,
     microTradeTimestamps,
     microSlCooldownUntil,
+    postSlCooldownUntilMs,
+    utcDayTradesCount,
+    manualLotSize,
     isLiveUnverified,
     isSignalStandby,
     directionMode,
+    sniperStrategyMode,
     exposureMode,
     scalpTier,
     signalSource,
@@ -2988,23 +3218,33 @@ export function useSniperScalpingEngine({
         ? Math.max(...candles5m.slice(-6).map((c) => Number(c.high) || liveMark))
         : liveCandleState?.currentCandle?.high || liveMark;
 
-    const bufferedPreOrder = enforceMinimumSniperStopBuffer({
-      entryPrice: liveMark > 0 ? liveMark : rawEntryPrice,
-      side: signalToUse.signal || 'LONG',
-      symbol: targetSym,
-      stopLoss: rawStopLoss,
-      tp1: rawTp1,
-      tp2: rawTp2,
-      tp3: rawTp3,
-      tp4: rawTp4,
-      atr5m: execAtr5m,
-      h3: effectiveCamarilla.h3,
-      l3: effectiveCamarilla.l3,
-      swingLow: recent5mLowVal,
-      swingHigh: recent5mHighVal,
-    });
+    const isEma921Trade = signalToUse.sniperStrategyMode === 'EMA_9_21_MOMENTUM_5M';
 
-    const effectiveEntryPrice = liveMark > 0 ? liveMark : rawEntryPrice;
+    const bufferedPreOrder = isEma921Trade
+      ? {
+          stopLoss: rawStopLoss,
+          tp1: rawTp1,
+          tp2: rawTp2,
+          tp3: rawTp3,
+          tp4: rawTp4,
+        }
+      : enforceMinimumSniperStopBuffer({
+          entryPrice: liveMark > 0 ? liveMark : rawEntryPrice,
+          side: signalToUse.signal || 'LONG',
+          symbol: targetSym,
+          stopLoss: rawStopLoss,
+          tp1: rawTp1,
+          tp2: rawTp2,
+          tp3: rawTp3,
+          tp4: rawTp4,
+          atr5m: execAtr5m,
+          h3: effectiveCamarilla.h3,
+          l3: effectiveCamarilla.l3,
+          swingLow: recent5mLowVal,
+          swingHigh: recent5mHighVal,
+        });
+
+    const effectiveEntryPrice = isEma921Trade && rawEntryPrice > 0 ? rawEntryPrice : (liveMark > 0 ? liveMark : rawEntryPrice);
     const effectiveStopLoss = bufferedPreOrder.stopLoss;
     const effectiveTp1 = bufferedPreOrder.tp1;
     const effectiveTp2 = bufferedPreOrder.tp2;
@@ -3058,7 +3298,7 @@ export function useSniperScalpingEngine({
 
     const isWideCpr = signalToUse.camarilla?.isWideCpr ?? false;
     const narrowCprOverride = Boolean(signalToUse.isNarrow5mCpr || signalToUse.riskChecks?.narrowCprOverrideActive || isMicro15Tier);
-    if (isWideCpr && !narrowCprOverride && !isBypassActive) {
+    if (!isEma921Trade && isWideCpr && !narrowCprOverride && !isBypassActive) {
       addLog('BLOCKED', 'Trade Blocked by CPR Filter', 'WIDE CPR - CHOP RISK - BREAKOUT SUPPRESSED');
       onSendNotification('Sniper Trade Blocked', 'WIDE CPR - CHOP RISK - BREAKOUT SUPPRESSED', 'RISK');
       return;
@@ -3071,7 +3311,7 @@ export function useSniperScalpingEngine({
       return;
     }
 
-    // Enforce Anti-Chase Breakout Zone, L3–H3 Chop-Zone 5m Bar Close & Current-Candle Momentum Guard before dispatching order
+    // Enforce Anti-Chase Breakout Zone, L3–H3 Chop-Zone 5m Bar Close & Current-Candle Momentum Guard before dispatching order (Camarilla/Pullback mode)
     const prevApi5mForExec = candles5m.length > 1 ? candles5m[candles5m.length - 2] : null;
     const execHasSimulatedClose = simulatedCandleCloses[targetSym] !== undefined;
     const execLastClosed5mClose = execHasSimulatedClose
@@ -3080,37 +3320,61 @@ export function useSniperScalpingEngine({
       ? liveCandleState.lastClosedCandle.close
       : Number(prevApi5mForExec?.close || 0);
 
-    const antiChaseCheck = evaluateAntiChaseAndCandleMomentum({
-      side: signalToUse.signal || 'LONG',
-      currentPrice: liveMark,
-      h4: effectiveCamarilla.h4,
-      l4: effectiveCamarilla.l4,
-      h3: effectiveCamarilla.h3,
-      l3: effectiveCamarilla.l3,
-      lastClosed5mClose: execLastClosed5mClose,
-      currentCandleOpen: liveCandleState?.currentCandle?.open || liveMark,
-      currentCandleHigh: liveCandleState?.currentCandle?.high || liveMark,
-      currentCandleLow: liveCandleState?.currentCandle?.low || liveMark,
-      recent5mLow: recent5mLowVal,
-      low24h: curMarket.low24h || liveMark * 0.99,
-    });
+    if (!isEma921Trade) {
+      const antiChaseCheck = evaluateAntiChaseAndCandleMomentum({
+        side: signalToUse.signal || 'LONG',
+        currentPrice: liveMark,
+        h4: effectiveCamarilla.h4,
+        l4: effectiveCamarilla.l4,
+        h3: effectiveCamarilla.h3,
+        l3: effectiveCamarilla.l3,
+        lastClosed5mClose: execLastClosed5mClose,
+        currentCandleOpen: liveCandleState?.currentCandle?.open || liveMark,
+        currentCandleHigh: liveCandleState?.currentCandle?.high || liveMark,
+        currentCandleLow: liveCandleState?.currentCandle?.low || liveMark,
+        recent5mLow: recent5mLowVal,
+        low24h: curMarket.low24h || liveMark * 0.99,
+      });
 
-    if (!antiChaseCheck.passed && !isBypassActive) {
-      const rejectMsg = antiChaseCheck.rejectionReason || 'Anti-Chase, L3–H3 Chop Zone, or forming 5m candle momentum check failed.';
-      addLog('BLOCKED', antiChaseCheck.chopZoneBlocked ? 'Trade Blocked: L3–H3 Chop Zone' : 'Trade Blocked: Anti-Chase / Momentum Guard', rejectMsg);
-      onSendNotification(antiChaseCheck.chopZoneBlocked ? 'L3–H3 Chop Zone Guard' : 'Anti-Chase & Candle Momentum Guard', rejectMsg, 'RISK');
-      return;
-    }
+      if (!antiChaseCheck.passed && !isBypassActive) {
+        const rejectMsg = antiChaseCheck.rejectionReason || 'Anti-Chase, L3–H3 Chop Zone, or forming 5m candle momentum check failed.';
+        addLog('BLOCKED', antiChaseCheck.chopZoneBlocked ? 'Trade Blocked: L3–H3 Chop Zone' : 'Trade Blocked: Anti-Chase / Momentum Guard', rejectMsg);
+        onSendNotification(antiChaseCheck.chopZoneBlocked ? 'L3–H3 Chop Zone Guard' : 'Anti-Chase & Candle Momentum Guard', rejectMsg, 'RISK');
+        return;
+      }
 
-    if (signalToUse.validation?.candleConfirmed === false && !isBypassActive) {
-      addLog('BLOCKED', 'Trade Blocked: Wick Protection', '5-minute candle close & momentum confirmation required. Intra-candle touch or L3–H3 chop rejected.');
-      onSendNotification('Candle & Anti-Chase Confirmation Required', 'Auto-entry blocked: wait for valid H4/L4 5m close and aligned 5m candle momentum.', 'RISK');
+      if (signalToUse.validation?.candleConfirmed === false && !isBypassActive) {
+        addLog('BLOCKED', 'Trade Blocked: Wick Protection', '5-minute candle close & momentum confirmation required. Intra-candle touch or L3–H3 chop rejected.');
+        onSendNotification('Candle & Anti-Chase Confirmation Required', 'Auto-entry blocked: wait for valid H4/L4 5m close and aligned 5m candle momentum.', 'RISK');
+        return;
+      }
+    } else if (!isBypassActive && signalToUse.ema921Cross && !signalToUse.ema921Cross.filtersPassed) {
+      const chopMsg = signalToUse.ema921Cross.rejectionReasons.join(' · ') || '5m EMA 9/21 chop filters not satisfied.';
+      addLog('BLOCKED', '5m EMA 9/21 Chop Filter Blocked', chopMsg);
+      onSendNotification('5m EMA 9/21 Chop Filter', chopMsg, 'RISK');
       return;
     }
 
     if ((!isTradeApproved && !isBypassActive) || (!isConfidenceApproved && !isBypassActive) || effectiveEntryPrice <= 0) {
       addLog('BLOCKED', 'Trade Blocked by Risk Layer', 'Validation failed: signal not confirmed, conviction < 75%, or one or more of the 7 risk gates were not satisfied.');
       onSendNotification('Sniper Trade Blocked', 'Risk Protection Layer blocked execution: signal must be confirmed (>= 75% conviction) and pass all risk gates.', 'RISK');
+      return;
+    }
+
+    if (!isBypassActive && utcDayTradesCount >= MAX_TRADES_PER_UTC_DAY) {
+      addLog('BLOCKED', 'UTC Daily Trade Cap Reached', `Max ${MAX_TRADES_PER_UTC_DAY} trades per UTC day reached (${utcDayTradesCount}/${MAX_TRADES_PER_UTC_DAY}).`);
+      onSendNotification('UTC Daily Limit Reached', `Max ${MAX_TRADES_PER_UTC_DAY} trades per UTC day enforced to protect equity.`, 'INFO');
+      return;
+    }
+
+    if (!isBypassActive && postSlCooldownUntilMs > Date.now()) {
+      const remBars = Math.max(1, Math.ceil((postSlCooldownUntilMs - Date.now()) / (15 * 60 * 1000)));
+      addLog('BLOCKED', '3-Bar Post-SL Cooldown Active', `Waiting ${remBars} more 15m bar(s) after stop-loss before re-entering.`);
+      return;
+    }
+
+    if (!isEma921Trade && !isBypassActive && signalToUse.regimeRouter?.isNoTrade) {
+      addLog('BLOCKED', 'NO TRADE (CHOP / LOW VOLATILITY)', signalToUse.regimeRouter.statusLabel || 'Unified Regime Router suppressed entry.');
       return;
     }
 
@@ -3123,20 +3387,36 @@ export function useSniperScalpingEngine({
     try {
       const orderSymbol = signalToUse.symbol || selectedSymbol;
       const orderSide = signalToUse.signal || 'LONG';
-      const orderEntry = effectiveEntryPrice > 0 ? effectiveEntryPrice : liveMark;
+      // 15m Maker Pullback Limit price (EMA 20 / VWAP retest zone) or 5m EMA 9/21 Bar-Close Cross fill
+      const routerPullback = Number(signalToUse.regimeRouter?.pullbackEntryZone || 0);
+      const orderEntry = isEma921Trade
+        ? (liveMark > 0 ? liveMark : effectiveEntryPrice)
+        : (routerPullback > 0 && signalToUse.entryPrice > 0
+          ? signalToUse.entryPrice
+          : effectiveEntryPrice > 0
+          ? effectiveEntryPrice
+          : liveMark);
       const orderSl = effectiveStopLoss;
-      const orderTp = isMicro15Tier && effectiveTp2 > 0
-        ? effectiveTp2
-        : (effectiveTp4 > 0 ? effectiveTp4 : effectiveTp2);
+      const orderTp = effectiveTp4 > 0 ? effectiveTp4 : effectiveTp2;
+      const feeAdjustedBe =
+        signalToUse.feeAdjustedBePrice && signalToUse.feeAdjustedBePrice > 0
+          ? signalToUse.feeAdjustedBePrice
+          : formatCamarillaPrice(
+              orderSide === 'LONG'
+                ? orderEntry * (1 + FEE_ADJUSTED_BE_BUFFER)
+                : orderEntry * (1 - FEE_ADJUSTED_BE_BUFFER),
+              orderEntry
+            );
 
       const enforcedSniperLev = capitalAlloc.clampLeverage(signalToUse.leverage || capitalAlloc.globalLeverage);
 
-      // Re-resolve lot & contract quantity against actual pre-order anti-wick SL distance so risk stays strictly <= maxRiskPerTradePct (1%)
+      // Resolve lot size directly if manually overridden, otherwise via Risk Management
       const existingMarginUsed = positions.reduce((acc, p) => acc + (Number(p.margin) || 0), 0);
       const effectiveExecEq =
         typeof totalEquity === 'number' && totalEquity > 0
           ? totalEquity
           : Math.max(0, (isLiveUnverified ? 0 : availableBalance) + Math.max(marginUsed || 0, existingMarginUsed));
+      const hasManualOverride = manualLotSize !== null && manualLotSize > 0;
       const execLotRes = capitalAlloc.resolveSafeExecutionLot({
         symbol: orderSymbol,
         markPrice: orderEntry,
@@ -3144,21 +3424,37 @@ export function useSniperScalpingEngine({
         totalEquity: effectiveExecEq,
         stopLossDistance: Math.abs(orderEntry - orderSl),
         leverage: enforcedSniperLev,
+        overrideLotSize: hasManualOverride ? manualLotSize! : undefined,
       });
-      const orderSize = execLotRes.lotSize > 0
+      const orderSize = hasManualOverride
+        ? manualLotSize!
+        : execLotRes.lotSize > 0
         ? execLotRes.lotSize
-        : (signalToUse.lotSize > 0 ? signalToUse.lotSize : capitalAlloc.defaultLotSize);
-      const resolvedContracts = execLotRes.contracts > 0
+        : signalToUse.lotSize > 0
+        ? signalToUse.lotSize
+        : capitalAlloc.defaultLotSize;
+      const resolvedContracts = hasManualOverride
+        ? capitalAlloc.getContractsCount(orderSymbol, orderSize)
+        : execLotRes.contracts > 0
         ? execLotRes.contracts
         : capitalAlloc.getContractsCount(orderSymbol, orderSize);
 
-      // Execute order on Delta Exchange India backend
+      // Dispatch post_only Limit Order for 15m Pullback OR confirmed cross execution for 5m EMA 9/21
+      const isPaperMakerPending =
+        !isEma921Trade &&
+        tradingMode === 'PAPER' &&
+        (orderSide === 'LONG' ? liveMark > orderEntry * 1.0001 : liveMark < orderEntry * 0.9999);
+
       const execRes: any = await onExecuteOrder({
         symbol: orderSymbol,
         side: orderSide,
         size: orderSize,
         contracts: resolvedContracts,
-        orderType: 'MARKET',
+        orderType: isEma921Trade ? 'MARKET' : 'LIMIT',
+        limitPrice: isEma921Trade ? undefined : orderEntry,
+        post_only: !isEma921Trade,
+        postOnly: !isEma921Trade,
+        simulatePendingLimit: isPaperMakerPending,
         leverage: enforcedSniperLev,
         marginMode: capitalAlloc.marginMode,
         entryPrice: orderEntry,
@@ -3168,10 +3464,12 @@ export function useSniperScalpingEngine({
         tp2: effectiveTp2 > 0 ? effectiveTp2 : undefined,
         tp3: effectiveTp3 > 0 ? effectiveTp3 : undefined,
         tp4: effectiveTp4 > 0 ? effectiveTp4 : orderTp,
-        strategy: isMicro15Tier ? 'Narrow CPR $15 Micro Sniper' : 'Intraday Sniper Scalping Engine',
-        strategyTag: isMicro15Tier ? 'NARROW_CPR_MICRO_15' : 'CAMARILLA_SNIPER',
+        strategy: isEma921Trade
+          ? '5m EMA 9/21 Momentum Cross (100pt Scalp + Runner)'
+          : '15m Maker Pullback Sniper',
+        strategyTag: isEma921Trade ? 'EMA_9_21_MOMENTUM_5M' : 'UNIFIED_MTF_PULLBACK_LIMIT',
         isMicro15: isMicro15Tier,
-        exposureMode: isMicro15Tier ? 'MICRO_15' : (signalToUse.exposureMode || exposureMode),
+        exposureMode: signalToUse.exposureMode || exposureMode,
         microMarginUsd: execLotRes.estimatedMarginUsd ?? signalToUse.estimatedMargin,
         enforcePerpSlot: true,
         autoPilot: isAutoSniperEnabled,
@@ -3182,6 +3480,60 @@ export function useSniperScalpingEngine({
         mode: tradingMode,
       });
 
+      const resolvedFriction = calculateSniperFriction({
+        entryPrice: orderEntry,
+        direction: orderSide,
+        lotSize: orderSize,
+        isTaker: false,
+      });
+
+      const isRestingLimit =
+        !isEma921Trade &&
+        (execRes?.filled === false ||
+          String(execRes?.state || execRes?.order?.state || '').toLowerCase() === 'open');
+
+      if (isRestingLimit) {
+        const pendingTtlMs = PENDING_LIMIT_TTL_BARS * 15 * 60 * 1000;
+        const pendingObj: PendingSniperLimitOrder = {
+          id: `pending-${Date.now()}`,
+          orderId: execRes?.orderId || execRes?.order_id || execRes?.order?.id,
+          symbol: String(execRes?.symbol || execRes?.order?.product_symbol || orderSymbol),
+          side: orderSide,
+          limitPrice: Number(execRes?.limit_price || execRes?.order?.limit_price || orderEntry),
+          stopLoss: orderSl,
+          tp1: effectiveTp1,
+          tp2: effectiveTp2,
+          tp3: effectiveTp3,
+          tp4: effectiveTp4 > 0 ? effectiveTp4 : orderTp,
+          lotSize: orderSize,
+          contracts: resolvedContracts,
+          leverage: enforcedSniperLev,
+          placedAtMs: Date.now(),
+          expiresAtMs: Date.now() + pendingTtlMs,
+          signalId: signalToUse.id || `${orderSymbol}-${orderSide}-${Math.round(orderEntry)}`,
+          feeAdjustedBePrice: feeAdjustedBe,
+          friction: resolvedFriction,
+          camarilla: effectiveCamarilla,
+          exposureMode: signalToUse.exposureMode || exposureMode,
+          scalpTier: signalToUse.scalpTier || scalpTier,
+          confidence: signalToUse.confidence || 75,
+          confidenceStatus: signalToUse.confidenceStatus || 'Strong',
+        };
+        setPendingLimitOrder(pendingObj);
+        lastAutoExecutedSignalId.current = pendingObj.signalId;
+        addLog(
+          'ENTRY',
+          `Staged post_only Limit ${orderSide} ${orderSize} ${pendingObj.symbol}`,
+          `Resting limit @ $${pendingObj.limitPrice.toLocaleString()} (0.02% maker fee). Auto-cancels in ${PENDING_LIMIT_TTL_BARS} bars (45m) if unfilled.`
+        );
+        onSendNotification(
+          'Post-Only Limit Staged',
+          `${orderSide} ${orderSize} ${pendingObj.symbol} resting @ $${pendingObj.limitPrice.toLocaleString()} (auto-cancel in 3 bars if unfilled).`,
+          'TRADE'
+        );
+        return;
+      }
+
       const resolvedFillPrice =
         Number(
           execRes?.order?.average_fill_price ||
@@ -3190,27 +3542,39 @@ export function useSniperScalpingEngine({
           orderEntry
         ) || orderEntry;
 
-      // Re-verify anti-wick SL buffer (>= max(1.5x 5m ATR, 0.55% BTC) + $35 wick buffer) against actual exchange fill price
-      const postFillBuffered = enforceMinimumSniperStopBuffer({
-        entryPrice: resolvedFillPrice,
-        side: orderSide,
-        symbol: orderSymbol,
-        stopLoss: Number(execRes?.slPrice || execRes?.microSniper?.sl || orderSl),
-        tp1: Number(execRes?.microSniper?.tp1 || effectiveTp1),
-        tp2: Number(execRes?.microSniper?.tp2 || effectiveTp2),
-        tp3: effectiveTp3,
-        tp4: Number(execRes?.tpPrice || orderTp),
-        atr5m: execAtr5m,
-        h3: effectiveCamarilla.h3,
-        l3: effectiveCamarilla.l3,
-        swingLow: recent5mLowVal,
-        swingHigh: recent5mHighVal,
-      });
-      const finalSl = postFillBuffered.stopLoss;
-      const finalTp1 = postFillBuffered.tp1;
-      const finalTp2 = postFillBuffered.tp2;
-      const finalTp3 = postFillBuffered.tp3;
-      const finalTp4 = isMicro15Tier ? postFillBuffered.tp2 : postFillBuffered.tp4;
+      const isBtcTrade = orderSymbol.toUpperCase().includes('BTC');
+      const finalSl = orderSl;
+      const finalTp1 = isEma921Trade
+        ? formatCamarillaPrice(
+            orderSide === 'LONG'
+              ? resolvedFillPrice + (isBtcTrade ? EMA921_PARTIAL_PTS_BTC : Math.abs(effectiveTp1 - orderEntry))
+              : resolvedFillPrice - (isBtcTrade ? EMA921_PARTIAL_PTS_BTC : Math.abs(effectiveTp1 - orderEntry)),
+            resolvedFillPrice
+          )
+        : effectiveTp1;
+      const finalTp2 = effectiveTp2;
+      const finalTp3 = effectiveTp3;
+      const finalTp4 = isEma921Trade
+        ? formatCamarillaPrice(
+            orderSide === 'LONG'
+              ? resolvedFillPrice + (isBtcTrade ? EMA921_RUNNER_PTS_BTC : Math.abs(effectiveTp4 - orderEntry))
+              : resolvedFillPrice - (isBtcTrade ? EMA921_RUNNER_PTS_BTC : Math.abs(effectiveTp4 - orderEntry)),
+            resolvedFillPrice
+          )
+        : (effectiveTp4 > 0 ? effectiveTp4 : orderTp);
+      const finalFeeAdjBe = isEma921Trade
+        ? formatCamarillaPrice(
+            orderSide === 'LONG'
+              ? resolvedFillPrice + (isBtcTrade ? 35 : resolvedFillPrice * 0.00042)
+              : resolvedFillPrice - (isBtcTrade ? 35 : resolvedFillPrice * 0.00042),
+            resolvedFillPrice
+          )
+        : formatCamarillaPrice(
+            orderSide === 'LONG'
+              ? resolvedFillPrice * (1 + FEE_ADJUSTED_BE_BUFFER)
+              : resolvedFillPrice * (1 - FEE_ADJUSTED_BE_BUFFER),
+            resolvedFillPrice
+          );
 
       const bracketWarningMsg: string | undefined = execRes?.bracketWarning
         ? String(execRes.bracketWarning)
@@ -3219,15 +3583,16 @@ export function useSniperScalpingEngine({
         execRes?.order?.product_symbol || execRes?.product_symbol || orderSymbol
       );
 
+      incrementUtcDayTradeCount();
       if (isMicro15Tier) {
         recordMicroTradeTimestamp();
       }
 
-      const tradeFriction = signalToUse.friction || calculateSniperFriction({
+      const tradeFriction = calculateSniperFriction({
         entryPrice: resolvedFillPrice,
         direction: orderSide,
         lotSize: orderSize,
-        isTaker: true,
+        isTaker: false,
       });
 
       const newTrade: SniperActiveTrade = {
@@ -3238,7 +3603,7 @@ export function useSniperScalpingEngine({
         exposureMode: signalToUse.exposureMode || exposureMode,
         scalpTier: signalToUse.scalpTier || scalpTier,
         confidence: signalToUse.confidence || 75,
-        confidenceStatus: signalToUse.confidenceStatus || 'High Conviction',
+        confidenceStatus: signalToUse.confidenceStatus || 'Strong',
         lotSize: orderSize,
         remainingSize: orderSize,
         leverage: enforcedSniperLev,
@@ -3270,12 +3635,20 @@ export function useSniperScalpingEngine({
         lowestPriceReached: resolvedFillPrice,
         openedAt: Date.now(),
         lastUpdatedAt: Date.now(),
-        aiVerdict: 'HOLD POSITION UNTIL H6/L6 (TP4), TRAILING STOP HIT, OR CAMARILLA H3/L3 TRAP EXIT.',
+        aiVerdict: isEma921Trade
+          ? `5M EMA 9/21 ACTIVE: BANK 70% @ $${(finalTp1 || resolvedFillPrice).toLocaleString()} (+$15.00 Net Profit Target) -> MOVE SL TO FEE BE ($${finalFeeAdjBe.toLocaleString()}) & TRAIL 30% ON 5M EMA 21 -> $${finalTp4.toLocaleString()}.`
+          : `HOLD UNTIL +1.35R STEP 01 ($${(finalTp1 || resolvedFillPrice).toLocaleString()}) -> MOVE SL TO FEE-ADJ BE ($${finalFeeAdjBe.toLocaleString()}) & TRAIL 15M EMA20.`,
         mode: tradingMode,
         adoptedFromExchange: false,
         bracketWarning: bracketWarningMsg,
         friction: tradeFriction,
-        netBreakevenPrice: tradeFriction.netBreakevenPrice,
+        netBreakevenPrice: finalFeeAdjBe,
+        entryOrderType: isEma921Trade ? 'market' : 'post_only_limit',
+        isPendingLimit: false,
+        feeAdjustedBePrice: finalFeeAdjBe,
+        sniperStrategyMode: isEma921Trade ? 'EMA_9_21_MOMENTUM_5M' : 'UNIFIED_MTF_PULLBACK',
+        partialTakeProfitPct: isEma921Trade ? 70 : 50,
+        trailBasis: isEma921Trade ? '5M_EMA21' : '15M_EMA20',
       };
 
       lastAutoExecutedSignalId.current = signalToUse.id || `${orderSymbol}-${orderSide}-${signalToUse.exposureMode || 'MACRO'}-${signalToUse.confidence || 75}-${Math.round(resolvedFillPrice)}`;
@@ -3284,8 +3657,15 @@ export function useSniperScalpingEngine({
       setLastExecutedSignalTs(Date.now());
       if (onPlaySound) onPlaySound();
 
-      addLog('ENTRY', `Executed ${orderSide} ${orderSize} ${resolvedProductSymbol}`, 
-        `Entry: $${resolvedFillPrice.toLocaleString()} | Initial SL: $${finalSl.toLocaleString()} (${postFillBuffered.slPct}% buffer) | TP1: $${(finalTp1 || resolvedFillPrice).toLocaleString()} | TP2: $${(finalTp2 || finalTp4).toLocaleString()}${bracketWarningMsg ? ` | Bracket Note: ${bracketWarningMsg}` : ''}`);
+      addLog(
+        'ENTRY',
+        isEma921Trade
+          ? `Executed 5m EMA 9/21 ${orderSide} ${orderSize} ${resolvedProductSymbol}`
+          : `Executed post_only Limit ${orderSide} ${orderSize} ${resolvedProductSymbol}`,
+        isEma921Trade
+          ? `Entry: $${resolvedFillPrice.toLocaleString()} | 1.2x 5m ATR SL: $${finalSl.toLocaleString()} | 60% Limit TP1 (+100pt / 0.0236% maker incl. GST): $${(finalTp1 || resolvedFillPrice).toLocaleString()} | BE: $${finalFeeAdjBe.toLocaleString()} | 40% EMA 21 Runner: $${finalTp4.toLocaleString()}`
+          : `Entry: $${resolvedFillPrice.toLocaleString()} (0.02% maker) | 1.5x ATR SL: $${finalSl.toLocaleString()} | Step 01 BE (+1.35R): $${(finalTp1 || resolvedFillPrice).toLocaleString()} | Runner: $${(finalTp2 || finalTp4).toLocaleString()}–$${finalTp4.toLocaleString()}${bracketWarningMsg ? ` | Bracket Note: ${bracketWarningMsg}` : ''}`
+      );
 
       queueAnalyticsEvent({
         kind: 'TRADE_LIFECYCLE',
@@ -3302,7 +3682,7 @@ export function useSniperScalpingEngine({
         netRealizedPnlUsd: 0,
         usdInrRate: usdInrRef.current,
         mode: tradingMode,
-        reason: isMicro15Tier ? 'Camarilla Sniper $15 Micro Entry Submitted' : 'Camarilla Sniper $50 Standard Entry Submitted',
+        reason: isEma921Trade ? '5m EMA 9/21 Momentum Cross Submitted' : '15m Maker Pullback post_only Limit Submitted',
       });
       queueAnalyticsEvent({
         kind: 'TRADE_LIFECYCLE',
@@ -3319,7 +3699,9 @@ export function useSniperScalpingEngine({
         netRealizedPnlUsd: 0,
         usdInrRate: usdInrRef.current,
         mode: tradingMode,
-        reason: `Entry Filled @ $${resolvedFillPrice.toLocaleString()} | SL $${finalSl.toLocaleString()} | TP1 $${(finalTp1 || resolvedFillPrice).toLocaleString()}`,
+        reason: isEma921Trade
+          ? `5m EMA 9/21 Filled @ $${resolvedFillPrice.toLocaleString()} | SL $${finalSl.toLocaleString()} | 60% TP1 $${(finalTp1 || resolvedFillPrice).toLocaleString()}`
+          : `Maker Limit Filled @ $${resolvedFillPrice.toLocaleString()} | SL $${finalSl.toLocaleString()} | Step 01 (+1.35R) $${(finalTp1 || resolvedFillPrice).toLocaleString()}`,
       });
       queueAnalyticsSignal({
         signalId: signalToUse.id || lastAutoExecutedSignalId.current || newTrade.id,
@@ -3347,17 +3729,16 @@ export function useSniperScalpingEngine({
       }
 
       onSendNotification(
-        'Sniper Trade Executed',
-        `${orderSide} ${orderSize} ${resolvedProductSymbol} @ $${resolvedFillPrice.toLocaleString()} (Confidence: ${signalToUse.confidence || 75}%). 4 Profit Targets Primed.`,
+        'Sniper Maker Limit Filled',
+        `${orderSide} ${orderSize} ${resolvedProductSymbol} @ $${resolvedFillPrice.toLocaleString()} (0.02% maker). BE delayed until +1.35R.`,
         'TRADE'
       );
 
       const shortSym = formatVoiceSymbol(resolvedProductSymbol);
       const dirWord = orderSide === 'SHORT' ? 'Short' : 'Long';
-      const tierPrefix = isMicro15Tier ? 'Micro Sniper' : 'Sniper';
       const tpSpeechTarget = finalTp1 > 0 ? finalTp1 : finalTp4;
       speakVoiceAlert(
-        `${tierPrefix} ${dirWord} executed on ${shortSym} at ${formatVoicePrice(resolvedFillPrice)}. Stop loss ${formatVoicePrice(finalSl)}. Target ${formatVoicePrice(tpSpeechTarget)}.`,
+        `Maker ${dirWord} executed on ${shortSym} at ${formatVoicePrice(resolvedFillPrice)}. Stop loss ${formatVoicePrice(finalSl)}. Target ${formatVoicePrice(tpSpeechTarget)}.`,
         `${newTrade.id}:ENTRY`
       );
     } catch (err: any) {
@@ -3383,7 +3764,131 @@ export function useSniperScalpingEngine({
     } finally {
       setIsExecuting(false);
     }
-  }, [isLiveUnverified, isLiveApiAuthenticated, currentSignal, onExecuteOrder, tradingMode, exposureMode, scalpTier, setActiveTrade, setIsSignalStandby, onSendNotification, onPlaySound, addLog, markets, selectedSymbol, reconcileLivePerpPositionsNow]);
+  }, [isLiveUnverified, isLiveApiAuthenticated, currentSignal, onExecuteOrder, tradingMode, exposureMode, scalpTier, setActiveTrade, setIsSignalStandby, onSendNotification, onPlaySound, addLog, markets, selectedSymbol, reconcileLivePerpPositionsNow, utcDayTradesCount, postSlCooldownUntilMs, manualLotSize, incrementUtcDayTradeCount]);
+
+  const cancelPendingLimitOrder = useCallback(async (reason = 'User Cancelled Pending Limit Order') => {
+    const pending = pendingLimitOrderRef.current;
+    if (!pending) return;
+    if (tradingMode === 'LIVE' && pending.orderId) {
+      const creds = typeof window !== 'undefined' ? localStorage.getItem('delta_api_credentials_v1') : null;
+      let headers: Record<string, string> = { 'Content-Type': 'application/json' };
+      if (creds) {
+        try {
+          const parsed = JSON.parse(creds);
+          if (parsed?.apiKey) headers['x-delta-api-key'] = parsed.apiKey;
+          if (parsed?.apiSecret) headers['x-delta-api-secret'] = parsed.apiSecret;
+        } catch {}
+      }
+      await fetch(`/api/delta/orders/${encodeURIComponent(String(pending.orderId))}?symbol=${encodeURIComponent(pending.symbol)}`, {
+        method: 'DELETE',
+        headers,
+      }).catch(() => {});
+    }
+    setPendingLimitOrder(null);
+    addLog('CONDUIT', 'Pending post_only Limit Cancelled', `${pending.side} ${pending.lotSize} ${pending.symbol} @ $${pending.limitPrice.toLocaleString()} — ${reason}`);
+  }, [tradingMode, addLog]);
+
+  // Monitor resting post_only Limit Order: fill on retest in PAPER, adopt in LIVE, or auto-cancel after 3 bars (45m)
+  useEffect(() => {
+    if (!pendingLimitOrder) return;
+
+    const checkPendingLimit = () => {
+      const pending = pendingLimitOrderRef.current;
+      if (!pending) return;
+
+      // Auto-cancel after 3 x 15m bars (45m) if unfilled
+      if (Date.now() >= pending.expiresAtMs) {
+        void cancelPendingLimitOrder(`Auto-cancelled unfilled post_only limit order after ${PENDING_LIMIT_TTL_BARS} bars`);
+        onSendNotification(
+          'Pending Limit Auto-Cancelled (3 Bars)',
+          `${pending.side} ${pending.symbol} limit @ $${pending.limitPrice.toLocaleString()} expired unfilled after ${PENDING_LIMIT_TTL_BARS} bars.`,
+          'INFO'
+        );
+        return;
+      }
+
+      if (tradingMode === 'LIVE') {
+        const matchedPos = perpOnlyPositions.find(
+          (p) => normalizePerpSymbol(p.symbol) === normalizePerpSymbol(pending.symbol)
+        );
+        if (matchedPos) {
+          incrementUtcDayTradeCount();
+          setPendingLimitOrder(null);
+          addLog('ENTRY', 'LIVE post_only Limit Filled', `${pending.symbol} resting limit filled on Delta Exchange.`);
+        }
+        return;
+      }
+
+      const px = getMarketTicker(markets, pending.symbol).markPrice || markPrice;
+      if (px <= 0) return;
+      const isLong = pending.side === 'LONG';
+      const touched = isLong ? px <= pending.limitPrice : px >= pending.limitPrice;
+      if (touched) {
+        incrementUtcDayTradeCount();
+        setPendingLimitOrder(null);
+        const promotedTrade: SniperActiveTrade = {
+          id: `sniper-lim-${Date.now()}`,
+          symbol: pending.symbol,
+          productSymbol: pending.symbol,
+          signal: pending.side,
+          exposureMode: pending.exposureMode || exposureMode,
+          scalpTier: pending.scalpTier || scalpTier,
+          confidence: pending.confidence || 75,
+          confidenceStatus: pending.confidenceStatus || 'Strong',
+          lotSize: pending.lotSize,
+          remainingSize: pending.lotSize,
+          leverage: pending.leverage,
+          entryPrice: pending.limitPrice,
+          currentPrice: px,
+          initialStopLoss: pending.stopLoss,
+          currentStopLoss: pending.stopLoss,
+          tp1: pending.tp1 > 0 ? pending.tp1 : pending.limitPrice,
+          tp2: pending.tp2 > 0 ? pending.tp2 : pending.limitPrice,
+          tp3: pending.tp3 > 0 ? pending.tp3 : pending.limitPrice,
+          tp4: pending.tp4,
+          camarilla: pending.camarilla,
+          tp1Hit: false,
+          tp2Hit: false,
+          tp3Hit: false,
+          tp4Hit: false,
+          status: 'OPEN',
+          tradeStatus: 'ACTIVE',
+          riskStatus: 'INITIAL_RISK',
+          trailingStopActive: false,
+          trailingStopValue: pending.stopLoss,
+          trailingStage: 0,
+          profitLocked: false,
+          bookedProfitUsd: 0,
+          unrealisedProfitUsd: 0,
+          unrealizedPnlUsd: 0,
+          unrealizedPnlInr: 0,
+          highestPriceReached: Math.max(pending.limitPrice, px),
+          lowestPriceReached: Math.min(pending.limitPrice, px),
+          openedAt: Date.now(),
+          lastUpdatedAt: Date.now(),
+          aiVerdict: `POST-ONLY MAKER FILL @ $${pending.limitPrice.toLocaleString()}. BE DELAYED UNTIL +1.35R ($${pending.tp1.toLocaleString()}).`,
+          mode: 'PAPER',
+          adoptedFromExchange: false,
+          friction: pending.friction,
+          netBreakevenPrice: pending.feeAdjustedBePrice,
+          entryOrderType: 'post_only_limit',
+          isPendingLimit: false,
+          feeAdjustedBePrice: pending.feeAdjustedBePrice,
+        };
+        setActiveTrade(promotedTrade);
+        addLog(
+          'ENTRY',
+          `post_only Limit Filled (${pending.side} ${pending.lotSize} ${pending.symbol})`,
+          `Retest filled @ $${pending.limitPrice.toLocaleString()} (0.02% maker fee). 1.5x ATR SL: $${pending.stopLoss.toLocaleString()}.`
+        );
+        if (onPlaySound) onPlaySound();
+      }
+    };
+
+    checkPendingLimit();
+    const timer = setInterval(checkPendingLimit, 3000);
+    return () => clearInterval(timer);
+  }, [pendingLimitOrder, tradingMode, perpOnlyPositions, markets, markPrice, exposureMode, scalpTier, cancelPendingLimitOrder, incrementUtcDayTradeCount, setActiveTrade, addLog, onSendNotification, onPlaySound]);
 
   // Dynamic Cooldown Release on 9/20 EMA Alignment
   useEffect(() => {
@@ -3494,7 +3999,8 @@ export function useSniperScalpingEngine({
       const isMicro15 = trade.exposureMode === 'MICRO_15' || trade.scalpTier === 'TIER_15';
       const isMainStopLoss = totalRealisedPnl <= (isMicro15 ? -14.50 : -49.00);
 
-      if (isMicro15 && !isDefendedExit) {
+      if (!isDefendedExit) {
+        // Universal 3-bar (45m) post-SL cooldown across all Perpetual trades
         triggerMicroSlCooldown();
       }
 
@@ -3749,13 +4255,18 @@ export function useSniperScalpingEngine({
     }
 
     // ─────────────────────────────────────────────────────────
-    // TARGET 1 (STEP 01 / TP1): Partial Close 50% Size · Keep SL at Initial Anti-Wick Stop (BE disabled until STEP 02 / 2.00R)
+    // TARGET 1: Partial Bank (60% @ +100pts on 5m EMA 9/21 w/ 0.0236% Maker Fee; 50% @ +1.35R on MTF Pullback) & SL -> Fee-Adjusted BE
     // ─────────────────────────────────────────────────────────
+    const isEma921ActiveTrade =
+      trade.sniperStrategyMode === 'EMA_9_21_MOMENTUM_5M' ||
+      trade.partialTakeProfitPct === 60 ||
+      trade.trailBasis === '5M_EMA21';
+    const partialFraction = isEma921ActiveTrade ? 0.6 : 0.5;
     const tp1Reached = isLong ? currentPrice >= trade.tp1 : currentPrice <= trade.tp1;
     if (tp1Reached && !trade.tp1Hit) {
       const minStep = trade.symbol?.startsWith('BTC') ? 0.001 : trade.symbol?.startsWith('ETH') ? 0.01 : 0.1;
       const partialPortion = Math.min(
-        Math.max(minStep, +(trade.lotSize * 0.5).toFixed(3)),
+        Math.max(minStep, +(trade.lotSize * partialFraction).toFixed(3)),
         Math.max(minStep, +(trade.remainingSize - minStep).toFixed(3))
       );
       const currentTradeFriction =
@@ -3764,10 +4275,26 @@ export function useSniperScalpingEngine({
           entryPrice: trade.entryPrice,
           direction: trade.signal,
           lotSize: trade.lotSize,
-          isTaker: true,
+          isTaker: false,
         });
+      const feeAdjustedBe =
+        trade.feeAdjustedBePrice && trade.feeAdjustedBePrice > 0
+          ? trade.feeAdjustedBePrice
+          : formatCamarillaPrice(
+              isEma921ActiveTrade
+                ? (isLong
+                    ? trade.entryPrice + (trade.symbol?.startsWith('BTC') ? 35 : trade.entryPrice * 0.00042)
+                    : trade.entryPrice - (trade.symbol?.startsWith('BTC') ? 35 : trade.entryPrice * 0.00042))
+                : (isLong
+                    ? trade.entryPrice * (1 + FEE_ADJUSTED_BE_BUFFER)
+                    : trade.entryPrice * (1 - FEE_ADJUSTED_BE_BUFFER)),
+              trade.entryPrice
+            );
       const tp1Diff = isLong ? Math.max(0, trade.tp1 - trade.entryPrice) : Math.max(0, trade.entryPrice - trade.tp1);
-      const bookedPortionProfit = +(tp1Diff * partialPortion).toFixed(2);
+      const makerTpFeeWithGstUsd = isEma921ActiveTrade
+        ? +(trade.tp1 * partialPortion * DELTA_MAKER_FEE_RATE * (1 + DELTA_GST_RATE_UNIFIED)).toFixed(4)
+        : 0;
+      const bookedPortionProfit = +(tp1Diff * partialPortion - makerTpFeeWithGstUsd).toFixed(2);
       const newBookedUsd = +(trade.bookedProfitUsd + bookedPortionProfit).toFixed(2);
       const remainingAfterTp1 = Math.max(minStep, +(trade.remainingSize - partialPortion).toFixed(3));
       const portionMargin = (trade.entryPrice * partialPortion) / Math.max(1, trade.leverage || 10);
@@ -3776,22 +4303,28 @@ export function useSniperScalpingEngine({
       updatedTrade = {
         ...updatedTrade,
         tp1Hit: true,
-        beArmed: false,
-        currentStopLoss: trade.currentStopLoss,
+        beArmed: true,
+        trailingStopActive: true,
+        trailingStopValue: feeAdjustedBe,
+        currentStopLoss: feeAdjustedBe,
+        netBreakevenPrice: feeAdjustedBe,
+        feeAdjustedBePrice: feeAdjustedBe,
         friction: currentTradeFriction,
-        riskStatus: 'INITIAL_RISK',
-        tradeStatus: 'ACTIVE',
+        riskStatus: 'RISK-FREE',
+        tradeStatus: 'RISK-FREE',
         trailingStage: 1,
         bookedProfitUsd: newBookedUsd,
         remainingSize: remainingAfterTp1,
-        aiVerdict: `STEP 01 (TP1) HIT: 50% SIZE CLOSED (+$${bookedPortionProfit.toFixed(2)}). SL HELD AT INITIAL ANTI-WICK STOP ($${trade.currentStopLoss.toLocaleString()}) UNTIL STEP 02 (2.00R).`,
+        aiVerdict: isEma921ActiveTrade
+          ? `EMA 9/21 +100PT TP1 HIT: 60% LIMIT BANKED (+$${bookedPortionProfit.toFixed(2)} · 0.0236% MAKER INCL. GST). SL -> FEE BE ($${feeAdjustedBe.toLocaleString()}) · TRAILING 40% ON 5M EMA 21.`
+          : `STEP 01 (+1.35R / TP1) HIT: 50% CLOSED (+$${bookedPortionProfit.toFixed(2)}). SL MOVED TO FEE-ADJ BE ($${feeAdjustedBe.toLocaleString()}) · TRAILING 15M EMA20.`,
       };
 
       consecutiveStopsCountRef.current = 0;
       setConsecutiveStopsCount(0);
       registerRealizedPnL(bookedPortionProfit);
       setActiveTrade(updatedTrade);
-      speakVoiceAlert('Target 1 reached. Partial profit locked.', `${trade.id}:TP1`);
+      speakVoiceAlert('Target 1 reached. Stop loss moved to breakeven.', `${trade.id}:TP1`);
 
       if (onRecordClosedTrade) {
         onRecordClosedTrade(
@@ -3806,14 +4339,17 @@ export function useSniperScalpingEngine({
             pnlPercent: portionPct,
             openedAt: trade.openedAt,
             closedAt: Date.now(),
-            reason: 'STEP 01 (TP1) Hit — 50% Partial Close (SL Held Until STEP 02 / 2.00R)',
+            reason: isEma921ActiveTrade
+              ? '5m EMA 9/21 +100pt TP1 Limit Fill (60% · 0.0236% Maker incl. GST) & SL -> Entry ± $35 BE'
+              : 'STEP 01 (+1.35R) Hit — 50% Partial Close & SL Moved to Fee-Adjusted BE',
             mode: tradingMode,
           },
           {
             symbol: trade.symbol,
             partialSize: partialPortion,
-            newStopLoss: trade.currentStopLoss,
+            newStopLoss: feeAdjustedBe,
             tp1Hit: true,
+            feeBufferBe: feeAdjustedBe,
             exitPrice: trade.tp1,
           }
         );
@@ -3821,8 +4357,12 @@ export function useSniperScalpingEngine({
 
       addLog(
         'TP1',
-        'STEP 01 (TP1) Hit! 50% Closed · SL Held Until 2.00R',
-        `TP1 ($${trade.tp1.toLocaleString()}) achieved. 50% closed (+$${bookedPortionProfit.toFixed(2)}). SL remains at anti-wick stop ($${trade.currentStopLoss.toLocaleString()}) until STEP 02 (2.00R).`
+        isEma921ActiveTrade
+          ? 'EMA 9/21 +100pt TP1 Limit Hit! 60% Banked · SL Moved to Entry ± $35 BE'
+          : 'STEP 01 (+1.35R) Hit! 50% Closed · SL Moved to Fee-Adjusted BE',
+        isEma921ActiveTrade
+          ? `TP1 ($${trade.tp1.toLocaleString()}) achieved via Limit TP (0.0236% maker fee incl. GST). 60% closed (+$${bookedPortionProfit.toFixed(2)}). SL moved to Fee BE ($${feeAdjustedBe.toLocaleString()}) & 40% runner trailing 5m EMA 21.`
+          : `TP1 ($${trade.tp1.toLocaleString()}) achieved. 50% closed (+$${bookedPortionProfit.toFixed(2)}). SL armed to Fee-Adjusted BE ($${feeAdjustedBe.toLocaleString()}) & 15M EMA 20 runner trailing enabled.`
       );
       queueAnalyticsEvent({
         kind: 'TRADE_LIFECYCLE',
@@ -3836,16 +4376,28 @@ export function useSniperScalpingEngine({
         entryPrice: trade.entryPrice,
         exitPrice: trade.tp1,
         triggerPrice: trade.tp1,
-        fees: currentTradeFriction.totalFrictionUsd * 0.5,
+        fees: isEma921ActiveTrade ? makerTpFeeWithGstUsd : currentTradeFriction.totalFrictionUsd * 0.5,
         leverage: trade.leverage || 10,
         netRealizedPnlUsd: bookedPortionProfit,
         usdInrRate: usdInrRef.current,
         mode: tradingMode,
-        reason: 'STEP 01 (TP1) Hit — 50% Partial Close (BE Disabled Until 2.00R)',
+        reason: isEma921ActiveTrade
+          ? 'EMA 9/21 +100pt TP1 — 60% Limit Banked & SL to Entry ± $35 BE'
+          : 'STEP 01 (+1.35R) Hit — 50% Partial Close & SL to Fee-Adj BE',
+      });
+      void syncNativeExchangeStopLossLive({
+        mode: tradingMode,
+        symbol: trade.symbol,
+        side: trade.signal,
+        remainingSizeCoin: remainingAfterTp1,
+        stopLossPrice: feeAdjustedBe,
+        entryPrice: trade.entryPrice,
       });
       onSendNotification(
-        'TP1 Hit · 50% Partial Booked',
-        `${trade.symbol} reached TP1 ($${trade.tp1.toLocaleString()}). Closed 50% (+$${bookedPortionProfit.toFixed(2)}). SL remains at initial anti-wick stop until STEP 02 (2.00R).`,
+        isEma921ActiveTrade ? '5m EMA 9/21 +100pt Banked (60%)' : 'STEP 01 (+1.35R) · SL at Fee-Adjusted BE',
+        isEma921ActiveTrade
+          ? `${trade.symbol} banked 60% @ $${trade.tp1.toLocaleString()} (+$${bookedPortionProfit.toFixed(2)}). SL moved to Fee BE ($${feeAdjustedBe.toLocaleString()}).`
+          : `${trade.symbol} reached +1.35R ($${trade.tp1.toLocaleString()}). Closed 50% (+$${bookedPortionProfit.toFixed(2)}), SL moved to Fee-Adj BE ($${feeAdjustedBe.toLocaleString()}).`,
         'TRADE'
       );
       return;
@@ -3853,9 +4405,10 @@ export function useSniperScalpingEngine({
 
     // ─────────────────────────────────────────────────────────
     // TARGET 2 (STEP 02 / 2.00R / TP2): Scale Out 25% & Arm SL -> Fee-Buffer Breakeven (Risk-Free)
+    // (Skipped in EMA 9/21 Momentum Cross mode so full 40% runner trails behind 5m EMA 21 toward +220 pts)
     // ─────────────────────────────────────────────────────────
     const tp2Reached = isLong ? currentPrice >= trade.tp2 : currentPrice <= trade.tp2;
-    if (tp2Reached && !trade.tp2Hit) {
+    if (!isEma921ActiveTrade && tp2Reached && !trade.tp2Hit) {
       const minStep = trade.symbol?.startsWith('BTC') ? 0.001 : trade.symbol?.startsWith('ETH') ? 0.01 : 0.1;
       const isMicroExitAtTp2 = (trade.exposureMode === 'MICRO_15' || trade.scalpTier === 'TIER_15') && trade.remainingSize <= minStep * 1.01;
 
@@ -4079,10 +4632,10 @@ export function useSniperScalpingEngine({
     }
 
     // ─────────────────────────────────────────────────────────
-    // TARGET 3 (TP3): Scale Out 25% & Trail Stop Loss to TP2
+    // TARGET 3 (TP3): Scale Out 25% & Trail Stop Loss to TP2 (Skipped on 5m EMA 9/21 Runner)
     // ─────────────────────────────────────────────────────────
     const tp3Reached = isLong ? currentPrice >= trade.tp3 : currentPrice <= trade.tp3;
-    if (tp3Reached && !trade.tp3Hit) {
+    if (!isEma921ActiveTrade && tp3Reached && !trade.tp3Hit) {
       const partialPortion = Math.min(
         Math.max(0.001, +(trade.remainingSize * 0.25).toFixed(3)),
         Math.max(0.001, +(trade.remainingSize - 0.001).toFixed(3))
@@ -4177,33 +4730,65 @@ export function useSniperScalpingEngine({
     }
 
     // ─────────────────────────────────────────────────────────
-    // DYNAMIC ADVANCED TRAILING STOP UPDATE (Stage 3)
+    // RUNNER TRAILING (5M EMA 21 on EMA 9/21 Cross toward +220pts | 15M EMA 20 on MTF Pullback)
     // ─────────────────────────────────────────────────────────
-    if (trade.trailingStopActive && trade.tp3Hit && !trade.tp4Hit) {
-      const atrStep = Math.abs(trade.tp3 - trade.tp2) * 0.55;
+    if (trade.tp1Hit && trade.beArmed && !trade.tp4Hit) {
+      const emaTrailRef = isEma921ActiveTrade
+        ? Number(currentSignal.ema921Cross?.ema21_5m || currentSignal.ema21 || 0)
+        : Number(currentSignal.regimeRouter?.ema20_15m || 0);
+      const trailLabel = isEma921ActiveTrade ? '5m EMA 21' : '15m EMA 20';
+      const feeFloor =
+        trade.feeAdjustedBePrice && trade.feeAdjustedBePrice > 0
+          ? trade.feeAdjustedBePrice
+          : isLong
+          ? trade.entryPrice * (1 + FEE_ADJUSTED_BE_BUFFER)
+          : trade.entryPrice * (1 - FEE_ADJUSTED_BE_BUFFER);
       if (isLong) {
-        const potentialSl = +(highest - atrStep).toFixed(2);
-        if (potentialSl > trade.currentStopLoss) {
+        const emaTrail = emaTrailRef > feeFloor && emaTrailRef < currentPrice ? formatCamarillaPrice(emaTrailRef, trade.entryPrice) : 0;
+        const atrStep = Math.abs(trade.tp3 - trade.tp2) * 0.55;
+        const swingTrail = !isEma921ActiveTrade && trade.tp3Hit ? +(highest - atrStep).toFixed(2) : 0;
+        const candidateSl = Math.max(feeFloor, emaTrail, swingTrail);
+        if (candidateSl > trade.currentStopLoss && candidateSl < currentPrice) {
           updatedTrade = {
             ...updatedTrade,
-            currentStopLoss: potentialSl,
-            trailingStopValue: potentialSl,
-            aiVerdict: `TRAILING STOP ADAPTED: MOVED HIGHER TO $${potentialSl.toLocaleString()} PROTECTING RUNNER.`,
+            currentStopLoss: candidateSl,
+            trailingStopValue: candidateSl,
+            aiVerdict: `${trailLabel.toUpperCase()} RUNNER TRAIL: SL RAISED TO $${candidateSl.toLocaleString()} PROTECTING RUNNER.`,
           };
           setActiveTrade(updatedTrade);
-          addLog('TRAILING', 'Trailing Stop Adapted Upwards', `Runner SL ratcheted up to $${potentialSl.toLocaleString()} following swing peak.`);
+          addLog('TRAILING', `${trailLabel} Runner Trail Updated`, `Runner SL ratcheted up to $${candidateSl.toLocaleString()} (above Fee-Adj BE).`);
+          void syncNativeExchangeStopLossLive({
+            mode: tradingMode,
+            symbol: trade.symbol,
+            side: trade.signal,
+            remainingSizeCoin: trade.remainingSize,
+            stopLossPrice: candidateSl,
+            entryPrice: trade.entryPrice,
+          });
         }
       } else {
-        const potentialSl = +(lowest + atrStep).toFixed(2);
-        if (potentialSl < trade.currentStopLoss) {
+        const emaTrail = emaTrailRef > currentPrice && emaTrailRef < feeFloor ? formatCamarillaPrice(emaTrailRef, trade.entryPrice) : 0;
+        const atrStep = Math.abs(trade.tp3 - trade.tp2) * 0.55;
+        const swingTrail = !isEma921ActiveTrade && trade.tp3Hit ? +(lowest + atrStep).toFixed(2) : 0;
+        const candidates = [feeFloor, emaTrail, swingTrail].filter((v) => v > 0);
+        const candidateSl = candidates.length > 0 ? Math.min(...candidates) : 0;
+        if (candidateSl > 0 && candidateSl < trade.currentStopLoss && candidateSl > currentPrice) {
           updatedTrade = {
             ...updatedTrade,
-            currentStopLoss: potentialSl,
-            trailingStopValue: potentialSl,
-            aiVerdict: `TRAILING STOP ADAPTED: MOVED LOWER TO $${potentialSl.toLocaleString()} PROTECTING RUNNER.`,
+            currentStopLoss: candidateSl,
+            trailingStopValue: candidateSl,
+            aiVerdict: `${trailLabel.toUpperCase()} RUNNER TRAIL: SL LOWERED TO $${candidateSl.toLocaleString()} PROTECTING RUNNER.`,
           };
           setActiveTrade(updatedTrade);
-          addLog('TRAILING', 'Trailing Stop Adapted Downwards', `Runner SL ratcheted down to $${potentialSl.toLocaleString()} following swing trough.`);
+          addLog('TRAILING', `${trailLabel} Runner Trail Updated`, `Runner SL ratcheted down to $${candidateSl.toLocaleString()} (below Fee-Adj BE).`);
+          void syncNativeExchangeStopLossLive({
+            mode: tradingMode,
+            symbol: trade.symbol,
+            side: trade.signal,
+            remainingSizeCoin: trade.remainingSize,
+            stopLossPrice: candidateSl,
+            entryPrice: trade.entryPrice,
+          });
         }
       }
     }
@@ -4466,8 +5051,18 @@ export function useSniperScalpingEngine({
   }, []);
 
   useEffect(() => {
-    // 1. Guard against disabled auto-pilot, unverified live API, in-flight execution, or active open position
-    if (!isAutoSniperEnabled || isLiveUnverified || isExecuting || activeTrade) {
+    // 1. Guard: Boot 10s hydration window + live wallet & position reconciliation + no active trade or resting limit order
+    const withinBootGuard = Boolean(appBootTimestamp && Date.now() - appBootTimestamp < 10_000);
+    if (
+      !isAutoSniperEnabled ||
+      isLiveUnverified ||
+      !isExchangeHydrated ||
+      withinBootGuard ||
+      isExecuting ||
+      activeTrade ||
+      pendingLimitOrderRef.current ||
+      perpOnlyPositions.length > 0
+    ) {
       if (autoExecutionTimerRef.current) {
         clearTimeout(autoExecutionTimerRef.current);
         autoExecutionTimerRef.current = null;
@@ -4477,6 +5072,37 @@ export function useSniperScalpingEngine({
     }
 
     const isBypassActive = tradingMode === 'PAPER' && bypassHtfFilter;
+
+    // 1b. Daily UTC Cap (max 3/day), 3-bar post-SL cooldown, and Unified Regime Router (no-trade / options-only)
+    if (
+      !isBypassActive &&
+      (utcDayTradesCount >= MAX_TRADES_PER_UTC_DAY ||
+        postSlCooldownUntilMs > Date.now() ||
+        currentSignal.regimeRouter?.isNoTrade ||
+        currentSignal.regimeRouter?.routeDestination === 'OPTIONS_DEBIT_SPREAD')
+    ) {
+      if (autoExecutionTimerRef.current) {
+        clearTimeout(autoExecutionTimerRef.current);
+        autoExecutionTimerRef.current = null;
+      }
+      pendingAutoSignalIdRef.current = null;
+      return;
+    }
+
+    // 1c. Anchor auto-entry signals strictly to new candles forming AFTER mount
+    const autoTargetSym = currentSignal.symbol || selectedSymbol;
+    if (!isBypassActive && candles15m.length > 0 && simulatedCandleCloses[autoTargetSym] === undefined) {
+      const latest15mSec = normalizeCandleTimeSec(candles15m[candles15m.length - 1]?.time);
+      if (latest15mSec > 0 && latest15mSec <= mountTimestampSecRef.current - 900) {
+        // Wait for fresh post-boot candle tick/update
+        if (candles15m.length >= 2) {
+          const prevClosedSec = normalizeCandleTimeSec(candles15m[candles15m.length - 2]?.time);
+          if (prevClosedSec <= mountTimestampSecRef.current - 900 && Date.now() - mountTimestampSecRef.current * 1000 < 10_000) {
+            return;
+          }
+        }
+      }
+    }
 
     // 2. Validate trade eligibility: must pass Gate 1 + Gate 7 risk checks, not be stale, and have conviction >= 75%
     const isSignalApproved =
@@ -4506,7 +5132,7 @@ export function useSniperScalpingEngine({
       return;
     }
 
-    // Guard against WIDE CPR (> 0.35%) UNLESS Narrow 5m/15m CPR ($15 Micro override) or Bypass HTF is active
+    // Guard against WIDE CPR (> 0.35%) UNLESS Bypass HTF is active (router already routes wide CPR trending to Options Lab)
     const isWideCpr = currentSignal.camarilla?.isWideCpr ?? (currentSignal.camarilla?.cprWidthRatio ? currentSignal.camarilla.cprWidthRatio > 0.0035 : false);
     const narrowCprOverride = Boolean(currentSignal.isNarrow5mCpr || currentSignal.riskChecks?.narrowCprOverrideActive);
     if (isWideCpr && !narrowCprOverride && !isBypassActive) {
@@ -4518,25 +5144,7 @@ export function useSniperScalpingEngine({
       return;
     }
 
-    // Independent 1/1 Perp Micro Slot & Anti-Chop Guard (Max 3/hr, 10m post-SL cooldown, <65% total margin)
-    const isMicro15Signal = currentSignal.exposureMode === 'MICRO_15' || currentSignal.scalpTier === 'TIER_15' || narrowCprOverride;
-    if (isMicro15Signal && !isBypassActive) {
-      if (
-        currentSignal.riskChecks?.perpMicroSlotOccupied ||
-        currentSignal.riskChecks?.marginUtilizationSafe === false ||
-        currentSignal.riskChecks?.microAntiChopPassed === false
-      ) {
-        if (autoExecutionTimerRef.current) {
-          clearTimeout(autoExecutionTimerRef.current);
-          autoExecutionTimerRef.current = null;
-        }
-        pendingAutoSignalIdRef.current = null;
-        return;
-      }
-    }
-
-    // Guard against intra-candle touches, L3–H3 chop zone without H4/L4 5m close, or failed anti-chase / candle momentum checks
-    const autoTargetSym = currentSignal.symbol || selectedSymbol;
+    // Guard against failed anti-chase / candle momentum checks unless using 15m pullback limit
     const liveCandleStateForAuto = candleHistoryRef.current[autoTargetSym];
     const prevApi5mForAuto = candles5m.length > 1 ? candles5m[candles5m.length - 2] : null;
     const autoHasSimulatedClose = simulatedCandleCloses[autoTargetSym] !== undefined;
@@ -4568,7 +5176,8 @@ export function useSniperScalpingEngine({
       (currentSignal.validation?.candleConfirmed === false ||
         !autoAntiChaseCheck.passed ||
         autoAntiChaseCheck.chopZoneBlocked) &&
-      !isBypassActive
+      !isBypassActive &&
+      currentSignal.entryOrderType !== 'post_only_limit'
     ) {
       if (autoExecutionTimerRef.current) {
         clearTimeout(autoExecutionTimerRef.current);
@@ -4578,35 +5187,6 @@ export function useSniperScalpingEngine({
       return;
     }
 
-    // Strict Anti-Chase & L3–H3 Chop-Zone Guard: block auto-entries while inside L3–H3 unless H4/L4 closed on 5m bar
-    const isLongSignal = currentSignal.signal === 'LONG';
-    const liveMark = markPrice > 0 ? markPrice : (currentSignal.entryPrice || 81702.50);
-    const h4Val = currentSignal.camarilla?.h4 || 0;
-    const l4Val = currentSignal.camarilla?.l4 || 0;
-
-    const priceConditionMet = isBypassActive
-      ? true
-      : isLongSignal
-      ? (h4Val > 0 ? liveMark >= h4Val * 0.9995 || (autoLastClosed5mClose > 0 && autoLastClosed5mClose >= h4Val) : true)
-      : (l4Val > 0 ? liveMark <= l4Val * 1.0005 || (autoLastClosed5mClose > 0 && autoLastClosed5mClose <= l4Val) : true);
-
-    if (!priceConditionMet) {
-      if (autoExecutionTimerRef.current) {
-        clearTimeout(autoExecutionTimerRef.current);
-        autoExecutionTimerRef.current = null;
-      }
-      pendingAutoSignalIdRef.current = null;
-      return;
-    }
-
-    const high24 = curMarket.high24h || liveMark * 1.01;
-    const low24 = curMarket.low24h || liveMark * 0.99;
-    const sessionVwap = (high24 + low24 + liveMark * 2) / 4;
-    const htfEma50 = liveMark / (1 + ((curMarket.change24h || 0) / 100) * 0.40);
-    const camL3 = currentSignal.camarilla?.l3 || liveMark * 0.995;
-    const isHighConfidence = (currentSignal?.confidence ?? 0) >= 75;
-
-    // Guard: Margin Sufficiency Check
     if (currentSignal.riskChecks?.sufficientMargin === false && !isBypassActive) {
       if (autoExecutionTimerRef.current) {
         clearTimeout(autoExecutionTimerRef.current);
@@ -4616,29 +5196,6 @@ export function useSniperScalpingEngine({
       return;
     }
 
-    if (!isBypassActive && !isHighConfidence) {
-      if (isLongSignal) {
-        if (liveMark < htfEma50 || liveMark < camL3 || liveMark < sessionVwap) {
-          if (autoExecutionTimerRef.current) {
-            clearTimeout(autoExecutionTimerRef.current);
-            autoExecutionTimerRef.current = null;
-          }
-          pendingAutoSignalIdRef.current = null;
-          return;
-        }
-      } else {
-        if (liveMark > htfEma50 || liveMark > sessionVwap) {
-          if (autoExecutionTimerRef.current) {
-            clearTimeout(autoExecutionTimerRef.current);
-            autoExecutionTimerRef.current = null;
-          }
-          pendingAutoSignalIdRef.current = null;
-          return;
-        }
-      }
-    }
-
-    // Requirement 3: Guard against 15m Cascade Pause (> 1.0% drop in last 15m)
     if (cascadePauseExpiryRef.current > Date.now() && consolidationBarsRef.current < 3) {
       if (autoExecutionTimerRef.current) {
         clearTimeout(autoExecutionTimerRef.current);
@@ -4658,7 +5215,7 @@ export function useSniperScalpingEngine({
     }
 
     // 3. Resolve the unique signal setup identifier
-    const currentSignalId = currentSignal.id || 
+    const currentSignalId = currentSignal.id ||
       `${currentSignal.symbol}-${currentSignal.signal}-${currentSignal.exposureMode || 'MACRO'}-${currentSignal.confidence}-${Math.round(currentSignal.entryPrice || 0)}`;
 
     // 4. Prevent duplicate dispatches for the exact same signal setup that was already auto-executed
@@ -4684,8 +5241,7 @@ export function useSniperScalpingEngine({
       autoExecutionTimerRef.current = null;
       pendingAutoSignalIdRef.current = null;
 
-      // Final sanity check before dispatching trade
-      if (!isAutoSniperEnabled || isLiveUnverified || isExecuting || activeTrade) return;
+      if (!isAutoSniperEnabled || isLiveUnverified || !isExchangeHydrated || isExecuting || activeTrade || pendingLimitOrderRef.current || perpOnlyPositions.length > 0) return;
 
       lastAutoExecutedSignalId.current = currentSignalId;
       lastAttemptTsRef.current = Date.now();
@@ -4693,18 +5249,33 @@ export function useSniperScalpingEngine({
       addLog(
         'EXECUTION',
         'Auto-Pilot Triggered',
-        `AUTO-PILOT: Order executed based on AI Command consensus (Confidence: ${currentSignal.confidence}%)`
+        `AUTO-PILOT: Staging post_only Limit @ $${(currentSignal.entryPrice || 0).toLocaleString()} (Unified Router: ${currentSignal.regimeStatusLabel || 'PERPETUALS'})`
       );
       executeSniperTrade(currentSignal);
     }, 1500);
   }, [
     isAutoSniperEnabled,
+    isLiveUnverified,
+    isExchangeHydrated,
+    appBootTimestamp,
     currentSignal,
     activeTrade,
+    perpOnlyPositions.length,
     isExecuting,
     executeSniperTrade,
     addLog,
-
+    utcDayTradesCount,
+    postSlCooldownUntilMs,
+    candles15m,
+    candles5m,
+    simulatedCandleCloses,
+    tradingMode,
+    bypassHtfFilter,
+    harvestTargetHit,
+    lockoutExpiry,
+    selectedSymbol,
+    markPrice,
+    curMarket.low24h,
   ]);
 
   // Manual Reset / Emergency Close — Immediately clears activeTrade and wipes target ladder to "---"
@@ -5901,6 +6472,8 @@ export function useSniperScalpingEngine({
     syncSniperAutoPilotFromServer,
     directionMode,
     setDirectionMode,
+    sniperStrategyMode,
+    setSniperStrategyMode,
     scalpTier,
     setScalpTier,
     exposureMode,
@@ -5946,6 +6519,14 @@ export function useSniperScalpingEngine({
     isAutoRescueEnabled,
     setIsAutoRescueEnabled,
     rescueRecordsByKey,
+    manualLotSize,
+    setManualLotSize,
+    pendingLimitOrder,
+    cancelPendingLimitOrder,
+    utcDayTradesCount,
+    postSlCooldownBarsRemaining: currentSignal.postSlCooldownBarsRemaining ?? 0,
+    regimeRouter: currentSignal.regimeRouter,
+    regimeStatusLabel: currentSignal.regimeStatusLabel,
   }), [
     currentSignal,
     activeTrade,
@@ -5958,6 +6539,7 @@ export function useSniperScalpingEngine({
     setIsAutoSniperEnabled,
     syncSniperAutoPilotFromServer,
     directionMode,
+    sniperStrategyMode,
     scalpTier,
     setScalpTier,
     exposureMode,
@@ -5994,6 +6576,11 @@ export function useSniperScalpingEngine({
     isAutoRescueEnabled,
     setIsAutoRescueEnabled,
     rescueRecordsByKey,
+    manualLotSize,
+    setManualLotSize,
+    pendingLimitOrder,
+    cancelPendingLimitOrder,
+    utcDayTradesCount,
   ]);
 }
 
