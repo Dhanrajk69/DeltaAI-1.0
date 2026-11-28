@@ -85,9 +85,13 @@ async function deltaFetch(url: string, options: any = {}): Promise<globalThis.Re
   try {
     const res = await undiciFetch(url, {
       dispatcher,
+      cache: 'no-store',
       ...options,
       headers: {
         'User-Agent': 'DeltaExchangeIndia-AI/3.0',
+        'Cache-Control': 'no-cache, no-store, must-revalidate, proxy-revalidate',
+        Pragma: 'no-cache',
+        Expires: '0',
         ...(options.headers || {}),
       },
     } as any);
@@ -100,9 +104,13 @@ async function deltaFetch(url: string, options: any = {}): Promise<globalThis.Re
         console.warn(`[Dual-Stack] IPv4 request failed (${err.message}), retrying IPv6...`);
         const res6 = await undiciFetch(url, {
           dispatcher: deltaUndiciIpv6Dispatcher,
+          cache: 'no-store',
           ...options,
           headers: {
             'User-Agent': 'DeltaExchangeIndia-AI/3.0',
+            'Cache-Control': 'no-cache, no-store, must-revalidate, proxy-revalidate',
+            Pragma: 'no-cache',
+            Expires: '0',
             ...(options.headers || {}),
           },
         } as any);
@@ -337,55 +345,37 @@ function appendCloudAuditLog(entry: any) {
   return normalized;
 }
 
-function loadCloudTradeHistory(): any[] {
-  const collected: any[] = [];
-  for (const filePath of [TRADE_HISTORY_PATH, LEGACY_TRADE_HISTORY_PATH]) {
-    try {
-      if (fs.existsSync(filePath)) {
-        const data = fs.readFileSync(filePath, 'utf8');
-        const parsed = JSON.parse(data);
-        if (Array.isArray(parsed)) {
-          collected.push(...parsed);
-        }
-      }
-    } catch {}
-  }
-  if (collected.length === 0) return [];
-  return mergeTradesDeduplicated(collected, [], 2000);
+// Stateless mode: purge any legacy disk trade cache on boot and never read/write local trade history
+for (const legacyTradeFile of [TRADE_HISTORY_PATH, LEGACY_TRADE_HISTORY_PATH]) {
+  try {
+    if (fs.existsSync(legacyTradeFile)) {
+      fs.unlinkSync(legacyTradeFile);
+    }
+  } catch {}
 }
 
-function saveCloudTradeHistory(history: any[]) {
-  try {
-    const normalized = mergeTradesDeduplicated(history, [], 2000);
-    fs.writeFileSync(TRADE_HISTORY_PATH, JSON.stringify(normalized, null, 2), 'utf8');
-  } catch {}
+function loadCloudTradeHistory(): any[] {
+  return [];
+}
+
+function saveCloudTradeHistory(_history: any[]) {
+  // No-op: Delta Exchange India /v2/fills is the sole authoritative source of truth
 }
 
 function appendCloudTradeHistory(trade: any) {
   if (!trade || typeof trade !== 'object') return;
-  const current = loadCloudTradeHistory();
   const baseClosedMs =
     typeof trade.closedAt === 'number' && Number.isFinite(trade.closedAt) && trade.closedAt > 0
       ? trade.closedAt
       : typeof trade.created_at === 'string' && Number.isFinite(Date.parse(trade.created_at))
       ? Date.parse(trade.created_at)
       : Date.now();
-  const normalized = ensureTradeTimestampFields({
+  return ensureTradeTimestampFields({
     id: trade.id || `th-${baseClosedMs}-${Math.random().toString(36).slice(2, 6)}`,
     closedAt: baseClosedMs,
     created_at: trade.created_at || new Date(baseClosedMs).toISOString(),
     ...trade,
   });
-  if (!normalized) return;
-  const merged = mergeTradesDeduplicated(current, [normalized], 2000);
-  saveCloudTradeHistory(merged);
-  try {
-    analyticsWarehouse.recordClosedTradeAsLifecycle(
-      normalized,
-      liveDeltaUsdInrRate || INR_TO_USD_CONVERSION_RATE
-    );
-  } catch {}
-  return normalized;
 }
 import {
   maskSecret,
@@ -461,6 +451,21 @@ const __dirname = __filename ? path.dirname(__filename) : process.cwd();
 
 const app = express();
 const PORT = 3000;
+
+// Completely bypass Google Cloud, Nginx, and browser caching across DeltaAI
+app.set('etag', false);
+
+// Global Anti-Caching Middleware: attaches strict no-cache headers across all API and /v2 pass-through routes
+app.use((req: Request, res: Response, next: NextFunction) => {
+  const url = req.originalUrl || req.url;
+  if (url.startsWith('/api/') || url.startsWith('/v2/') || url === '/v2') {
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+    res.setHeader('Pragma', 'no-cache');
+    res.setHeader('Expires', '0');
+    res.setHeader('Surrogate-Control', 'no-store');
+  }
+  next();
+});
 
 app.use(express.json({ limit: '512kb' }));
 app.use(express.text({ type: 'text/plain', limit: '256kb' }));
@@ -577,6 +582,77 @@ app.use('/api/delta', (req: Request, res: Response, next: NextFunction) => {
 });
 app.use('/api/guardian', requireAuthenticatedUser);
 
+// Stateless Pass-Through Signer for direct /v2/* requests to https://api.india.delta.exchange
+app.use('/v2', requireAuthenticatedUser, async (req: Request, res: Response) => {
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+  res.setHeader('Pragma', 'no-cache');
+  res.setHeader('Expires', '0');
+
+  const rawOriginalUrl = req.originalUrl || `/v2${req.url || ''}`;
+  if (!rawOriginalUrl.startsWith('/v2/') || rawOriginalUrl.includes('..') || rawOriginalUrl.includes('://')) {
+    return res.status(400).json({ success: false, error: 'Invalid Delta Exchange /v2 path' });
+  }
+
+  const method = String(req.method || 'GET').toUpperCase();
+  if (!['GET', 'POST', 'PUT', 'DELETE'].includes(method)) {
+    return res.status(405).json({ success: false, error: 'Unsupported HTTP method' });
+  }
+
+  const isPublicV2Endpoint =
+    method === 'GET' &&
+    (rawOriginalUrl.startsWith('/v2/tickers') ||
+      rawOriginalUrl.startsWith('/v2/products') ||
+      rawOriginalUrl.startsWith('/v2/history/candles') ||
+      rawOriginalUrl.startsWith('/v2/l2orderbook'));
+
+  const { apiKey, apiSecret, hasCredentials } = resolveDeltaApiCredentials(req);
+  if (!isPublicV2Endpoint && (!hasCredentials || !apiKey || !apiSecret)) {
+    return res.status(401).json({
+      success: false,
+      code: 'MISSING_API_CREDENTIALS',
+      error: 'Connect your Delta Exchange India API Key & Secret in Settings.',
+      result: [],
+    });
+  }
+
+  try {
+    const timestamp = Math.floor(Date.now() / 1000).toString();
+    const hasBody = method !== 'GET' && req.body && Object.keys(req.body).length > 0;
+    const bodyStr = hasBody ? JSON.stringify(req.body) : '';
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+      'Cache-Control': 'no-store, no-cache, must-revalidate',
+      Pragma: 'no-cache',
+      Expires: '0',
+    };
+
+    if (hasCredentials && apiKey && apiSecret) {
+      const signaturePayload = method + timestamp + rawOriginalUrl + bodyStr;
+      const signature = crypto.createHmac('sha256', apiSecret).update(signaturePayload).digest('hex');
+      headers['api-key'] = apiKey;
+      headers['timestamp'] = timestamp;
+      headers['signature'] = signature;
+    }
+
+    const upstreamRes = await deltaFetch(`https://api.india.delta.exchange${rawOriginalUrl}`, {
+      method,
+      headers,
+      body: hasBody ? bodyStr : undefined,
+      cache: 'no-store',
+      signal: AbortSignal.timeout(8000),
+    });
+
+    const json = await upstreamRes.json().catch(() => ({ success: false, error: 'Invalid upstream JSON' }));
+    return res.status(upstreamRes.status).json(json);
+  } catch (err: any) {
+    return res.status(502).json({
+      success: false,
+      error: err?.message || 'Stateless pass-through request to Delta Exchange India failed',
+    });
+  }
+});
+
 // Session & Credential Security Manager
 const SESSION_SECRET = process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex');
 const sessionManager = new SessionTokenManager(SESSION_SECRET);
@@ -677,54 +753,15 @@ let portfolio = {
 // Strict clean default: no phantom mock positions without real trade execution
 let activePositions: Position[] = [];
 
-let tradeHistory: ClosedTrade[] = [
-  {
-    id: 'th-1',
-    symbol: 'BTCUSDT',
-    side: 'LONG',
-    size: 0.2,
-    entryPrice: 80900.00,
-    exitPrice: 81650.00,
-    realisedPnl: 150.00,
-    pnlPercent: 9.27,
-    openedAt: Date.now() - 86400000,
-    closedAt: Date.now() - 82800000,
-    reason: 'Take Profit Target 1 Hit',
-  },
-  {
-    id: 'th-2',
-    symbol: 'SOLUSDT',
-    side: 'SHORT',
-    size: 15,
-    entryPrice: 106.20,
-    exitPrice: 104.10,
-    realisedPnl: 31.50,
-    pnlPercent: 19.77,
-    openedAt: Date.now() - 80000000,
-    closedAt: Date.now() - 72000000,
-    reason: 'EMA Trailing Stop Triggered',
-  },
-  {
-    id: 'th-3',
-    symbol: 'BTCUSDT',
-    side: 'LONG',
-    size: 0.15,
-    entryPrice: 81400.00,
-    exitPrice: 81050.00,
-    realisedPnl: -52.50,
-    pnlPercent: -4.30,
-    openedAt: Date.now() - 70000000,
-    closedAt: Date.now() - 68000000,
-    reason: 'Stop Loss Hit (Risk Protected)',
-  },
-];
+// Strict clean default: zero cached/mock trade history — Delta Exchange India is sole source of truth
+let tradeHistory: ClosedTrade[] = [];
 
 function computeLedgerWinRate(history: ClosedTrade[]): number {
   if (!history || history.length === 0) return 0.0;
   const wins = history.filter((t) => (t.realisedPnl || 0) >= 0).length;
   return +((wins / history.length) * 100).toFixed(1);
 }
-portfolio.winRate = computeLedgerWinRate(tradeHistory);
+portfolio.winRate = 0.0;
 
 // Market state with live noise
 interface MarketData {
@@ -862,31 +899,7 @@ let markets: Record<string, MarketData> = {
   },
 };
 
-// Periodic live market tick drift generator
-setInterval(() => {
-  for (const sym of Object.keys(markets)) {
-    const m = markets[sym];
-    const drift = (Math.random() - 0.495) * 0.0012;
-    m.markPrice = +(m.markPrice * (1 + drift)).toFixed(m.markPrice > 100 ? 2 : 4);
-    m.indexPrice = +(m.markPrice * (1 + (Math.random() - 0.5) * 0.0002)).toFixed(m.markPrice > 100 ? 2 : 4);
-  }
-
-  // Update active positions unrealised PnL
-  let unPnlTotal = 0;
-  for (const pos of activePositions) {
-    const currentPrice = markets[pos.symbol]?.markPrice || pos.entryPrice;
-    pos.markPrice = currentPrice;
-    if (pos.side === 'LONG') {
-      pos.unrealisedPnl = +((currentPrice - pos.entryPrice) * pos.size).toFixed(2);
-    } else {
-      pos.unrealisedPnl = +((pos.entryPrice - currentPrice) * pos.size).toFixed(2);
-    }
-    pos.unrealisedPnlPercent = +((pos.unrealisedPnl / pos.margin) * 100).toFixed(2);
-    unPnlTotal += pos.unrealisedPnl;
-  }
-  portfolio.unrealisedPnlTotal = +unPnlTotal.toFixed(2);
-  portfolio.totalEquity = +(portfolio.availableBalance + portfolio.marginUsed + unPnlTotal).toFixed(2);
-}, 2500);
+// Synthetic market drift removed: markets update strictly from live Delta Exchange India WebSocket & REST feeds
 
 // ================= WEBSOCKET & MARKET STREAMING =================
 
@@ -896,7 +909,11 @@ const localWsClients = new Set<WsClient>();
 // Delta Exchange India Upstream WebSocket state
 let upstreamWs: WsClient | null = null;
 let upstreamConnected = false;
-let upstreamUrl = 'wss://socket.india.delta.exchange';
+let upstreamAuthenticated = false;
+let upstreamReconnectAttempts = 0;
+let upstreamReconnectTimer: ReturnType<typeof setTimeout> | null = null;
+const dynamicSubscribedOptionSymbols = new Set<string>();
+const upstreamUrl = 'wss://socket.india.delta.exchange';
 let lastUpstreamMessageTime = Date.now();
 let totalMessagesRelayed = 0;
 let estimatedLatencyMs = 18;
@@ -1025,44 +1042,139 @@ async function syncDeltaLiveTickers() {
 syncDeltaLiveTickers();
 setInterval(syncDeltaLiveTickers, 2500);
 
-// Connect upstream to Delta Exchange India WebSocket
+function sendUpstreamPrivateAuthIfPossible() {
+  if (!upstreamWs || upstreamWs.readyState !== WsClient.OPEN) return;
+  try {
+    const creds = resolveDeltaApiCredentials();
+    if (!creds.hasCredentials || !creds.apiKey || !creds.apiSecret) {
+      return;
+    }
+    const timestamp = Math.floor(Date.now() / 1000).toString();
+    const signaturePayload = 'GET' + timestamp + '/live';
+    const signature = crypto.createHmac('sha256', creds.apiSecret).update(signaturePayload).digest('hex');
+    upstreamWs.send(
+      JSON.stringify({
+        type: 'key-auth',
+        payload: {
+          'api-key': creds.apiKey,
+          signature,
+          timestamp,
+        },
+      })
+    );
+  } catch (err: any) {
+    console.warn('[Delta WebSocket] key-auth dispatch error:', err?.message || err);
+  }
+}
+
+function subscribeUpstreamPrivateChannels() {
+  if (!upstreamWs || upstreamWs.readyState !== WsClient.OPEN) return;
+  try {
+    upstreamWs.send(
+      JSON.stringify({
+        type: 'subscribe',
+        payload: {
+          channels: [
+            { name: 'positions', symbols: ['all'] },
+            { name: 'orders', symbols: ['all'] },
+            { name: 'user_trades', symbols: ['all'] },
+            { name: 'margins' },
+          ],
+        },
+      })
+    );
+  } catch {}
+}
+
+function subscribeUpstreamPublicChannels() {
+  if (!upstreamWs || upstreamWs.readyState !== WsClient.OPEN) return;
+  const tickerSymbols = Array.from(
+    new Set([
+      'BTCUSD',
+      'ETHUSD',
+      'SOLUSD',
+      'XRPUSD',
+      'DOGEUSD',
+      'AVAXUSD',
+      ...Array.from(dynamicSubscribedOptionSymbols),
+    ])
+  );
+  try {
+    upstreamWs.send(
+      JSON.stringify({
+        type: 'subscribe',
+        payload: {
+          channels: [
+            {
+              name: 'v2/ticker',
+              symbols: tickerSymbols,
+            },
+            {
+              name: 'l2_orderbook',
+              symbols: ['BTCUSD'],
+            },
+            {
+              name: 'candlestick_1m',
+              symbols: ['BTCUSD', 'ETHUSD', 'SOLUSD'],
+            },
+            {
+              name: 'candlestick_5m',
+              symbols: ['BTCUSD', 'ETHUSD', 'SOLUSD'],
+            },
+            {
+              name: 'candlestick_15m',
+              symbols: ['BTCUSD', 'ETHUSD', 'SOLUSD'],
+            },
+          ],
+        },
+      })
+    );
+  } catch {}
+}
+
+// Connect upstream strictly to wss://socket.india.delta.exchange with exponential backoff & full resync trigger
 function connectDeltaUpstream() {
-  const urls = [
-    'wss://socket.india.delta.exchange',
-    'wss://socket.delta.exchange',
-  ];
-  let urlIdx = 0;
+  function scheduleReconnect() {
+    if (upstreamReconnectTimer) clearTimeout(upstreamReconnectTimer);
+    const baseDelay = Math.min(30_000, 1000 * Math.pow(2, upstreamReconnectAttempts));
+    const jitter = Math.floor(Math.random() * 400);
+    upstreamReconnectAttempts = Math.min(upstreamReconnectAttempts + 1, 6);
+    upstreamReconnectTimer = setTimeout(attempt, baseDelay + jitter);
+  }
 
   function attempt() {
     try {
-      upstreamUrl = urls[urlIdx];
+      if (upstreamWs) {
+        try {
+          upstreamWs.removeAllListeners();
+          upstreamWs.close();
+        } catch {}
+        upstreamWs = null;
+      }
+
+      upstreamAuthenticated = false;
       upstreamWs = new WsClient(upstreamUrl, {
+        agent: currentRoutingMode === 'IPV6_ONLY' ? deltaIpv6Agent : deltaIpv4Agent,
         headers: { 'User-Agent': 'DeltaExchangeIndia-AI/3.0' },
-        handshakeTimeout: 6000,
+        handshakeTimeout: 8000,
       });
 
       upstreamWs.on('open', () => {
         upstreamConnected = true;
+        upstreamReconnectAttempts = 0;
         lastUpstreamMessageTime = Date.now();
-        console.log(`[Delta WebSocket] Connected to upstream: ${upstreamUrl}`);
+        console.log(`[Delta WebSocket] Connected to authoritative upstream: ${upstreamUrl}`);
 
-        // Subscribe to live channels with real Delta Exchange contract symbols
-        const subMsg = {
-          type: 'subscribe',
-          payload: {
-            channels: [
-              {
-                name: 'v2/ticker',
-                symbols: ['BTCUSD', 'ETHUSD', 'SOLUSD', 'XRPUSD', 'DOGEUSD', 'AVAXUSD'],
-              },
-              {
-                name: 'l2_orderbook',
-                symbols: ['BTCUSD'],
-              },
-            ],
-          },
-        };
-        upstreamWs?.send(JSON.stringify(subMsg));
+        subscribeUpstreamPublicChannels();
+        sendUpstreamPrivateAuthIfPossible();
+
+        // Notify clients to perform full authoritative REST resync on upstream reconnect
+        broadcastToClients({
+          type: 'ws_reconnected_resync',
+          authenticated: false,
+          upstreamUrl,
+          timestamp: Date.now(),
+        });
       });
 
       upstreamWs.on('message', (raw: any) => {
@@ -1072,31 +1184,129 @@ function connectDeltaUpstream() {
           const str = raw.toString();
           const parsed = JSON.parse(str);
 
-          // Update server-side market state
+          // Handle key-auth response from wss://socket.india.delta.exchange
+          if (parsed.type === 'key-auth') {
+            const authOk =
+              parsed.success === true ||
+              parsed.status === 'authenticated' ||
+              String(parsed.status || '').toLowerCase() === 'ok';
+            upstreamAuthenticated = authOk;
+            if (authOk) {
+              console.log('[Delta WebSocket] Private channels authenticated on wss://socket.india.delta.exchange');
+              subscribeUpstreamPrivateChannels();
+              broadcastToClients({
+                type: 'ws_reconnected_resync',
+                authenticated: true,
+                upstreamUrl,
+                timestamp: Date.now(),
+              });
+            }
+            return;
+          }
+
+          // Public v2/ticker updates (Perpetuals + Option Chain Greeks/IV)
           if (parsed.type === 'v2/ticker' && parsed.symbol) {
-            const sym = parsed.symbol;
-            const mark = Number(parsed.mark_price || parsed.close || 0);
+            const sym = String(parsed.symbol).toUpperCase();
+            const isOpt = sym.startsWith('C-') || sym.startsWith('P-');
+            const mark = Number(
+              parsed.mark_price ?? parsed.close ?? parsed.quotes?.mark_price ?? parsed.quotes?.best_bid ?? 0
+            );
 
             if (mark > 0) {
-              const targetSym = toCanonicalSymbol(sym);
-              if (markets[targetSym]) {
+              const targetSym = isOpt ? sym : toCanonicalSymbol(sym);
+              const existingMeta = deltaLiveProductsBySymbol[sym];
+              const contractValue = existingMeta?.contractValue || getDefaultDeltaContractValue(sym);
+              deltaLiveProductsBySymbol[sym] = {
+                symbol: sym,
+                canonicalSymbol: targetSym,
+                productId: parsed.product_id ? Number(parsed.product_id) : existingMeta?.productId,
+                contractType:
+                  parsed.contract_type ||
+                  existingMeta?.contractType ||
+                  (sym.startsWith('C-') ? 'call_options' : sym.startsWith('P-') ? 'put_options' : 'perpetual_futures'),
+                markPrice: mark,
+                spotPrice: Number(parsed.spot_price || existingMeta?.spotPrice || mark),
+                contractValue,
+                leverage: existingMeta?.leverage,
+              };
+              deltaLiveProductsBySymbol[targetSym] = deltaLiveProductsBySymbol[sym];
+
+              if (!isOpt && markets[targetSym]) {
                 markets[targetSym].markPrice = mark;
                 if (parsed.spot_price) markets[targetSym].indexPrice = Number(parsed.spot_price);
                 if (parsed.high) markets[targetSym].high24h = Number(parsed.high);
                 if (parsed.low) markets[targetSym].low24h = Number(parsed.low);
                 if (parsed.turnover_usd) markets[targetSym].volume24hUsd = Number(parsed.turnover_usd);
                 if (parsed.funding_rate) markets[targetSym].fundingRate = Number(parsed.funding_rate);
-                if (parsed.mark_change_24h) markets[targetSym].change24h = +Number(parsed.mark_change_24h).toFixed(2);
+                if (parsed.mark_change_24h !== undefined) {
+                  markets[targetSym].change24h = +Number(parsed.mark_change_24h).toFixed(2);
+                }
+              }
 
-                broadcastToClients({
-                  ...parsed,
-                  symbol: targetSym,
-                  mark_price: mark,
-                  timestamp: parsed.timestamp || Date.now(),
-                  latencyMs: estimatedLatencyMs,
-                });
+              broadcastToClients({
+                ...parsed,
+                channel: 'v2/ticker',
+                symbol: targetSym,
+                rawSymbol: sym,
+                mark_price: mark,
+                spot_price: parsed.spot_price !== undefined ? Number(parsed.spot_price) : undefined,
+                greeks: parsed.greeks || undefined,
+                mark_vol: parsed.mark_vol !== undefined ? Number(parsed.mark_vol) : undefined,
+                quotes: parsed.quotes || undefined,
+                timestamp: parsed.timestamp || Date.now(),
+                latencyMs: estimatedLatencyMs,
+              });
+            }
+            return;
+          }
+
+          // Live candlestick streams (candlestick_1m, candlestick_5m, candlestick_15m)
+          if (typeof parsed.type === 'string' && parsed.type.startsWith('candlestick_')) {
+            const sym = parsed.symbol ? toCanonicalSymbol(String(parsed.symbol).toUpperCase()) : parsed.symbol;
+            broadcastToClients({
+              ...parsed,
+              channel: parsed.type,
+              symbol: sym,
+              rawSymbol: parsed.symbol,
+              timestamp: parsed.timestamp || Date.now(),
+            });
+            return;
+          }
+
+          // Private authenticated channels: positions, orders, user_trades, margins
+          const msgType = String(parsed.type || parsed.channel || '').toLowerCase();
+          if (
+            msgType === 'positions' ||
+            msgType === 'orders' ||
+            msgType === 'v2/orders' ||
+            msgType === 'user_trades' ||
+            msgType === 'v2/user_trades' ||
+            msgType === 'fills' ||
+            msgType === 'margins' ||
+            msgType === 'l2_orderbook'
+          ) {
+            // If an option position arrives on WS, ensure its ticker is subscribed for live Greeks/mark_price
+            if (msgType === 'positions') {
+              const pSym = String(parsed.symbol || parsed.product_symbol || '').toUpperCase();
+              if ((pSym.startsWith('C-') || pSym.startsWith('P-')) && !dynamicSubscribedOptionSymbols.has(pSym)) {
+                dynamicSubscribedOptionSymbols.add(pSym);
+                if (upstreamWs && upstreamWs.readyState === WsClient.OPEN) {
+                  upstreamWs.send(
+                    JSON.stringify({
+                      type: 'subscribe',
+                      payload: { channels: [{ name: 'v2/ticker', symbols: [pSym] }] },
+                    })
+                  );
+                }
               }
             }
+
+            broadcastToClients({
+              ...parsed,
+              channel: msgType,
+              timestamp: parsed.timestamp || Date.now(),
+              latencyMs: estimatedLatencyMs,
+            });
           }
         } catch {}
       });
@@ -1107,17 +1317,20 @@ function connectDeltaUpstream() {
 
       upstreamWs.on('error', (err: any) => {
         upstreamConnected = false;
+        upstreamAuthenticated = false;
         console.warn(`[Delta WebSocket] Upstream notice (${upstreamUrl}):`, err?.message || err);
       });
 
       upstreamWs.on('close', () => {
         upstreamConnected = false;
-        urlIdx = (urlIdx + 1) % urls.length;
-        setTimeout(attempt, 4000);
+        upstreamAuthenticated = false;
+        scheduleReconnect();
       });
     } catch (err: any) {
+      upstreamConnected = false;
+      upstreamAuthenticated = false;
       console.warn('[Delta WebSocket] Connect error:', err?.message || err);
-      setTimeout(attempt, 5000);
+      scheduleReconnect();
     }
   }
 
@@ -1126,49 +1339,13 @@ function connectDeltaUpstream() {
   // Upstream ping heartbeat every 20 seconds
   setInterval(() => {
     if (upstreamWs && upstreamWs.readyState === WsClient.OPEN) {
-      upstreamWs.send(JSON.stringify({ type: 'ping' }));
-      upstreamWs.ping();
+      try {
+        upstreamWs.send(JSON.stringify({ type: 'ping' }));
+        upstreamWs.ping();
+      } catch {}
     }
   }, 20000);
 }
-
-// Live High-Frequency Broadcast to connected client WebSockets (every 400ms for active pairs)
-const CORE_BROADCAST_SYMBOLS = [
-  'BTCUSD', 'BTCUSDT',
-  'ETHUSD', 'ETHUSDT',
-  'SOLUSD', 'SOLUSDT',
-  'XRPUSD', 'XRPUSDT',
-  'DOGEUSD', 'DOGEUSDT',
-  'AVAXUSD', 'AVAXUSDT',
-];
-let coreBroadcastIndex = 0;
-
-setInterval(() => {
-  if (localWsClients.size === 0) return;
-  const sym = CORE_BROADCAST_SYMBOLS[coreBroadcastIndex % CORE_BROADCAST_SYMBOLS.length];
-  coreBroadcastIndex++;
-  const m = markets[sym];
-  if (!m) return;
-
-  const tickPacket = {
-    type: 'v2/ticker',
-    channel: 'v2/ticker',
-    exchange: 'Delta Exchange India',
-    symbol: m.symbol,
-    mark_price: m.markPrice,
-    index_price: m.indexPrice,
-    change24h: m.change24h,
-    high24h: m.high24h,
-    low24h: m.low24h,
-    volume24hUsd: m.volume24hUsd,
-    fundingRate: m.fundingRate,
-    nextFundingCountdown: m.nextFundingCountdown,
-    timestamp: Date.now(),
-    latencyMs: estimatedLatencyMs,
-  };
-
-  broadcastToClients(tickPacket);
-}, 350);
 
 // ================= API ROUTES =================
 
@@ -1176,14 +1353,24 @@ setInterval(() => {
 app.get('/api/delta/ws-status', (_req: Request, res: Response) => {
   res.json({
     status: 'success',
-    connected: upstreamConnected || localWsClients.size > 0,
+    connected: upstreamConnected,
+    authenticated: upstreamAuthenticated,
     upstreamUrl,
     upstreamConnected,
     activeLocalClients: localWsClients.size,
     latencyMs: estimatedLatencyMs,
     totalMessagesRelayed,
     lastMessageTime: lastUpstreamMessageTime,
-    subscribedChannels: ['v2/ticker', 'l2_orderbook', 'candlestick_5m'],
+    subscribedChannels: [
+      'v2/ticker',
+      'candlestick_1m',
+      'candlestick_5m',
+      'candlestick_15m',
+      'positions',
+      'orders',
+      'user_trades',
+      'margins',
+    ],
     symbols: ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'XRPUSDT', 'DOGEUSDT', 'AVAXUSDT'],
   });
 });
@@ -3518,6 +3705,7 @@ function handlePersistServerConfig(req: Request, res: Response) {
       apiKey: cleanApiKey,
       apiSecret: cleanApiSecret,
     });
+    sendUpstreamPrivateAuthIfPossible();
   }
 
   if (notificationConfig) {
@@ -4120,45 +4308,31 @@ app.post('/api/delta/audit-logs', (req: Request, res: Response) => {
   return res.json({ success: false });
 });
 
-app.get('/api/delta/trade-history', (_req: Request, res: Response) => {
-  res.json({
+app.get('/api/delta/trade-history', async (req: Request, res: Response) => {
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+  const { apiKey, apiSecret, hasCredentials } = resolveDeltaApiCredentials(req);
+  if (!hasCredentials || !apiKey || !apiSecret) {
+    return res.json({ success: true, tradeHistory: [] });
+  }
+  const syncResult = await fetchAndMergeDeltaFillsHistory(apiKey, apiSecret, true);
+  return res.json({
     success: true,
-    tradeHistory: loadCloudTradeHistory(),
+    tradeHistory: syncResult.mergedHistory,
   });
 });
 
-app.post('/api/delta/trade-history', (req: Request, res: Response) => {
-  const { trade, history } = req.body || {};
-  if (Array.isArray(history)) {
-    const existing = loadCloudTradeHistory();
-    const merged = mergeTradesDeduplicated(existing, history, 2000);
-    saveCloudTradeHistory(merged);
-    return res.json({ success: true, count: merged.length, tradeHistory: merged });
-  }
-  if (trade && typeof trade === 'object') {
-    const saved = appendCloudTradeHistory(trade);
-    return res.json({ success: true, trade: saved });
-  }
-  return res.json({ success: false });
+app.post('/api/delta/trade-history', (_req: Request, res: Response) => {
+  // Stateless mode: never persist client trade history to backend disk or memory
+  return res.json({ success: true, stateless: true });
 });
 
-// 30-second cached Delta Exchange India historical fills fetcher & ~/.deltaai-data/trades.json merger
-const DELTA_FILLS_CACHE_TTL_MS = 30_000;
-const deltaFillsHistoryCache = new Map<
-  string,
-  {
-    fetchedAt: number;
-    fetchedCount: number;
-    mergedHistory: NormalizedClosedTrade[];
-    upstreamOk: boolean;
-    error?: string;
-  }
->();
+// Stateless Delta Exchange India /v2/fills fetcher (zero server caching, zero disk hydration)
+const deltaFillsHistoryCache = new Map<string, any>();
 
 async function fetchAndMergeDeltaFillsHistory(
   apiKey: string,
   apiSecret: string,
-  forceRefresh = false
+  _forceRefresh = true
 ): Promise<{
   cached: boolean;
   upstreamOk: boolean;
@@ -4170,30 +4344,15 @@ async function fetchAndMergeDeltaFillsHistory(
   const cleanKey = String(apiKey || '').trim();
   const cleanSecret = String(apiSecret || '').trim();
   const now = Date.now();
-  const existingLocal = loadCloudTradeHistory();
 
   if (!cleanKey || !cleanSecret || cleanKey.length < 8 || cleanSecret.length < 8) {
     return {
       cached: false,
       upstreamOk: false,
       fetchedCount: 0,
-      mergedHistory: existingLocal,
+      mergedHistory: [],
       lastSyncedAt: now,
       error: 'Missing Delta Exchange API credentials',
-    };
-  }
-
-  const cachedEntry = deltaFillsHistoryCache.get(cleanKey);
-  if (!forceRefresh && cachedEntry && now - cachedEntry.fetchedAt < DELTA_FILLS_CACHE_TTL_MS) {
-    // Re-merge with any locally appended trades without hitting upstream again inside 30s TTL
-    const mergedWithLocal = mergeTradesDeduplicated(existingLocal, cachedEntry.mergedHistory, 2000);
-    return {
-      cached: true,
-      upstreamOk: cachedEntry.upstreamOk,
-      fetchedCount: cachedEntry.fetchedCount,
-      mergedHistory: mergedWithLocal,
-      lastSyncedAt: cachedEntry.fetchedAt,
-      error: cachedEntry.error,
     };
   }
 
@@ -4202,30 +4361,16 @@ async function fetchAndMergeDeltaFillsHistory(
       cleanKey,
       cleanSecret,
       '/v2/fills?page_size=100',
-      forceRefresh ? 0 : DELTA_FILLS_CACHE_TTL_MS
+      0
     );
 
     if (fillsRes && fillsRes.ok && Array.isArray(fillsRes.json?.result)) {
       const normalizedFills = normalizeDeltaExchangeFills(fillsRes.json.result);
-      const merged = mergeTradesDeduplicated(existingLocal, normalizedFills, 2000);
-      saveCloudTradeHistory(merged);
-      const activeRate = liveDeltaUsdInrRate || INR_TO_USD_CONVERSION_RATE;
-      for (const fill of normalizedFills) {
-        try {
-          analyticsWarehouse.recordClosedTradeAsLifecycle(fill, activeRate);
-        } catch {}
-      }
-      deltaFillsHistoryCache.set(cleanKey, {
-        fetchedAt: now,
-        fetchedCount: normalizedFills.length,
-        mergedHistory: merged,
-        upstreamOk: true,
-      });
       return {
         cached: false,
         upstreamOk: true,
         fetchedCount: normalizedFills.length,
-        mergedHistory: merged,
+        mergedHistory: normalizedFills,
         lastSyncedAt: now,
       };
     }
@@ -4234,37 +4379,32 @@ async function fetchAndMergeDeltaFillsHistory(
       fillsRes?.json?.error?.message ||
       fillsRes?.json?.error?.code ||
       `Delta /v2/fills returned HTTP ${fillsRes?.status || 502}`;
-    deltaFillsHistoryCache.set(cleanKey, {
-      fetchedAt: now,
-      fetchedCount: 0,
-      mergedHistory: existingLocal,
-      upstreamOk: false,
-      error: errMsg,
-    });
     return {
       cached: false,
       upstreamOk: false,
       fetchedCount: 0,
-      mergedHistory: existingLocal,
+      mergedHistory: [],
       lastSyncedAt: now,
       error: errMsg,
     };
   } catch (err: any) {
-    const errMsg = err?.message || 'Failed to fetch Delta Exchange /v2/fills';
     return {
       cached: false,
       upstreamOk: false,
       fetchedCount: 0,
-      mergedHistory: existingLocal,
+      mergedHistory: [],
       lastSyncedAt: now,
-      error: errMsg,
+      error: err?.message || 'Failed to fetch Delta Exchange /v2/fills',
     };
   }
 }
 
-// Dedicated 30s-cached Delta Exchange India Historical Fills Endpoint
+// Dedicated Delta Exchange India Historical Fills Endpoint (Strictly no-cache)
 app.get('/api/delta/fills-history', generalApiLimiter.middleware('fills history query'), async (req: Request, res: Response) => {
   res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+  res.setHeader('Pragma', 'no-cache');
+  res.setHeader('Expires', '0');
+  res.setHeader('Surrogate-Control', 'no-store');
   const { apiKey, apiSecret, hasCredentials } = resolveDeltaApiCredentials(req);
   const cloudCfg = loadCloudConfig();
   const activeKey = String(apiKey || cloudCfg.apiKey || '').trim();
@@ -5360,6 +5500,13 @@ app.post('/api/delta/reconcile-closed-position', orderLimiter.middleware('exchan
     };
   }
 
+  // Purge reconciled position from activePositions on the server
+  activePositions = activePositions.filter((p) => {
+    if (p.mode !== 'LIVE') return true;
+    const pSym = normSym(p.rawSymbol || p.symbol);
+    return pSym !== targetNorm && p.symbol.toUpperCase() !== rawSymbol;
+  });
+
   // Persist into trades.json and analytics/trades_archive.jsonl
   const existingLocal = loadCloudTradeHistory();
   const merged = mergeTradesDeduplicated(existingLocal, [finalClosedTrade], 5000);
@@ -5388,6 +5535,140 @@ app.post('/api/delta/reconcile-closed-position', orderLimiter.middleware('exchan
     cancelMessage: cancelMessage || null,
     closedTrade: finalClosedTrade,
   });
+});
+
+// Force Purge Stale Positions Endpoint
+app.post('/api/delta/purge-stale-positions', orderLimiter.middleware('purge stale positions'), async (req: Request, res: Response) => {
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+  const symbol = req.body?.symbol ? String(req.body.symbol).trim().toUpperCase() : null;
+  const purgedCount = activePositions.filter(
+    (p) => p.mode === 'LIVE' && (!symbol || p.rawSymbol === symbol || p.symbol === symbol)
+  ).length;
+  activePositions = activePositions.filter(
+    (p) => !(p.mode === 'LIVE' && (!symbol || p.rawSymbol === symbol || p.symbol === symbol))
+  );
+  return res.json({
+    success: true,
+    message: `Purged ${purgedCount} stale live position(s) from server memory.`,
+    remainingLivePositions: activePositions.filter((p) => p.mode === 'LIVE').length,
+  });
+});
+
+// Stateless Authoritative Open Orders Pass-Through (/v2/orders?state=open)
+app.get('/api/delta/open-orders', generalApiLimiter.middleware('open orders query'), async (req: Request, res: Response) => {
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+  const { apiKey, apiSecret, hasCredentials } = resolveDeltaApiCredentials(req);
+  if (!hasCredentials || !apiKey || !apiSecret) {
+    return res.status(401).json({
+      success: false,
+      code: 'MISSING_API_CREDENTIALS',
+      orders: [],
+    });
+  }
+  try {
+    const ordersRes = await fetchSignedDeltaGetEndpoint(apiKey, apiSecret, '/v2/orders?state=open', 0);
+    const orders = ordersRes.ok && Array.isArray(ordersRes.json?.result) ? ordersRes.json.result : [];
+    return res.json({
+      success: ordersRes.ok,
+      orders,
+      timestamp: Date.now(),
+    });
+  } catch (err: any) {
+    return res.status(502).json({
+      success: false,
+      error: err?.message || 'Failed to fetch open orders from Delta Exchange India',
+      orders: [],
+    });
+  }
+});
+
+// Full Authoritative REST Resync Endpoint (/v2/positions/margined, /v2/orders?state=open, /v2/fills, /v2/wallet/balances)
+app.get('/api/delta/resync-all', generalApiLimiter.middleware('authoritative resync'), async (req: Request, res: Response) => {
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+  const { apiKey, apiSecret, hasCredentials } = resolveDeltaApiCredentials(req);
+  if (!hasCredentials || !apiKey || !apiSecret) {
+    return res.status(401).json({
+      success: false,
+      authenticated: false,
+      code: 'MISSING_API_CREDENTIALS',
+      positions: [],
+      openOrders: [],
+      fills: [],
+      wallet: null,
+    });
+  }
+
+  try {
+    const [posSummary, openOrdersRes, fillsSync, walletRes] = await Promise.all([
+      fetchNormalizedDeltaPositionsAndPnl(apiKey, apiSecret).catch(() => null),
+      fetchSignedDeltaGetEndpoint(apiKey, apiSecret, '/v2/orders?state=open', 0).catch(() => null),
+      fetchAndMergeDeltaFillsHistory(apiKey, apiSecret, true).catch(() => null),
+      fetchSignedDeltaGetEndpoint(apiKey, apiSecret, '/v2/wallet/balances', 0).catch(() => null),
+    ]);
+
+    const positions = posSummary && posSummary.ok ? posSummary.positions : [];
+    const openOrders =
+      openOrdersRes && openOrdersRes.ok && Array.isArray(openOrdersRes.json?.result)
+        ? openOrdersRes.json.result.filter((o: any) => String(o?.state || 'open').toLowerCase() === 'open' || String(o?.state || '').toLowerCase() === 'pending')
+        : [];
+    const fills = fillsSync && Array.isArray(fillsSync.mergedHistory) ? fillsSync.mergedHistory : [];
+
+    // Ensure any active option symbols are subscribed on upstream WS for live Greeks/IV
+    for (const p of positions) {
+      const sym = String(p?.product_symbol || p?.rawSymbol || p?.symbol || '').toUpperCase();
+      if ((sym.startsWith('C-') || sym.startsWith('P-')) && !dynamicSubscribedOptionSymbols.has(sym)) {
+        dynamicSubscribedOptionSymbols.add(sym);
+        if (upstreamWs && upstreamWs.readyState === WsClient.OPEN) {
+          try {
+            upstreamWs.send(
+              JSON.stringify({
+                type: 'subscribe',
+                payload: { channels: [{ name: 'v2/ticker', symbols: [sym] }] },
+              })
+            );
+          } catch {}
+        }
+      }
+    }
+
+    let wallet: any = null;
+    if (walletRes && walletRes.ok) {
+      wallet = buildNormalizedDeltaWalletPayload(
+        walletRes.json,
+        posSummary && posSummary.ok
+          ? {
+              totalUnrealizedPnlUsd: posSummary.totalUnrealizedPnlUsd,
+              netOptionLiquidationUsd: posSummary.netOptionLiquidationUsd,
+              openPositionValueUsd: posSummary.openPositionValueUsd,
+              positionsMarginUsd: posSummary.positionsMarginUsd,
+            }
+          : undefined
+      );
+    }
+
+    return res.json({
+      success: true,
+      authenticated: true,
+      source: 'DELTA_EXCHANGE_INDIA_AUTHORITATIVE',
+      positions,
+      openOrders,
+      fills,
+      wallet,
+      usdInrRate: wallet?.usdInrRate || posSummary?.usdInrRate || liveDeltaUsdInrRate || INR_TO_USD_CONVERSION_RATE,
+      diagnosticError: posSummary?.diagnosticError || null,
+      timestamp: Date.now(),
+    });
+  } catch (err: any) {
+    return res.status(502).json({
+      success: false,
+      authenticated: true,
+      error: err?.message || 'Authoritative Delta Exchange India resync failed',
+      positions: [],
+      openOrders: [],
+      fills: [],
+      wallet: null,
+    });
+  }
 });
 
 // Unified Cross-Device Live Snapshot Endpoint
@@ -6360,6 +6641,9 @@ function buildNormalizedDeltaWalletPayload(
 // 2a. Live Delta Exchange India Wallet Balances (/v2/wallet/balances)
 app.get('/api/delta/wallet', generalApiLimiter.middleware('wallet balances query'), async (req: Request, res: Response) => {
   res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+  res.setHeader('Pragma', 'no-cache');
+  res.setHeader('Expires', '0');
+  res.setHeader('Surrogate-Control', 'no-store');
   const { apiKey, apiSecret, hasCredentials } = resolveDeltaApiCredentials(req);
   const cleanKey = String(apiKey || '').trim();
   const cleanSecret = String(apiSecret || '').trim();
@@ -6393,7 +6677,7 @@ app.get('/api/delta/wallet', generalApiLimiter.middleware('wallet balances query
 
   try {
     const [walletRes, posSummary] = await Promise.all([
-      fetchSignedDeltaGetEndpoint(cleanKey, cleanSecret, '/v2/wallet/balances'),
+      fetchSignedDeltaGetEndpoint(cleanKey, cleanSecret, '/v2/wallet/balances', 0),
       fetchNormalizedDeltaPositionsAndPnl(cleanKey, cleanSecret).catch(() => null),
     ]);
 
@@ -6676,6 +6960,17 @@ async function cachedFetchDeltaRest(
   ttlMs: number,
   fetchFn: () => Promise<{ ok: boolean; status: number; json: any }>
 ): Promise<{ ok: boolean; status: number; json: any; cached?: boolean; rateLimited?: boolean }> {
+  // Strictly bypass caching for live positions, orders, fills, and wallet balances
+  const isNoCachePath =
+    cacheKey.includes('/v2/positions') ||
+    cacheKey.includes('/v2/orders') ||
+    cacheKey.includes('/v2/fills') ||
+    cacheKey.includes('/v2/wallet');
+
+  if (isNoCachePath) {
+    return fetchFn();
+  }
+
   const now = Date.now();
 
   if (now < deltaRateLimitUntil) {
@@ -6724,16 +7019,22 @@ async function cachedFetchDeltaRest(
   return promise;
 }
 
-// Helper to query a signed Delta Exchange India GET path with in-memory caching & HTTP 429 mitigation
+// Helper to query a signed Delta Exchange India GET path without caching for live trading state
 async function fetchSignedDeltaGetEndpoint(
   apiKey: string,
   apiSecret: string,
   requestPathWithQuery: string,
-  ttlMs = 5000
+  ttlMs = 0
 ): Promise<{ ok: boolean; status: number; json: any }> {
   const cleanKey = String(apiKey || '').trim();
   const cleanSecret = String(apiSecret || '').trim();
   const cacheKey = `${cleanKey}:${requestPathWithQuery}`;
+
+  const isCriticalNoCachePath =
+    requestPathWithQuery.includes('/v2/positions') ||
+    requestPathWithQuery.includes('/v2/orders') ||
+    requestPathWithQuery.includes('/v2/fills') ||
+    requestPathWithQuery.includes('/v2/wallet');
 
   const execFetch = async () => {
     const method = 'GET';
@@ -6750,7 +7051,11 @@ async function fetchSignedDeltaGetEndpoint(
         signature,
         'Content-Type': 'application/json',
         Accept: 'application/json',
+        'Cache-Control': 'no-cache, no-store, must-revalidate, proxy-revalidate',
+        Pragma: 'no-cache',
+        Expires: '0',
       },
+      cache: 'no-store',
       signal: AbortSignal.timeout(7000),
     });
 
@@ -6762,11 +7067,11 @@ async function fetchSignedDeltaGetEndpoint(
     };
   };
 
-  if (ttlMs <= 0) {
-    return execFetch();
-  }
-
-  return cachedFetchDeltaRest(cacheKey, ttlMs, execFetch);
+  // Zero-caching rule: always execute stateless pass-through directly against https://api.india.delta.exchange
+  void cacheKey;
+  void ttlMs;
+  void isCriticalNoCachePath;
+  return execFetch();
 }
 
 // Helper to resolve live option/futures ticker mark_price directly from Delta Exchange India if not yet cached
@@ -6852,9 +7157,9 @@ async function fetchNormalizedDeltaPositionsAndPnl(apiKey: string, apiSecret: st
 
   const [settled, openOrdersRes] = await Promise.all([
     Promise.allSettled(
-      queryPaths.map((p) => fetchSignedDeltaGetEndpoint(apiKey, apiSecret, p))
+      queryPaths.map((p) => fetchSignedDeltaGetEndpoint(apiKey, apiSecret, p, 0))
     ),
-    fetchSignedDeltaGetEndpoint(apiKey, apiSecret, '/v2/orders?state=open').catch(() => null),
+    fetchSignedDeltaGetEndpoint(apiKey, apiSecret, '/v2/orders?state=open', 0).catch(() => null),
   ]);
 
   const openSlTpByKey = new Map<string, { stopLoss?: number; takeProfit?: number }>();
@@ -6895,7 +7200,7 @@ async function fetchNormalizedDeltaPositionsAndPnl(apiKey: string, apiSecret: st
     return {
       ok: false,
       diagnosticError,
-      positions: activePositions.filter((p) => p.mode === 'LIVE'),
+      positions: [],
       optionLegsCount: 0,
       totalUnrealizedPnlUsd: 0,
       totalUnrealizedPnlInr: 0,
@@ -7265,42 +7570,19 @@ async function fetchNormalizedDeltaPositionsAndPnl(apiKey: string, apiSecret: st
       return true;
     });
 
-  const localLivePositions = activePositions
-    .filter((lp) => {
-      if (lp.mode !== 'LIVE') return false;
-      const sym = String(lp.rawSymbol || lp.symbol || '').toUpperCase();
-      if (sym.startsWith('C-') || sym.startsWith('P-')) return false;
-      return !normalizedPositions.some(
-        (np) =>
-          (np.rawSymbol && lp.rawSymbol && np.rawSymbol === lp.rawSymbol) ||
-          (toCanonicalSymbol(np.symbol) === toCanonicalSymbol(lp.symbol) && np.side === lp.side)
-      );
-    })
-    .map((lp) => {
-      const rawSym = String(lp.rawSymbol || lp.symbol || '').toUpperCase();
-      const prodMeta = deltaLiveProductsBySymbol[rawSym] || deltaLiveProductsBySymbol[lp.symbol];
-      const liveMark =
-        prodMeta?.markPrice ||
-        markets[toCanonicalSymbol(lp.symbol)]?.markPrice ||
-        lp.markPrice ||
-        lp.entryPrice;
-      const signedCoin = lp.side === 'LONG' ? Math.abs(lp.size) : -Math.abs(lp.size);
-      const upnlUsd = +((liveMark - lp.entryPrice) * signedCoin).toFixed(6);
-      const upnlInr = +(upnlUsd * activeUsdInrRate).toFixed(2);
-      return {
-        ...lp,
-        contract_type: lp.contract_type || 'perpetual_futures',
-        product_symbol: rawSym,
-        markPrice: liveMark,
-        mark_price: liveMark,
-        entry_price: lp.entryPrice,
-        unrealisedPnl: upnlUsd,
-        unrealized_pnl: upnlUsd,
-        unrealized_pnl_inr: upnlInr,
-      };
-    });
+  // Delta Exchange API is the authoritative single source of truth:
+  // Purge any mode === 'LIVE' positions from activePositions that are no longer reported open on Delta Exchange
+  activePositions = activePositions.filter((lp) => {
+    if (lp.mode !== 'LIVE') return true;
+    const sym = String(lp.rawSymbol || lp.symbol || '').toUpperCase();
+    return normalizedPositions.some(
+      (np) =>
+        (np.rawSymbol && lp.rawSymbol && np.rawSymbol === lp.rawSymbol) ||
+        (toCanonicalSymbol(np.symbol) === toCanonicalSymbol(lp.symbol) && np.side === lp.side)
+    );
+  });
 
-  const combinedPositions = [...normalizedPositions, ...localLivePositions];
+  const combinedPositions = [...normalizedPositions];
   const optionPositions = combinedPositions.filter((pos: any) => {
     const sym = String(pos?.product_symbol || pos?.rawSymbol || pos?.symbol || '').toUpperCase();
     const ctype = String(pos?.contract_type || '').toLowerCase();
@@ -7351,6 +7633,9 @@ async function fetchNormalizedDeltaPositionsAndPnl(apiKey: string, apiSecret: st
 // 2b. Live Delta Exchange India Positions (/v2/positions/margined + /v2/positions?contract_types=perpetual_futures,call_options,put_options)
 app.get('/api/delta/positions', generalApiLimiter.middleware('live positions query'), async (req: Request, res: Response) => {
   res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+  res.setHeader('Pragma', 'no-cache');
+  res.setHeader('Expires', '0');
+  res.setHeader('Surrogate-Control', 'no-store');
   const { apiKey, apiSecret, hasCredentials } = resolveDeltaApiCredentials(req);
 
   if (!hasCredentials) {
@@ -7394,7 +7679,6 @@ app.get('/api/delta/positions', generalApiLimiter.middleware('live positions que
       502,
       err?.message || 'Network timeout reaching Delta Exchange India /v2/positions/margined'
     );
-    const fallbackLive = activePositions.filter((p) => p.mode === 'LIVE');
     return res.json({
       status: 'diagnostic_error',
       code: diagnosticError.code,
@@ -7402,11 +7686,8 @@ app.get('/api/delta/positions', generalApiLimiter.middleware('live positions que
       serverIpv4: diagnosticError.serverIpv4,
       serverIpv6: diagnosticError.serverIpv6,
       diagnosticError,
-      optionLegsCount: fallbackLive.filter((p) => {
-        const sym = String(p.rawSymbol || p.symbol || '').toUpperCase();
-        return sym.startsWith('C-') || sym.startsWith('P-');
-      }).length,
-      positions: fallbackLive,
+      optionLegsCount: 0,
+      positions: [],
     });
   }
 });
@@ -7415,6 +7696,9 @@ app.get('/api/delta/positions', generalApiLimiter.middleware('live positions que
 // Queries /v2/positions/margined + live /v2/tickers/{symbol} strictly over IPv4 without local Black-Scholes overrides.
 app.get('/api/delta/options/live-pnl', generalApiLimiter.middleware('options live pnl query'), async (req: Request, res: Response) => {
   res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+  res.setHeader('Pragma', 'no-cache');
+  res.setHeader('Expires', '0');
+  res.setHeader('Surrogate-Control', 'no-store');
   const { apiKey, apiSecret, hasCredentials } = resolveDeltaApiCredentials(req);
 
   if (!hasCredentials) {
@@ -8517,6 +8801,10 @@ async function setDeltaOrderLeverageUpstream(params: {
 }
 
 async function handleDeltaOrderExecution(req: Request, res: Response) {
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+  res.setHeader('Pragma', 'no-cache');
+  res.setHeader('Expires', '0');
+  res.setHeader('Surrogate-Control', 'no-store');
   const body = req.body || {};
   const requestedMode = String(body.mode || 'PAPER').toUpperCase() === 'LIVE' ? 'LIVE' : 'PAPER';
   const { apiKey, apiSecret, environment, hasCredentials } = resolveDeltaApiCredentials(req);
@@ -10292,7 +10580,75 @@ app.delete('/api/delta/orders/:orderId', async (req: Request, res: Response) => 
   }
 });
 
-// 4b. Atomic Multi-Leg Options Strategy Router (/api/delta/options/execute-strategy)
+// 4b. Direct signed proxy routes for /v2/positions*, /v2/orders*, /v2/fills*, and /v2/wallet/balances* (strict no-cache)
+app.all(
+  ['/v2/positions*', '/v2/orders*', '/v2/fills*', '/v2/wallet/balances*'],
+  async (req: Request, res: Response) => {
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+    res.setHeader('Pragma', 'no-cache');
+    res.setHeader('Expires', '0');
+    res.setHeader('Surrogate-Control', 'no-store');
+
+    const { apiKey, apiSecret, environment } = resolveDeltaApiCredentials(req);
+    const cleanKey = String(apiKey || '').trim();
+    const cleanSecret = String(apiSecret || '').trim();
+
+    if (!cleanKey || !cleanSecret) {
+      return res.status(401).json({
+        success: false,
+        error: 'Missing Delta Exchange API Key or Secret',
+        result: [],
+      });
+    }
+
+    const cleanPath = req.originalUrl || req.url;
+    const method = req.method.toUpperCase();
+    const timestamp = Math.floor(Date.now() / 1000).toString();
+    const baseUrl =
+      environment === 'TESTNET'
+        ? 'https://cdn-ind.testnet.deltaex.org'
+        : 'https://api.india.delta.exchange';
+
+    const bodyStr =
+      req.body && Object.keys(req.body).length > 0
+        ? typeof req.body === 'string'
+          ? req.body
+          : JSON.stringify(req.body)
+        : '';
+
+    const signaturePayload = method + timestamp + cleanPath + bodyStr;
+    const signature = crypto.createHmac('sha256', cleanSecret).update(signaturePayload).digest('hex');
+
+    try {
+      const upstreamRes = await deltaFetch(`${baseUrl}${cleanPath}`, {
+        method,
+        headers: {
+          'api-key': cleanKey,
+          timestamp,
+          signature,
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+          'Cache-Control': 'no-cache, no-store, must-revalidate, proxy-revalidate',
+          Pragma: 'no-cache',
+          Expires: '0',
+        },
+        cache: 'no-store',
+        ...(bodyStr ? { body: bodyStr } : {}),
+        signal: AbortSignal.timeout(10000),
+      });
+
+      const data = await upstreamRes.json().catch(() => null);
+      return res.status(upstreamRes.status).json(data);
+    } catch (err: any) {
+      return res.status(502).json({
+        success: false,
+        error: err?.message || 'Gateway error reaching Delta Exchange India',
+      });
+    }
+  }
+);
+
+// 4c. Atomic Multi-Leg Options Strategy Router (/api/delta/options/execute-strategy)
 // Resolves real live contracts from /v2/products?contract_types=call_options,put_options&states=live,
 // executes integer contracts via signed POST /v2/orders, attaches TP/SL, and rolls back filled legs if ANY leg fails.
 app.post(
@@ -12586,7 +12942,7 @@ async function startServer() {
     localWsClients.add(ws);
     console.log(`[Client WebSocket] Connected from ${req.socket.remoteAddress}. Active clients: ${localWsClients.size}`);
 
-    // Immediately send handshake with current live market snapshot
+    // Immediately send handshake with current live market snapshot & trigger authoritative resync
     ws.send(
       JSON.stringify({
         type: 'handshake',
@@ -12594,8 +12950,27 @@ async function startServer() {
         serverTime: Date.now(),
         upstreamUrl,
         upstreamConnected,
-        channels: ['v2/ticker', 'l2_orderbook', 'candlestick_5m'],
+        upstreamAuthenticated,
+        channels: [
+          'v2/ticker',
+          'candlestick_1m',
+          'candlestick_5m',
+          'candlestick_15m',
+          'positions',
+          'orders',
+          'user_trades',
+          'margins',
+        ],
         markets: Object.values(markets),
+      })
+    );
+
+    ws.send(
+      JSON.stringify({
+        type: 'ws_reconnected_resync',
+        authenticated: upstreamAuthenticated,
+        upstreamUrl,
+        timestamp: Date.now(),
       })
     );
 
@@ -12605,10 +12980,34 @@ async function startServer() {
         if (parsed.type === 'ping') {
           ws.send(JSON.stringify({ type: 'pong', timestamp: Date.now() }));
         } else if (parsed.type === 'subscribe') {
+          const requestedChannels = Array.isArray(parsed.payload?.channels) ? parsed.payload.channels : [];
+          // Forward any dynamic option / candlestick subscriptions to wss://socket.india.delta.exchange
+          const forwardChannels: any[] = [];
+          for (const ch of requestedChannels) {
+            if (!ch || typeof ch.name !== 'string') continue;
+            if (ch.name === 'v2/ticker' && Array.isArray(ch.symbols)) {
+              const newOptSyms: string[] = [];
+              for (const rawSym of ch.symbols) {
+                const s = String(rawSym || '').toUpperCase();
+                if ((s.startsWith('C-') || s.startsWith('P-')) && !dynamicSubscribedOptionSymbols.has(s)) {
+                  dynamicSubscribedOptionSymbols.add(s);
+                  newOptSyms.push(s);
+                }
+              }
+              if (newOptSyms.length > 0) {
+                forwardChannels.push({ name: 'v2/ticker', symbols: newOptSyms });
+              }
+            } else if (ch.name.startsWith('candlestick_') && Array.isArray(ch.symbols)) {
+              forwardChannels.push(ch);
+            }
+          }
+          if (forwardChannels.length > 0 && upstreamWs && upstreamWs.readyState === WsClient.OPEN) {
+            upstreamWs.send(JSON.stringify({ type: 'subscribe', payload: { channels: forwardChannels } }));
+          }
           ws.send(
             JSON.stringify({
               type: 'subscribed',
-              channels: parsed.payload?.channels || ['v2/ticker'],
+              channels: requestedChannels.length > 0 ? requestedChannels : ['v2/ticker'],
               status: 'active',
             })
           );

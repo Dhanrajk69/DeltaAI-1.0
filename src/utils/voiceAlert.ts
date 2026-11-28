@@ -61,21 +61,22 @@ function isAnyEnglish(lang?: string): boolean {
   return normalizeLang(lang).startsWith('en');
 }
 
+let voiceAlertsEnabledMemory = true;
+let selectedVoiceUriMemory: string | null = null;
+
+export function setVoiceAlertsEnabledMemory(enabled: boolean): void {
+  voiceAlertsEnabledMemory = Boolean(enabled);
+}
+
 export function isVoiceAlertsEnabled(): boolean {
   if (typeof window === 'undefined') return false;
   if (isGlobalAudioMuted()) return false;
-  try {
-    return localStorage.getItem(VOICE_ENABLED_STORAGE_KEY) !== 'false';
-  } catch {
-    return true;
-  }
+  return voiceAlertsEnabledMemory;
 }
 
 export function persistSelectedVoiceUri(voice: SpeechSynthesisVoice | null): void {
-  if (!voice?.voiceURI || typeof window === 'undefined') return;
-  try {
-    localStorage.setItem(AI_VOICE_URI_STORAGE_KEY, voice.voiceURI);
-  } catch {}
+  if (!voice?.voiceURI) return;
+  selectedVoiceUriMemory = voice.voiceURI;
 }
 
 /**
@@ -109,14 +110,11 @@ export function resolvePreferredEnglishVoice(voices: SpeechSynthesisVoice[]): Sp
     voices.find((v) => isAnyEnglish(v.lang) && NATURAL_ENGLISH_TOKENS.some((t) => byName(v).includes(t)));
   if (tier3) return tier3;
 
-  // Tier 4: Previously persisted voice URI if valid English
-  try {
-    const savedUri = localStorage.getItem(AI_VOICE_URI_STORAGE_KEY);
-    if (savedUri) {
-      const savedMatch = voices.find((v) => v.voiceURI === savedUri && isAnyEnglish(v.lang));
-      if (savedMatch) return savedMatch;
-    }
-  } catch {}
+  // Tier 4: Previously selected voice URI in memory if valid English
+  if (selectedVoiceUriMemory) {
+    const savedMatch = voices.find((v) => v.voiceURI === selectedVoiceUriMemory && isAnyEnglish(v.lang));
+    if (savedMatch) return savedMatch;
+  }
 
   return (
     voices.find((v) => isPreferredEnglishLocale(v.lang)) ||

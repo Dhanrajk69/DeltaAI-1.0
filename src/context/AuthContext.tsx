@@ -127,53 +127,14 @@ const DEFAULT_LOCAL_TOKEN = 'admin-local-session-dhanrajk69-token';
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
 
 export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) => {
-  const [user, setUser] = useState<GoogleUser | null>(() => {
-    try {
-      if (typeof window !== 'undefined') {
-        const cached = localStorage.getItem(STORAGE_KEY_USER);
-        if (cached === '__LOGGED_OUT__') return null;
-        if (cached) return JSON.parse(cached);
-      }
-    } catch {}
-    return DEFAULT_LOCAL_USER;
-  });
-
-  const [token, setToken] = useState<string | null>(() => {
-    try {
-      if (typeof window !== 'undefined') {
-        const cached = localStorage.getItem(STORAGE_KEY_TOKEN);
-        if (cached === '__LOGGED_OUT__') return null;
-        if (cached) return cached;
-      }
-    } catch {}
-    return DEFAULT_LOCAL_TOKEN;
-  });
-
-  const [customClientId, setCustomClientIdState] = useState<string>(() => {
-    try {
-      if (typeof window !== 'undefined') {
-        return localStorage.getItem(STORAGE_KEY_CUSTOM_CLIENT_ID)?.trim() || '';
-      }
-    } catch {}
-    return '';
-  });
-
+  const [user, setUser] = useState<GoogleUser | null>(DEFAULT_LOCAL_USER);
+  const [token, setToken] = useState<string | null>(DEFAULT_LOCAL_TOKEN);
+  const [customClientId, setCustomClientIdState] = useState<string>('');
   const [isGsiLoaded, setIsGsiLoaded] = useState<boolean>(false);
 
   const setCustomClientId = useCallback((nextId: string) => {
     const trimmed = (nextId || '').trim();
     setCustomClientIdState(trimmed);
-    try {
-      if (typeof window !== 'undefined') {
-        if (trimmed) {
-          localStorage.setItem(STORAGE_KEY_CUSTOM_CLIENT_ID, trimmed);
-        } else {
-          localStorage.removeItem(STORAGE_KEY_CUSTOM_CLIENT_ID);
-        }
-      }
-    } catch (err) {
-      console.warn('[AuthContext] Custom Client ID storage sync error:', err);
-    }
   }, []);
 
   const activeClientId = isValidGoogleClientId(customClientId)
@@ -181,23 +142,10 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
     : GOOGLE_CLIENT_ID;
   const hasValidClientId = Boolean(activeClientId && isValidGoogleClientId(activeClientId));
 
-  // Synchronize state changes to localStorage
+  // Keep session state strictly in React memory (never persisted to localStorage)
   const saveSession = useCallback((newUser: GoogleUser | null, newToken: string | null) => {
     setUser(newUser);
     setToken(newToken);
-    try {
-      if (typeof window !== 'undefined') {
-        if (newUser && newToken) {
-          localStorage.setItem(STORAGE_KEY_USER, JSON.stringify(newUser));
-          localStorage.setItem(STORAGE_KEY_TOKEN, newToken);
-        } else {
-          localStorage.removeItem(STORAGE_KEY_USER);
-          localStorage.removeItem(STORAGE_KEY_TOKEN);
-        }
-      }
-    } catch (err) {
-      console.warn('[AuthContext] Storage sync error:', err);
-    }
   }, []);
 
   // Handle Google Credential Response (JWT token from Google Identity Services)
@@ -243,10 +191,6 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
     try {
       if (hasValidClientId && typeof window !== 'undefined' && window.google?.accounts?.id?.disableAutoSelect) {
         window.google.accounts.id.disableAutoSelect();
-      }
-      if (typeof window !== 'undefined') {
-        localStorage.setItem(STORAGE_KEY_USER, '__LOGGED_OUT__');
-        localStorage.setItem(STORAGE_KEY_TOKEN, '__LOGGED_OUT__');
       }
     } catch {}
     setUser(null);

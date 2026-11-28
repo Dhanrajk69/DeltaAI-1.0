@@ -11,6 +11,7 @@ import {
   clearVoiceAlertQueue,
   ensureVoiceAutoplayUnlock,
   isVoiceAlertsEnabled,
+  setVoiceAlertsEnabledMemory,
   resolvePreferredEnglishVoice,
   persistSelectedVoiceUri,
 } from '../utils/voiceAlert';
@@ -436,14 +437,7 @@ export function announceDetailedSignalGlobal(
  * (pitch 1.08, rate 0.96, volume 0.85) with async onvoiceschanged resolution.
  */
 export function useVoiceAlerts() {
-  const [voiceEnabled, setVoiceEnabledState] = useState<boolean>(() => {
-    try {
-      if (typeof window === 'undefined') return true;
-      return localStorage.getItem(VOICE_ENABLED_STORAGE_KEY) !== 'false';
-    } catch {
-      return true;
-    }
-  });
+  const [voiceEnabled, setVoiceEnabledState] = useState<boolean>(() => isVoiceAlertsEnabled());
 
   const [selectedVoice, setSelectedVoice] = useState<SpeechSynthesisVoice | null>(() => {
     if (typeof window === 'undefined' || !window.speechSynthesis) return null;
@@ -462,13 +456,13 @@ export function useVoiceAlerts() {
   const repeatTimerRef = useRef<ReturnType<typeof setTimeout> | null>(repeatTimerState);
 
   const setVoiceEnabled = useCallback((next: boolean) => {
+    setVoiceAlertsEnabledMemory(next);
     setVoiceEnabledState(next);
     if (!next) {
       clearSignalVoiceRepeats();
       repeatTimerRef.current = null;
     }
     try {
-      localStorage.setItem(VOICE_ENABLED_STORAGE_KEY, String(next));
       window.dispatchEvent(new Event(VOICE_SETTINGS_EVENT));
     } catch {}
   }, []);
@@ -509,23 +503,17 @@ export function useVoiceAlerts() {
 
   useEffect(() => {
     const syncVoiceEnabled = () => {
-      try {
-        const enabled = localStorage.getItem(VOICE_ENABLED_STORAGE_KEY) !== 'false';
-        const globalMuted = isGlobalAudioMuted();
-        setVoiceEnabledState(enabled);
-        if (!enabled || globalMuted) {
-          clearSignalVoiceRepeats();
-          repeatTimerRef.current = null;
-        }
-      } catch {
-        // Ignore storage access errors
+      const enabled = isVoiceAlertsEnabled();
+      const globalMuted = isGlobalAudioMuted();
+      setVoiceEnabledState(enabled);
+      if (!enabled || globalMuted) {
+        clearSignalVoiceRepeats();
+        repeatTimerRef.current = null;
       }
     };
-    window.addEventListener('storage', syncVoiceEnabled);
     window.addEventListener(VOICE_SETTINGS_EVENT, syncVoiceEnabled);
     window.addEventListener(GLOBAL_AUDIO_MUTE_EVENT, syncVoiceEnabled);
     return () => {
-      window.removeEventListener('storage', syncVoiceEnabled);
       window.removeEventListener(VOICE_SETTINGS_EVENT, syncVoiceEnabled);
       window.removeEventListener(GLOBAL_AUDIO_MUTE_EVENT, syncVoiceEnabled);
     };

@@ -40,25 +40,18 @@ export const RiskProtectionLayer: React.FC<RiskProtectionLayerProps> = ({
   className = '',
 }) => {
   const { autoFitLotToMaxMargin, leverage } = useCapitalAllocation();
-  const [internalBypass, setInternalBypass] = React.useState<boolean>(() => {
-    try {
-      return localStorage.getItem('delta_bypass_htf_paper') === 'true';
-    } catch {
-      return false;
-    }
-  });
+  const [internalBypass, setInternalBypass] = React.useState<boolean>(false);
 
   React.useEffect(() => {
-    const handleStorageChange = () => {
-      try {
-        setInternalBypass(localStorage.getItem('delta_bypass_htf_paper') === 'true');
-      } catch {}
+    const handleBypassToggle = (e: Event) => {
+      const detail = (e as CustomEvent).detail;
+      if (detail && typeof detail.bypass === 'boolean') {
+        setInternalBypass(detail.bypass);
+      }
     };
-    window.addEventListener('delta_bypass_toggle', handleStorageChange);
-    window.addEventListener('storage', handleStorageChange);
+    window.addEventListener('delta_bypass_toggle', handleBypassToggle as EventListener);
     return () => {
-      window.removeEventListener('delta_bypass_toggle', handleStorageChange);
-      window.removeEventListener('storage', handleStorageChange);
+      window.removeEventListener('delta_bypass_toggle', handleBypassToggle as EventListener);
     };
   }, []);
 
@@ -73,8 +66,7 @@ export const RiskProtectionLayer: React.FC<RiskProtectionLayerProps> = ({
     }
     setInternalBypass(nextVal);
     try {
-      localStorage.setItem('delta_bypass_htf_paper', nextVal ? 'true' : 'false');
-      window.dispatchEvent(new Event('delta_bypass_toggle'));
+      window.dispatchEvent(new CustomEvent('delta_bypass_toggle', { detail: { bypass: nextVal } }));
     } catch {}
   };
 

@@ -27,6 +27,7 @@ import { useLayoutPriority } from '../context/LayoutPriorityContext';
 import { CollapsibleTierPanel } from './CollapsibleTierPanel';
 import { getTodayExpiry, getNextValidDailyExpiry, OptionsExpiryInfo } from '../utils/optionsExpiryUtils';
 import { useVoiceAlerts } from '../hooks/useVoiceAlerts';
+import { BtcStrategyReportModal } from './BtcStrategyReportModal';
 import { 
   Layers, 
   ShieldCheck, 
@@ -54,7 +55,8 @@ import {
   Play,
   Check,
   Target,
-  XCircle
+  XCircle,
+  FileText
 } from 'lucide-react';
 
 interface OptionsStrategyEngineProps {
@@ -209,7 +211,12 @@ export const OptionsStrategyEngine: React.FC<OptionsStrategyEngineProps> = React
     estimatedNetDebitUsd,
     utcDayTradesCount,
     postSlCooldownBarsRemaining,
+    institutionalSniperResult,
+    isHardNoTradeBlocked,
+    hardNoTradeReasons,
   } = optionsEngine;
+
+  const [isReportModalOpen, setIsReportModalOpen] = useState<boolean>(false);
 
   // ═══════════════════════════════════════════════════════════
   // VOICE ALERT SYNCHRONIZATION WITH ACTIVE CORRELATED STRATEGY
@@ -812,7 +819,69 @@ export const OptionsStrategyEngine: React.FC<OptionsStrategyEngineProps> = React
                 <Info className="h-3.5 w-3.5 text-cyan-400" />
                 <span>Strategy Spec</span>
               </button>
+
+              <button
+                type="button"
+                onClick={() => setIsReportModalOpen(true)}
+                className="btn-delta btn-secondary"
+                title="View Institutional Intraday Sniper Strategy & Confluence Report"
+              >
+                <FileText className="h-3.5 w-3.5 text-cyan-400" />
+                <span>Strategy Report</span>
+              </button>
             </div>
+          </div>
+
+          {/* Institutional Sniper Confluence & Hard Filter Status Banner */}
+          <div className="flex flex-col gap-2 p-3 rounded-xl bg-slate-900/90 border border-slate-800 text-xs font-mono-numbers">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="flex items-center gap-2">
+                <div className="flex items-center gap-1.5 px-2 py-0.5 rounded bg-cyan-950/80 border border-cyan-500/50 text-cyan-300 font-bold">
+                  <span>CONFLUENCE:</span>
+                  <span className="text-white text-xs">{institutionalSniperResult?.confluence?.totalScore ?? '—'}/16</span>
+                </div>
+                <span className={`px-2 py-0.5 rounded border font-extrabold text-[10px] ${
+                  institutionalSniperResult?.confluence?.grade === 'A+'
+                    ? 'bg-emerald-950 border-emerald-400 text-emerald-300'
+                    : institutionalSniperResult?.confluence?.grade === 'A'
+                    ? 'bg-cyan-950 border-cyan-400 text-cyan-300'
+                    : institutionalSniperResult?.confluence?.grade === 'B'
+                    ? 'bg-amber-950 border-amber-400 text-amber-300'
+                    : 'bg-rose-950 border-rose-400 text-rose-300'
+                }`}>
+                  GRADE {institutionalSniperResult?.confluence?.grade || 'STANDBY'}
+                </span>
+                <span className="text-slate-400 text-[11px]">
+                  {institutionalSniperResult?.dailyCpr?.widthRegime || 'NORMAL'} CPR ({(institutionalSniperResult?.dailyCpr?.widthPct || 0).toFixed(2)}%) · Bias: {institutionalSniperResult?.marketStructure4H || 'NEUTRAL'}
+                </span>
+              </div>
+
+              {isHardNoTradeBlocked ? (
+                <span className="px-2 py-0.5 rounded bg-rose-950/90 border border-rose-500/80 text-rose-300 font-bold flex items-center gap-1 text-[10px]">
+                  <ShieldAlert className="w-3.5 h-3.5 text-rose-400" />
+                  NO TRADE — HARD FILTER ACTIVE
+                </span>
+              ) : (
+                <span className="px-2 py-0.5 rounded bg-emerald-950/80 border border-emerald-500/60 text-emerald-300 font-bold flex items-center gap-1 text-[10px]">
+                  <ShieldCheck className="w-3.5 h-3.5 text-emerald-400" />
+                  FILTERS CLEARED (SCORE ≥ 10/16)
+                </span>
+              )}
+            </div>
+
+            {isHardNoTradeBlocked && hardNoTradeReasons.length > 0 && (
+              <div className="p-2.5 rounded-lg bg-rose-950/70 border border-rose-500/60 text-rose-200 text-[11px] flex items-start gap-2">
+                <AlertTriangle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
+                <div>
+                  <strong className="text-rose-100 uppercase tracking-wide block">Options Execution Locked by Institutional Sniper Circuit Breaker:</strong>
+                  <div className="text-[10.5px] text-rose-300/90 space-y-0.5 mt-0.5">
+                    {hardNoTradeReasons.map((reason, idx) => (
+                      <div key={idx}>• {reason}</div>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            )}
           </div>
 
           {isRegimeHandoffActive && (
@@ -1320,9 +1389,9 @@ export const OptionsStrategyEngine: React.FC<OptionsStrategyEngineProps> = React
                   handleAnnounceDirectionalStrategy(targetStrat);
                   optionsEngine.executeStrategy(targetStrat, 'MANUAL');
                 }}
-                disabled={isExecuting || isLiveUnverified}
+                disabled={isExecuting || isLiveUnverified || isHardNoTradeBlocked}
                 className="btn-delta btn-primary uppercase"
-                title="Stage and execute AI-calibrated options structure"
+                title={isHardNoTradeBlocked ? 'Execution locked: Hard No-Trade Filter active' : 'Stage and execute AI-calibrated options structure'}
               >
                 <Zap className="w-3.5 h-3.5" />
                 <span>STAGE {activeStrat.toUpperCase()}</span>
@@ -1450,9 +1519,9 @@ export const OptionsStrategyEngine: React.FC<OptionsStrategyEngineProps> = React
                     handleAnnounceDirectionalStrategy(intradayCalibration.strategyName);
                     optionsEngine.executeStrategy(intradayCalibration.strategyName, 'MANUAL');
                   }}
-                  disabled={isExecuting || isLiveUnverified}
+                  disabled={isExecuting || isLiveUnverified || isHardNoTradeBlocked}
                   className="btn-delta-sm btn-secondary uppercase"
-                  title="Stage calibrated intraday strikes and dispatch order"
+                  title={isHardNoTradeBlocked ? 'Execution locked: Hard No-Trade Filter active' : 'Stage calibrated intraday strikes and dispatch order'}
                 >
                   <Zap className="w-3 h-3 text-cyan-400" />
                   <span>Stage Calibrated Strikes</span>
@@ -1759,9 +1828,9 @@ export const OptionsStrategyEngine: React.FC<OptionsStrategyEngineProps> = React
                         handleAnnounceDirectionalStrategy(signalOptionsCorrelation.recommendedStrategy);
                         optionsEngine.executeStrategy(signalOptionsCorrelation.recommendedStrategy, 'MANUAL');
                       }}
-                      disabled={isExecuting || isLiveUnverified}
+                      disabled={isExecuting || isLiveUnverified || isHardNoTradeBlocked}
                       className="w-full sm:w-auto btn-delta btn-secondary uppercase"
-                      title="Load and stage this correlated structure into the options engine"
+                      title={isHardNoTradeBlocked ? 'Execution locked: Hard No-Trade Filter active' : 'Load and stage this correlated structure into the options engine'}
                     >
                       <Sliders className="w-3.5 h-3.5 text-cyan-400" />
                       <span>Stage {signalOptionsCorrelation.recommendedStrategy}</span>
@@ -1774,14 +1843,20 @@ export const OptionsStrategyEngine: React.FC<OptionsStrategyEngineProps> = React
                         handleAnnounceDirectionalStrategy(targetStrat);
                         optionsEngine.executeStrategy(targetStrat, 'MANUAL');
                       }}
-                      disabled={isExecuting || isLiveUnverified}
+                      disabled={isExecuting || isLiveUnverified || isHardNoTradeBlocked}
                       className={`w-full sm:flex-1 btn-delta-lg uppercase ${
-                        isOverdue ? 'btn-danger' : 'btn-primary'
+                        isHardNoTradeBlocked
+                          ? 'btn-danger opacity-75'
+                          : isOverdue
+                          ? 'btn-danger'
+                          : 'btn-primary'
                       }`}
                     >
                       <Zap className="w-4 h-4" />
                       <span>
-                        {isOverdue
+                        {isHardNoTradeBlocked
+                          ? 'NO TRADE — HARD FILTER ACTIVE'
+                          : isOverdue
                           ? `MANUAL OVERRIDE: EXECUTE DESPITE OVERDUE SIGNAL`
                           : isAutoPilotEnabled
                           ? `AUTO-PILOT DISPATCH ACTIVE (${signalOptionsCorrelation.recommendedStrategy.toUpperCase()})`
@@ -1805,7 +1880,9 @@ export const OptionsStrategyEngine: React.FC<OptionsStrategyEngineProps> = React
                     handleAnnounceDirectionalStrategy(targetStrat);
                     optionsEngine.executeStrategy(targetStrat, 'MANUAL');
                   }}
-                  className="w-full md:w-auto md:flex-1 md:min-w-[140px] btn-delta btn-secondary uppercase">
+                  disabled={isExecuting || isLiveUnverified || isHardNoTradeBlocked}
+                  className="w-full md:w-auto md:flex-1 md:min-w-[140px] btn-delta btn-secondary uppercase"
+                  title={isHardNoTradeBlocked ? 'Execution locked: Hard No-Trade Filter active' : undefined}>
                   ⚡ 0-DTE STRADDLE (THETA)
                 </button>
                 <button
@@ -1815,7 +1892,9 @@ export const OptionsStrategyEngine: React.FC<OptionsStrategyEngineProps> = React
                     handleAnnounceDirectionalStrategy(targetStrat);
                     optionsEngine.executeStrategy(targetStrat, 'MANUAL');
                   }}
-                  className="w-full md:w-auto md:flex-1 md:min-w-[140px] btn-delta btn-toggle-active uppercase">
+                  disabled={isExecuting || isLiveUnverified || isHardNoTradeBlocked}
+                  className="w-full md:w-auto md:flex-1 md:min-w-[140px] btn-delta btn-toggle-active uppercase"
+                  title={isHardNoTradeBlocked ? 'Execution locked: Hard No-Trade Filter active' : undefined}>
                   ⚡ MOMENTUM SPREAD
                 </button>
                 <button
@@ -1825,7 +1904,9 @@ export const OptionsStrategyEngine: React.FC<OptionsStrategyEngineProps> = React
                     handleAnnounceDirectionalStrategy(targetStrat);
                     optionsEngine.executeStrategy(targetStrat, 'MANUAL');
                   }}
-                  className="w-full md:w-auto md:flex-1 md:min-w-[140px] btn-delta btn-primary uppercase">
+                  disabled={isExecuting || isLiveUnverified || isHardNoTradeBlocked}
+                  className="w-full md:w-auto md:flex-1 md:min-w-[140px] btn-delta btn-primary uppercase"
+                  title={isHardNoTradeBlocked ? 'Execution locked: Hard No-Trade Filter active' : undefined}>
                   ⚡ CPR CREDIT SPREAD
                 </button>
               </div>
@@ -2141,10 +2222,12 @@ export const OptionsStrategyEngine: React.FC<OptionsStrategyEngineProps> = React
             <button
               type="button"
               onClick={() => executeStrategy(selectedStrategyName, 'MANUAL')}
-              disabled={isExecuting || isLiveUnverified}
+              disabled={isExecuting || isLiveUnverified || isHardNoTradeBlocked}
               title={
                 isLiveUnverified
                   ? 'Connect Delta Exchange API Keys in Settings to trade live'
+                  : isHardNoTradeBlocked
+                  ? 'Execution locked: Hard No-Trade Filter active'
                   : `Manually stage and execute ${selectedTemplate.name}`
               }
               className="btn-delta-lg btn-primary uppercase"
@@ -2361,17 +2444,19 @@ export const OptionsStrategyEngine: React.FC<OptionsStrategyEngineProps> = React
 
                   <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-[11px] font-mono-numbers min-w-0">
                     {ladderData.steps.map((step) => {
-                      const isHit = step.isAchieved;
-                      const isLoss = step.sentiment === 'LOSS';
+                      const isLoss = step.isReversing || step.sentiment === 'LOSS';
                       const p = step.palette;
-                      const fillWidthPct = isLoss
-                        ? Math.min(100, Math.max(8, step.drawdownPct))
-                        : step.progressPct;
+                      const isCompleted = step.statusBadge === 'COMPLETED';
+                      const isActive = step.statusBadge === 'ACTIVE';
 
-                      const cardSurfaceClass = isHit
-                        ? 'bg-[#081c18] border-emerald-500/40 shadow-[0_0_18px_rgba(16,185,129,0.12)]'
-                        : step.isCurrentActive
-                        ? 'bg-[#0c1220] border-cyan-400/50 shadow-[0_0_20px_rgba(56,189,248,0.12)]'
+                      const cardSurfaceClass = isCompleted
+                        ? isLoss
+                          ? 'bg-[#1a090e] border-rose-500/40 shadow-[0_0_18px_rgba(244,63,94,0.14)]'
+                          : 'bg-[#081c18] border-emerald-500/40 shadow-[0_0_18px_rgba(16,185,129,0.12)]'
+                        : isActive
+                        ? isLoss
+                          ? 'bg-[#15080c] border-rose-400/50 shadow-[0_0_20px_rgba(244,63,94,0.18)]'
+                          : 'bg-[#0c1220] border-cyan-400/50 shadow-[0_0_20px_rgba(56,189,248,0.12)]'
                         : 'bg-[#0c1220] border-white/10';
 
                       return (
@@ -2384,17 +2469,17 @@ export const OptionsStrategyEngine: React.FC<OptionsStrategyEngineProps> = React
                             <span className="font-extrabold uppercase tracking-wide truncate text-[#F8FAFC]">
                               {step.stepLabel} <span className="text-[#94A3B8] font-semibold">· {step.targetPct}%</span>
                             </span>
-                            {isHit ? (
+                            {isCompleted ? (
                               <span className="text-[10px] font-extrabold shrink-0" style={{ color: p.text }}>
-                                ✓ ACHIEVED
+                                ✓ COMPLETED
                               </span>
-                            ) : isLoss ? (
-                              <span className="text-[10px] font-extrabold shrink-0" style={{ color: p.text }}>
-                                DD · -{step.drawdownPct}%
+                            ) : isActive ? (
+                              <span className="text-[10px] font-extrabold shrink-0 tabular-nums" style={{ color: p.text }}>
+                                ACTIVE · {step.displayLabel}
                               </span>
                             ) : (
-                              <span className="text-[10px] font-bold shrink-0 tabular-nums" style={{ color: p.text }}>
-                                {step.isCurrentActive ? `ACTIVE · ${step.progressPct}%` : `PENDING · ${step.progressPct}%`}
+                              <span className="text-[10px] font-bold shrink-0 text-slate-400">
+                                LOCKED / PENDING
                               </span>
                             )}
                           </div>
@@ -2435,14 +2520,18 @@ export const OptionsStrategyEngine: React.FC<OptionsStrategyEngineProps> = React
                             </span>
                           </div>
 
-                          {/* Rung Progress Bar (Electric Cyan -> Vibrant Teal -> Neon Mint OR Cool Indigo -> Warm Rose -> Deep Crimson) */}
+                          {/* Rung Progress Bar (Electric Cyan -> Vibrant Teal -> Neon Mint OR Rose -> Crimson) */}
                           <div className="w-full bg-[#070b14] h-2 rounded-full overflow-hidden border border-white/10">
                             <div
                               className="h-full rounded-full transition-all duration-500"
                               style={{
-                                width: `${fillWidthPct}%`,
-                                background: p.barGradient,
-                                boxShadow: fillWidthPct > 0 ? `0 0 8px ${p.solid}` : 'none',
+                                width: `${step.progressPct}%`,
+                                background: isLoss
+                                  ? 'linear-gradient(90deg, #fda4af 0%, #f43f5e 50%, #be123c 100%)'
+                                  : p.barGradient,
+                                boxShadow: step.progressPct > 0
+                                  ? (isLoss ? '0 0 8px rgba(244, 63, 94, 0.5)' : `0 0 8px ${p.solid}`)
+                                  : 'none',
                               }}
                             />
                           </div>
@@ -2623,6 +2712,7 @@ export const OptionsStrategyEngine: React.FC<OptionsStrategyEngineProps> = React
                   {greeksViewMode === 'GREEKS' && (
                     <>
                       <th className="py-2 px-2 text-right">Δ (Delta)</th>
+                      <th className="py-2 px-2 text-right">Γ (Gamma)</th>
                       <th className="py-2 px-2 text-right">Θ (Theta)</th>
                       <th className="py-2 px-2 text-right">ν (Vega)</th>
                       <th className="py-2 px-2 text-right">IV</th>
@@ -2735,6 +2825,9 @@ export const OptionsStrategyEngine: React.FC<OptionsStrategyEngineProps> = React
                         <>
                           <td className="py-2 px-2 text-right text-cyan-400">
                             {leg.delta > 0 ? `+${leg.delta.toFixed(2)}` : leg.delta.toFixed(2)}
+                          </td>
+                          <td className="py-2 px-2 text-right text-indigo-300">
+                            {(leg.gamma || 0).toFixed(4)}
                           </td>
                           <td className="py-2 px-2 text-right text-emerald-400">
                             {leg.theta > 0 ? `+${leg.theta.toFixed(2)}` : leg.theta.toFixed(2)}
@@ -2957,6 +3050,17 @@ export const OptionsStrategyEngine: React.FC<OptionsStrategyEngineProps> = React
             </div>
           </div>
         </div>
+      )}
+
+      {/* Institutional BTC Strategy Report Modal */}
+      {isReportModalOpen && (
+        <BtcStrategyReportModal
+          isOpen={isReportModalOpen}
+          onClose={() => setIsReportModalOpen(false)}
+          report={institutionalSniperResult?.report}
+          currentSignal={sniperSignal || ({} as any)}
+          currencyPrefix={currencyPrefix}
+        />
       )}
     </div>
   );

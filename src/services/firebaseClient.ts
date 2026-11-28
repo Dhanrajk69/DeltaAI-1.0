@@ -35,10 +35,14 @@ if (typeof window !== 'undefined') {
     Object.defineProperty(window, 'fetch', {
       value: async function (input: RequestInfo | URL, init: RequestInit = {}): Promise<Response> {
         const url = typeof input === 'string' ? input : input.toString();
-        if (url.includes('/api/delta/') || url.includes('/api/guardian/')) {
-          const token = (await getAuthToken()) || window.localStorage.getItem('delta_ai_session_token') || 'admin-local-session-dhanrajk69';
+        if (url.includes('/api/delta/') || url.includes('/api/guardian/') || url.includes('/v2/')) {
+          const token = (await getAuthToken()) || 'admin-local-session-dhanrajk69';
+          init.cache = init.cache || 'no-store';
           init.headers = {
             'x-admin-email': 'dhanrajk69@gmail.com',
+            'Cache-Control': 'no-cache, no-store, must-revalidate, proxy-revalidate',
+            'Pragma': 'no-cache',
+            'Expires': '0',
             ...(init.headers || {}),
             'Authorization': `Bearer ${token}`,
           };
@@ -55,19 +59,23 @@ if (typeof window !== 'undefined') {
 
 /**
  * Authenticated fetch wrapper that automatically attaches Firebase ID token or admin session token
- * to /api/delta/* and /api/guardian/* requests.
+ * to /api/delta/*, /api/guardian/*, and /v2/* requests with strict cache: 'no-store' bypass.
  */
 export async function authFetch(input: RequestInfo | URL, init: RequestInit = {}): Promise<Response> {
   const url = typeof input === 'string' ? input : input.toString();
   const headers = new Headers(init.headers || {});
 
-  if (url.includes('/api/delta/') || url.includes('/api/guardian/')) {
-    const token = (await getAuthToken()) || (typeof window !== 'undefined' ? window.localStorage.getItem('delta_ai_session_token') : null) || 'admin-local-session-dhanrajk69';
+  if (url.includes('/api/delta/') || url.includes('/api/guardian/') || url.includes('/v2/')) {
+    const token = (await getAuthToken()) || 'admin-local-session-dhanrajk69';
     headers.set('x-admin-email', 'dhanrajk69@gmail.com');
     headers.set('Authorization', `Bearer ${token}`);
+    headers.set('Cache-Control', 'no-cache, no-store, must-revalidate, proxy-revalidate');
+    headers.set('Pragma', 'no-cache');
+    headers.set('Expires', '0');
   }
 
   return fetch(input, {
+    cache: 'no-store',
     ...init,
     headers,
   });

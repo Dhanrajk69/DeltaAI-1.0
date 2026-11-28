@@ -3,20 +3,17 @@ import { useState, useCallback, useEffect } from 'react';
 export const GLOBAL_AUDIO_MUTE_STORAGE_KEY = 'delta_global_audio_muted';
 export const GLOBAL_AUDIO_MUTE_EVENT = 'delta-global-audio-mute-changed';
 
+let globalAudioMutedState = false;
+
 export function isGlobalAudioMuted(): boolean {
-  if (typeof window === 'undefined') return false;
-  try {
-    return localStorage.getItem(GLOBAL_AUDIO_MUTE_STORAGE_KEY) === 'true';
-  } catch {
-    return false;
-  }
+  return globalAudioMutedState;
 }
 
 export function setGlobalAudioMuted(isMuted: boolean): void {
+  globalAudioMutedState = Boolean(isMuted);
   if (typeof window === 'undefined') return;
   try {
-    localStorage.setItem(GLOBAL_AUDIO_MUTE_STORAGE_KEY, String(isMuted));
-    window.dispatchEvent(new CustomEvent(GLOBAL_AUDIO_MUTE_EVENT, { detail: { muted: isMuted } }));
+    window.dispatchEvent(new CustomEvent(GLOBAL_AUDIO_MUTE_EVENT, { detail: { muted: globalAudioMutedState } }));
   } catch {}
 }
 
@@ -27,10 +24,8 @@ export function useSoundEffects(externalMuted = false) {
   useEffect(() => {
     const syncMute = () => setGlobalMutedState(isGlobalAudioMuted());
     window.addEventListener(GLOBAL_AUDIO_MUTE_EVENT, syncMute);
-    window.addEventListener('storage', syncMute);
     return () => {
       window.removeEventListener(GLOBAL_AUDIO_MUTE_EVENT, syncMute);
-      window.removeEventListener('storage', syncMute);
     };
   }, []);
 

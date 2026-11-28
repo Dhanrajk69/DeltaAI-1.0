@@ -6,10 +6,12 @@ import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react'
 import { MarketTicker, TradingMode, SniperSignal, SniperActiveTrade, SniperLogEntry, SniperExposureMode, SniperScalpTier, AiAnalysisResult, SniperExecutionTriggerMode, SniperStrategyMode } from '../types';
 import { CamarillaPriceGauge } from './CamarillaPriceGauge';
 import { ProfitLadderDashdark } from './ProfitLadderDashdark';
+import { usePortfolio } from '../context/PortfolioContext';
 import { useAiMatrixCorrelation, evaluateLockedSignalValidity } from '../context/AiMatrixCorrelationContext';
 import { useCapitalAllocation } from '../context/CapitalAllocationContext';
 import { useLayoutPriority } from '../context/LayoutPriorityContext';
 import { CollapsibleTierPanel } from './CollapsibleTierPanel';
+import { BtcStrategyReportModal } from './BtcStrategyReportModal';
 import { 
   Crosshair, 
   Zap, 
@@ -39,6 +41,7 @@ import {
   AlertTriangle,
   ShieldAlert,
   Terminal,
+  FileText,
 } from 'lucide-react';
 
 function normalizePerpSymbol(sym?: string): string {
@@ -85,6 +88,11 @@ interface IntradaySniperEngineProps {
   onRefreshSignal?: () => void;
   pairCooldowns?: Record<string, number>;
   consecutiveStopsCount?: number;
+  circuitBreakerTripped?: boolean;
+  circuitBreakerReason?: string | null;
+  dailyLossPercent?: number;
+  postSlCooldownUntilMs?: number;
+  onResetCircuitBreaker?: () => void;
   simulate5mCandleClose?: (symbol: string, forcedClose?: number) => void;
   clearPairCooldown?: (symbol: string) => void;
   bypassHtfFilter?: boolean;
@@ -208,7 +216,7 @@ export const IntradaySniperEngine: React.FC<IntradaySniperEngineProps> = React.m
   setSelectedSymbol,
   tradingMode,
   currentSignal,
-  activeTrade,
+  activeTrade: propActiveTrade,
   isAutoSniperEnabled,
   setIsAutoSniperEnabled,
   isExecuting,
@@ -237,6 +245,11 @@ export const IntradaySniperEngine: React.FC<IntradaySniperEngineProps> = React.m
   onRefreshSignal,
   pairCooldowns = {},
   consecutiveStopsCount = 0,
+  circuitBreakerTripped = false,
+  circuitBreakerReason = null,
+  dailyLossPercent = 0,
+  postSlCooldownUntilMs = 0,
+  onResetCircuitBreaker,
   simulate5mCandleClose,
   clearPairCooldown,
   bypassHtfFilter = false,
@@ -273,6 +286,7 @@ export const IntradaySniperEngine: React.FC<IntradaySniperEngineProps> = React.m
     setLotSizingMode,
     getContractsCount,
   } = useCapitalAllocation();
+  const { positions, positionMismatchWarning, clearPositionMismatchWarning } = usePortfolio();
   const { effectiveCompact, syncGeneration, globalTargetExpanded } = useLayoutPriority();
 
   const [localExposureMode, setLocalExposureMode] = useState<SniperExposureMode>('MACRO');
@@ -281,6 +295,7 @@ export const IntradaySniperEngine: React.FC<IntradaySniperEngineProps> = React.m
   const [isAiDiagnosticsOpen, setIsAiDiagnosticsOpen] = useState<boolean>(false);
   const [cooldownRemainingSec, setCooldownRemainingSec] = useState<number>(0);
   const [validityTick, setValidityTick] = useState<number>(() => Date.now());
+  const [isStrategyReportOpen, setIsStrategyReportOpen] = useState<boolean>(false);
 
   useEffect(() => {
     if (effectiveCompact || globalTargetExpanded === false) {
@@ -346,7 +361,7 @@ export const IntradaySniperEngine: React.FC<IntradaySniperEngineProps> = React.m
   }, [livePrice]);
 
   // Signal & Position Direction Resolution
-  const effectiveSignal: 'LONG' | 'SHORT' = activeTrade ? activeTrade.signal : currentSignal.signal;
+  const effectiveSignal: 'LONG' | 'SHORT' = propActiveTrade ? (propActiveTrade.signal === 'SHORT' ? 'SHORT' : 'LONG') : currentSignal.signal;
   const isShort = effectiveSignal === 'SHORT';
 
   // Single Source of Truth Daily Session Anchor (Delta Exchange India UTC 00:00)
@@ -365,7 +380,7 @@ export const IntradaySniperEngine: React.FC<IntradaySniperEngineProps> = React.m
       dailyAnchor
     ).camarilla;
   }, [curMarket, effectiveSignal, selectedTimeframe, dailyAnchor]);
-  const camarilla = activeTrade?.camarilla || currentSignal.camarilla || computedCamarilla;
+  const camarilla = propActiveTrade?.camarilla || currentSignal.camarilla || computedCamarilla;
 
   const fmtPrice = (val: number) => {
     const decimals = livePrice < 1 ? 4 : livePrice < 10 ? 3 : 2;
@@ -387,18 +402,95 @@ export const IntradaySniperEngine: React.FC<IntradaySniperEngineProps> = React.m
   // 2. Dynamic Target Hydration:
   //    - Only populate Entry, SL, and TP1–TP4 when a new signal meets >= 75% conviction
   //      and passes all pre-entry risk protection gates (or while an active position is open).
-  //    - Upon position exit (TP hit, SL triggered, or manual close), immediately wipe levels to "---".
   // ═══════════════════════════════════════════════════════════
+  // UNIFIED ACTIVE TRACKED PERPETUAL POSITION SELECTOR
+  // Binds immediately to any open perpetual position in positions/livePositions
+  // falling back to staged signal preview ONLY when 0 open contracts exist.
+  // ═══════════════════════════════════════════════════════════
+  const effectiveActiveTrade = useMemo(() => {
+    if (isLiveUnverified) return null;
+    if (
+      propActiveTrade &&
+      propActiveTrade.status !== 'CLOSED' &&
+      !['STOPPED_OUT', 'COMPLETED', 'REVERSED', 'TIME_EXIT'].includes(propActiveTrade.tradeStatus)
+    ) {
+      return propActiveTrade;
+    }
+    const normSelected = normalizePerpSymbol(selectedSymbol);
+    const activePerps = (Array.isArray(positions) ? positions : []).filter((p) => {
+      const sym = String(p.product_symbol || p.rawSymbol || p.symbol || '').toUpperCase();
+      const isOpt =
+        p.contract_type === 'call_options' ||
+        p.contract_type === 'put_options' ||
+        sym.startsWith('C-') ||
+        sym.startsWith('P-');
+      if (isOpt) return false;
+      const rawSize = Math.abs(Number(p.size ?? 0));
+      const rawContracts = Math.abs(Number(p.contracts ?? 0));
+      return rawSize > 0 || rawContracts > 0;
+    });
+
+    if (activePerps.length === 0) return null;
+
+    const matched =
+      activePerps.find(
+        (p) => normalizePerpSymbol(p.product_symbol || p.rawSymbol || p.symbol) === normSelected
+      ) || activePerps[0];
+
+    const rawSym = String(matched.product_symbol || matched.rawSymbol || matched.symbol || selectedSymbol).toUpperCase();
+    const sideStr = String(matched.side || '').toUpperCase();
+    const side: 'LONG' | 'SHORT' =
+      sideStr === 'SHORT' || sideStr === 'SELL' || Number(matched.signedSize ?? matched.size ?? 0) < 0
+        ? 'SHORT'
+        : 'LONG';
+
+    const rawAbsSize = Math.abs(Number(matched.size ?? 0));
+    const rawContracts = Math.abs(Number(matched.contracts ?? 0));
+    const cVal = Number(matched.contractValue || (rawSym.includes('BTC') ? 0.001 : rawSym.includes('ETH') ? 0.01 : 1));
+    const coinSize = rawContracts > 0 && Math.abs(rawAbsSize - rawContracts) < 1e-6 && cVal < 1
+      ? rawContracts * cVal
+      : rawAbsSize > 0
+      ? rawAbsSize
+      : rawContracts * cVal;
+    const contracts = rawContracts > 0 ? rawContracts : Math.max(1, Math.round(coinSize / cVal));
+    const entryPx = Number(matched.entryPrice ?? matched.entry_price ?? livePrice);
+    const slDist = entryPx * 0.0028;
+
+    return {
+      id: matched.id || `pos-${rawSym}`,
+      symbol: rawSym,
+      side,
+      direction: side,
+      signal: side,
+      lotSize: coinSize,
+      remainingSize: coinSize,
+      contractsCount: contracts,
+      entryPrice: entryPx,
+      currentPrice: livePrice > 0 ? livePrice : entryPx,
+      initialStopLoss: Number(matched.stopLoss ?? 0) > 0 ? Number(matched.stopLoss) : (side === 'SHORT' ? entryPx + slDist : entryPx - slDist),
+      currentStopLoss: Number(matched.stopLoss ?? 0) > 0 ? Number(matched.stopLoss) : (side === 'SHORT' ? entryPx + slDist : entryPx - slDist),
+      tp1: Number(matched.takeProfit ?? 0) > 0 ? Number(matched.takeProfit) : (side === 'SHORT' ? entryPx - slDist * 1.25 : entryPx + slDist * 1.25),
+      tp2: side === 'SHORT' ? entryPx - slDist * 2.0 : entryPx + slDist * 2.0,
+      tp3: side === 'SHORT' ? entryPx - slDist * 2.75 : entryPx + slDist * 2.75,
+      tp4: side === 'SHORT' ? entryPx - slDist * 3.5 : entryPx + slDist * 3.5,
+      tradeStatus: 'ACTIVE',
+      status: 'OPEN',
+      openedAt: matched.openedAt || Date.now(),
+      unrealizedPnlUsd: side === 'LONG' ? (livePrice - entryPx) * coinSize : (entryPx - livePrice) * coinSize,
+      unrealisedProfitUsd: side === 'LONG' ? (livePrice - entryPx) * coinSize : (entryPx - livePrice) * coinSize,
+      bookedProfitUsd: 0,
+      adoptedFromExchange: true,
+    } as any;
+  }, [isLiveUnverified, propActiveTrade, positions, selectedSymbol, livePrice]);
+
+  const activeTrade = effectiveActiveTrade;
+
   const isPositionOpen = Boolean(
     activeTrade &&
     activeTrade.status !== 'CLOSED' &&
     !['STOPPED_OUT', 'COMPLETED', 'REVERSED', 'TIME_EXIT'].includes(activeTrade.tradeStatus)
   );
-  const isTradeForSelected = Boolean(
-    isPositionOpen &&
-    activeTrade &&
-    normalizePerpSymbol(activeTrade.symbol) === normalizePerpSymbol(selectedSymbol)
-  );
+  const isTradeForSelected = Boolean(isPositionOpen);
 
   // Detect position exit and immediately wipe levels to "---"
   const prevTradeIdRef = useRef<string | null>(isTradeForSelected && activeTrade ? activeTrade.id : null);
@@ -733,18 +825,21 @@ export const IntradaySniperEngine: React.FC<IntradaySniperEngineProps> = React.m
   // ═══════════════════════════════════════════════════════════
   // REAL-TIME INR-FIRST PnL TELEMETRY CALCULATIONS
   // Primary: Indian Rupees (₹) in bold green/red · Secondary: (≈ $USD)
+  // Recalculates tick-by-tick on every WebSocket markPrice update
   // ═══════════════════════════════════════════════════════════
   const liveOpenUnrealisedUsd = useMemo(() => {
     if (isLiveUnverified || !isTradeForSelected || !activeTrade) return 0;
-    if (tradingMode === 'LIVE' && typeof activeTrade.unrealizedPnlUsd === 'number' && Number.isFinite(activeTrade.unrealizedPnlUsd)) {
-      return +activeTrade.unrealizedPnlUsd.toFixed(4);
+    const entryPx = Number(activeTrade.entryPrice || 0);
+    const remSize = Number(activeTrade.remainingSize > 0 ? activeTrade.remainingSize : activeTrade.lotSize || 0);
+    if (entryPx <= 0 || remSize <= 0 || livePrice <= 0) {
+      return Number(activeTrade.unrealizedPnlUsd || activeTrade.unrealisedProfitUsd || 0);
     }
-    const remSize = activeTrade.remainingSize > 0 ? activeTrade.remainingSize : activeTrade.lotSize;
-    const rawDiff = activeTrade.signal === 'LONG'
-      ? (livePrice - activeTrade.entryPrice) * remSize
-      : (activeTrade.entryPrice - livePrice) * remSize;
+    const isShortTrade = activeTrade.side === 'SHORT' || activeTrade.signal === 'SHORT';
+    const rawDiff = isShortTrade
+      ? (entryPx - livePrice) * remSize
+      : (livePrice - entryPx) * remSize;
     return Number.isFinite(rawDiff) ? +rawDiff.toFixed(2) : (activeTrade.unrealisedProfitUsd || 0);
-  }, [isLiveUnverified, tradingMode, isTradeForSelected, activeTrade, livePrice]);
+  }, [isLiveUnverified, isTradeForSelected, activeTrade, livePrice]);
 
   const bookedLadderRealisedUsd = useMemo(() => {
     if (isLiveUnverified) return 0;
@@ -1657,11 +1752,19 @@ export const IntradaySniperEngine: React.FC<IntradaySniperEngineProps> = React.m
               </div>
             </div>
             <div className="text-right">
-              <span className="badge-delta badge-delta-standby">
-                {isTradeForSelected ? sniperUnrealisedFmt.usdText : 'Standby'}
+              <span className={`badge-delta ${
+                isTradeForSelected
+                  ? sniperUnrealisedFmt.isPositive
+                    ? 'badge-delta-live'
+                    : 'badge-delta-danger'
+                  : 'badge-delta-standby'
+              }`}>
+                {isTradeForSelected ? `${sniperUnrealisedFmt.usdText} · ACTIVE` : 'Standby'}
               </span>
-              <span className="text-[9.5px] text-slate-500 block mt-1">
-                {isTradeForSelected && activeTrade ? `${activeTrade.remainingSize} Lots` : '0.00 Lots'}
+              <span className="text-[9.5px] text-slate-400 block mt-1 font-mono">
+                {isTradeForSelected && activeTrade
+                  ? `${effectiveContractsCount} Lots (${effectiveLotSize} ${cleanSymbolBase})`
+                  : '0.00 Lots'}
               </span>
             </div>
           </div>
@@ -1860,6 +1963,23 @@ export const IntradaySniperEngine: React.FC<IntradaySniperEngineProps> = React.m
         {/* Left Column (40% width): EXECUTION COCKPIT */}
         <div className="lg:col-span-5 min-w-0 max-w-full panel-delta panel-delta-body flex flex-col justify-between space-y-3">
           <div className="space-y-2.5 font-mono-numbers min-w-0">
+            {/* Position Mismatch Warning Alert Banner */}
+            {positionMismatchWarning && (
+              <div className="p-2.5 bg-rose-950/90 border border-rose-500/80 rounded-lg text-rose-200 text-xs flex items-center justify-between gap-2 shadow-[0_0_15px_rgba(244,63,94,0.3)] animate-pulse">
+                <div className="flex items-center gap-2">
+                  <AlertTriangle className="w-4 h-4 text-rose-400 shrink-0" />
+                  <span className="font-semibold text-rose-100">{positionMismatchWarning}</span>
+                </div>
+                <button
+                  type="button"
+                  onClick={clearPositionMismatchWarning}
+                  className="px-2 py-0.5 rounded bg-rose-500/20 hover:bg-rose-500/30 border border-rose-500/40 text-[10px] text-white shrink-0 cursor-pointer"
+                >
+                  Dismiss
+                </button>
+              </div>
+            )}
+
             {/* Header */}
             <div className="flex flex-wrap items-center justify-between gap-1.5 pb-2 border-b border-slate-800/80 min-w-0">
               <div className="flex items-center gap-2 flex-wrap min-w-0">
@@ -1887,6 +2007,15 @@ export const IntradaySniperEngine: React.FC<IntradaySniperEngineProps> = React.m
                     <span>{executionTriggerMode === 'IMMEDIATE_TOUCH' ? 'Immediate Touch' : 'Bar Close Guard'}</span>
                   </button>
                 )}
+                <button
+                  type="button"
+                  onClick={() => setIsStrategyReportOpen(true)}
+                  className="btn-delta-sm btn-secondary text-cyan-300 hover:text-cyan-200 border-cyan-500/40"
+                  title="View full 9-section institutional BTC strategy report"
+                >
+                  <FileText className="w-3 h-3 text-cyan-400" />
+                  <span>Strategy Report</span>
+                </button>
                 <span>Gen {signalGenTimeFormatted}</span>
               </div>
             </div>
@@ -1977,6 +2106,39 @@ export const IntradaySniperEngine: React.FC<IntradaySniperEngineProps> = React.m
                 )}
               </div>
             )}
+            {/* Institutional Intraday Strategy Confluence Card (16-Point Score, Grade, Active Setup) */}
+            <div className="p-2.5 rounded-lg bg-slate-950/90 border border-slate-800/90 text-xs font-mono-numbers space-y-1.5">
+              <div className="flex flex-wrap items-center justify-between gap-1.5">
+                <div className="flex items-center gap-1.5 min-w-0">
+                  <span className="text-[10px] text-slate-400 uppercase tracking-wider font-semibold">Institutional Setup:</span>
+                  <span className="font-bold text-cyan-300 truncate">
+                    {currentSignal.activeSetupName || 'Camarilla Breakout (Setup A)'}
+                  </span>
+                </div>
+                <div className="flex items-center gap-1.5 shrink-0">
+                  <span className={`px-2 py-0.5 rounded text-[10px] font-extrabold border ${
+                    (currentSignal.setupGrade === 'A+' || (!currentSignal.setupGrade && currentSignal.confidence >= 90))
+                      ? 'bg-emerald-950/80 border-emerald-500 text-emerald-300 shadow-[0_0_8px_rgba(16,185,129,0.3)]'
+                      : (currentSignal.setupGrade === 'A' || (!currentSignal.setupGrade && currentSignal.confidence >= 75))
+                      ? 'bg-cyan-950/80 border-cyan-500 text-cyan-300'
+                      : (currentSignal.setupGrade === 'B')
+                      ? 'bg-amber-950/80 border-amber-500 text-amber-300'
+                      : 'bg-rose-950/80 border-rose-500 text-rose-300'
+                  }`}>
+                    Grade {currentSignal.setupGrade || (currentSignal.confidence >= 90 ? 'A+' : currentSignal.confidence >= 75 ? 'A' : 'B')}
+                  </span>
+                  <span className="text-slate-300 font-bold tabular-nums">
+                    {currentSignal.setupScore16 ?? (currentSignal.confidence >= 90 ? 15 : currentSignal.confidence >= 75 ? 13 : 9)}/16 Pts
+                  </span>
+                </div>
+              </div>
+              {currentSignal.hardNoTradeReasons && currentSignal.hardNoTradeReasons.length > 0 && (
+                <div className="text-[10px] text-rose-300/90 bg-rose-950/50 p-1.5 rounded border border-rose-500/40 flex items-center gap-1.5">
+                  <ShieldAlert className="w-3.5 h-3.5 text-rose-400 shrink-0" />
+                  <span className="truncate">Hard Filter Active: {currentSignal.hardNoTradeReasons[0]}</span>
+                </div>
+              )}
+            </div>
 
             {/* Signal & Conviction Row */}
             <div className="grid grid-cols-2 gap-2 text-xs">
@@ -2270,15 +2432,50 @@ export const IntradaySniperEngine: React.FC<IntradaySniperEngineProps> = React.m
             )}
 
             {/* Circuit Breaker Lock Banner */}
-            {consecutiveStopsCount >= 2 && !isAutoSniperEnabled && (
-              <div className="p-2.5 rounded-lg bg-rose-950/80 border border-rose-500/60 text-[11px] font-mono-numbers text-rose-300 space-y-1">
-                <div className="flex items-center gap-1.5 font-bold text-rose-200">
-                  <ShieldCheck className="w-4 h-4 text-rose-400 shrink-0" />
-                  <span>CIRCUIT BREAKER: AUTO-PILOT HALTED</span>
+            {(circuitBreakerTripped || consecutiveStopsCount >= 3 || (dailyLossPercent !== undefined && dailyLossPercent >= 1.5)) && (
+              <div className="p-3 rounded-lg bg-rose-950/90 border border-rose-500/80 text-[11px] font-mono-numbers text-rose-200 space-y-2 animate-pulse shadow-lg">
+                <div className="flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-1.5 font-bold text-rose-100">
+                    <ShieldAlert className="w-4 h-4 text-rose-400 shrink-0" />
+                    <span>CIRCUIT BREAKER: AUTO-PILOT PAUSED</span>
+                  </div>
+                  {onResetCircuitBreaker && (
+                    <button
+                      type="button"
+                      onClick={onResetCircuitBreaker}
+                      className="px-2 py-0.5 rounded bg-rose-600 hover:bg-rose-500 text-white font-extrabold text-[10px] uppercase border border-rose-400 cursor-pointer shadow transition"
+                    >
+                      [RESET & RE-ARM]
+                    </button>
+                  )}
                 </div>
-                <p className="text-[10.5px] text-rose-300/90">
-                  AUTO-PILOT HALTED: 2 Consecutive Stops Hit. Session Locked to Preserve Capital.
+                <p className="text-[10.5px] text-rose-300">
+                  {circuitBreakerReason ||
+                    (consecutiveStopsCount >= 3
+                      ? `3 Consecutive Losses (${consecutiveStopsCount}/3) Hit. Auto-Pilot paused to preserve equity.`
+                      : `Daily loss limit reached (${(dailyLossPercent || 0).toFixed(2)}% >= 1.5% max risk). Auto-Pilot paused to preserve equity.`)}
                 </p>
+              </div>
+            )}
+
+            {/* Post-SL 1-Candle Cooldown Badge */}
+            {((postSlCooldownUntilMs && postSlCooldownUntilMs > Date.now()) || (currentSignal.postSlCooldownBarsRemaining && currentSignal.postSlCooldownBarsRemaining > 0)) && (
+              <div className="p-2.5 rounded-lg bg-amber-950/70 border border-amber-500/60 text-[11px] font-mono-numbers text-amber-200 flex items-center justify-between gap-2">
+                <div className="flex items-center gap-1.5">
+                  <Clock className="w-3.5 h-3.5 text-amber-400 shrink-0 animate-spin" />
+                  <span>
+                    1-CANDLE COOLDOWN ACTIVE · Awaiting completed 15M candle close before next entry
+                  </span>
+                </div>
+                {onResetCircuitBreaker && (
+                  <button
+                    type="button"
+                    onClick={onResetCircuitBreaker}
+                    className="px-1.5 py-0.5 rounded bg-amber-800/80 hover:bg-amber-700 text-white text-[9.5px] font-bold uppercase border border-amber-400 cursor-pointer"
+                  >
+                    Skip Cooldown
+                  </button>
+                )}
               </div>
             )}
 
@@ -2488,6 +2685,7 @@ export const IntradaySniperEngine: React.FC<IntradaySniperEngineProps> = React.m
             tp4={effectiveTp4}
             activeTrade={activeTrade}
             activeTargetIndex={activeTargetIndex}
+            unrealizedPnl={liveOpenUnrealisedUsd}
             isMicro15={isMicro15}
             lotSize={effectiveLotSize}
             symbol={selectedSymbol}
@@ -2889,6 +3087,37 @@ export const IntradaySniperEngine: React.FC<IntradaySniperEngineProps> = React.m
                 )}
               </span>
             </div>
+
+            <div className="p-2.5 bg-slate-950 rounded border border-slate-800/80 sm:col-span-2 flex flex-wrap items-center justify-between gap-1.5 min-w-0">
+              <div className="flex items-center gap-1.5 min-w-0">
+                <Crosshair className="w-3.5 h-3.5 text-cyan-400 shrink-0" />
+                <span className="text-slate-300 text-[11px] font-semibold truncate">
+                  Institutional Intraday Confluence (BTC): {currentSignal.activeSetupName || 'Camarilla Setup A'}
+                </span>
+              </div>
+              <div className="flex items-center gap-1.5 shrink-0">
+                <span className={`px-2 py-0.5 rounded text-[10px] font-extrabold border ${
+                  currentSignal.setupGrade === 'A+' ? 'bg-emerald-950/80 border-emerald-500 text-emerald-300' :
+                  currentSignal.setupGrade === 'A' ? 'bg-cyan-950/80 border-cyan-500 text-cyan-300' :
+                  'bg-amber-950/80 border-amber-500 text-amber-300'
+                }`}>
+                  Grade {currentSignal.setupGrade || 'A'}
+                </span>
+                <span className="font-bold text-slate-200">{currentSignal.setupScore16 ?? 13}/16 Pts</span>
+              </div>
+            </div>
+
+            {currentSignal.hardNoTradeReasons && currentSignal.hardNoTradeReasons.length > 0 && (
+              <div className="p-2.5 bg-rose-950/60 rounded border border-rose-500/60 sm:col-span-2 text-rose-200 text-[10.5px] space-y-1">
+                <div className="font-bold flex items-center gap-1.5 text-rose-300">
+                  <ShieldAlert className="w-3.5 h-3.5 text-rose-400 shrink-0" />
+                  <span>Hard No-Trade Circuit Breakers Active ({currentSignal.hardNoTradeReasons.length}):</span>
+                </div>
+                <div className="text-[10px] text-rose-300/85 pl-5">
+                  {currentSignal.hardNoTradeReasons.join(' · ')}
+                </div>
+              </div>
+            )}
           </div>
           </div>
         </div>
@@ -2949,9 +3178,16 @@ export const IntradaySniperEngine: React.FC<IntradaySniperEngineProps> = React.m
                         ? 'badge-delta-armed'
                         : log.type === 'TRAILING'
                         ? 'badge-delta-paper'
+                        : log.type === 'POSITION_MISMATCH_DETECTED'
+                        ? 'bg-rose-950/80 text-rose-300 border border-rose-500/60 shadow-[0_0_8px_rgba(244,63,94,0.3)]'
                         : 'badge-delta-danger'
                     }`}>
-                      {log.type === 'CONDUIT' ? (
+                      {log.type === 'POSITION_MISMATCH_DETECTED' ? (
+                        <span className="inline-flex items-center gap-1 font-bold text-rose-300">
+                          <AlertTriangle className="w-2.5 h-2.5" />
+                          <span>MISMATCH</span>
+                        </span>
+                      ) : log.type === 'CONDUIT' ? (
                         <span className="inline-flex items-center gap-1">
                           <Cpu className="w-2.5 h-2.5" />
                           <span>CONDUIT</span>
@@ -2972,6 +3208,13 @@ export const IntradaySniperEngine: React.FC<IntradaySniperEngineProps> = React.m
           </div>
         )}
       </CollapsibleTierPanel>
+
+      <BtcStrategyReportModal
+        isOpen={isStrategyReportOpen}
+        onClose={() => setIsStrategyReportOpen(false)}
+        currentSignal={currentSignal}
+        currencyPrefix={currencyPrefix}
+      />
     </div>
   );
 });

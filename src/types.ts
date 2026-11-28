@@ -680,6 +680,13 @@ export interface SniperSignal {
   ema921Cross?: Ema921MomentumCrossResult | null;
   partialTakeProfitPct?: number;
   trailBasis?: '5M_EMA21' | '15M_EMA20';
+  setupScore16?: number;
+  setupGrade?: 'A+' | 'A' | 'B' | 'NO_TRADE';
+  activeSetupName?: string;
+  activeSetupId?: string;
+  hardNoTradeReasons?: string[];
+  isHardNoTradeBlocked?: boolean;
+  btcSniperResult?: any;
 }
 
 export type SniperTradeStatus = 
@@ -900,7 +907,7 @@ export interface SniperActiveTrade {
 export interface SniperLogEntry {
   id: string;
   timestamp: number;
-  type: 'ENTRY' | 'TP1' | 'TP2' | 'TP3' | 'TP4' | 'TRAILING' | 'STOP_LOSS' | 'REVERSAL' | 'TIME_EXIT' | 'BLOCKED' | 'EXECUTION' | 'AUTOPILOT' | 'CONDUIT' | 'SIGNAL' | 'HOURLY_GOAL' | 'EXIT_DEFENDED' | 'RESCUE';
+  type: 'ENTRY' | 'TP1' | 'TP2' | 'TP3' | 'TP4' | 'TRAILING' | 'STOP_LOSS' | 'REVERSAL' | 'TIME_EXIT' | 'BLOCKED' | 'EXECUTION' | 'AUTOPILOT' | 'CONDUIT' | 'SIGNAL' | 'HOURLY_GOAL' | 'EXIT_DEFENDED' | 'RESCUE' | 'POSITION_MISMATCH_DETECTED';
   title: string;
   description: string;
 }
@@ -913,6 +920,7 @@ export type OptionStrategyName =
   | 'Long Call'
   | 'Long Put'
   | 'Bull Call Spread'
+  | 'Bull Put Spread'
   | 'Bear Put Spread'
   | 'Bear Call Spread'
   | 'Covered Call'

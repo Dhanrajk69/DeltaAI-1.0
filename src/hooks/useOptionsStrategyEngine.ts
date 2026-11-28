@@ -58,6 +58,11 @@ import {
 import { formatAssetNameForSpeech } from './useVoiceAlerts';
 import { speakVoiceAlert } from '../utils/voiceAlert';
 import {
+  evaluateInstitutionalBtcSniper,
+  evaluateIntradaySniperStrategy,
+  InstitutionalBtcSniperResult,
+} from '../services/intradaySniperEngine';
+import {
   getClosestFridayExpiry,
   getNextWeekFridayExpiry,
   getMonthlyOptionsExpiry,
@@ -138,6 +143,17 @@ export const ALL_OPTION_STRATEGIES: OptionStrategyTemplate[] = [
     profitManagementSummary: '50% evaluate exit · 75% lock gains · 85%-90% full exit',
     defaultMaxProfitTarget: 85,
     description: 'Long higher strike put + short lower strike put to define risk on controlled pullbacks.',
+  },
+  {
+    name: 'Bull Put Spread',
+    category: 'INCOME',
+    marketOutlook: 'Moderately Bullish / Support Defense',
+    volatilityOutlook: 'Neutral / Declining IV',
+    profitSource: 'Premium Collection · Theta Decay · Support Defense',
+    maxProfitRule: 'Limited to net credit collected',
+    profitManagementSummary: '50% evaluate exit · Invalidation exit if 15m close < CPR support',
+    defaultMaxProfitTarget: 50,
+    description: 'Short higher strike put shielded behind Daily/Virgin CPR + long lower protective put wing.',
   },
   {
     name: 'Bear Call Spread',
@@ -734,11 +750,6 @@ export function useOptionsStrategyEngine({
       disarmReasonRef.current = reason;
     }
     setIsAutoPilotEnabledState(enabled);
-    try {
-      localStorage.setItem('delta_options_autopilot_enabled_v1', enabled ? 'true' : 'false');
-    } catch (err) {
-      console.warn('[AutoPilot] Failed to save to localStorage:', err);
-    }
     fetch('/api/options/autopilot-state', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -755,9 +766,6 @@ export function useOptionsStrategyEngine({
   // On mount, force server & local autopilot state to false unless explicitly armed in current session
   useEffect(() => {
     if (!hasUserArmedInSessionRef.current) {
-      try {
-        localStorage.setItem('delta_options_autopilot_enabled_v1', 'false');
-      } catch {}
       fetch('/api/options/autopilot-state', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -770,62 +778,32 @@ export function useOptionsStrategyEngine({
     }
   }, []);
 
-  // Max 3 trades per UTC day + 3-bar (45m on 15m chart) post-SL cooldown
-  const optUtcDayStorageKey = `delta_options_utc_trades_v1_${tradingMode}`;
+  // Max 3 trades per UTC day + 3-bar (45m on 15m chart) post-SL cooldown (in-memory only)
   const getOptTodayUtcStr = () => new Date().toISOString().slice(0, 10);
-  const [optUtcDayState, setOptUtcDayState] = useState<{ date: string; count: number }>(() => {
-    const today = getOptTodayUtcStr();
-    try {
-      const raw = localStorage.getItem(optUtcDayStorageKey);
-      if (raw) {
-        const parsed = JSON.parse(raw);
-        if (parsed?.date === today) {
-          return { date: today, count: Math.max(0, Number(parsed.count) || 0) };
-        }
-      }
-    } catch {}
-    return { date: today, count: 0 };
-  });
-  const [optPostSlCooldownUntilMs, setOptPostSlCooldownUntilMs] = useState<number>(() => {
-    try {
-      return Number(localStorage.getItem(`delta_options_post_sl_v1_${tradingMode}`) || 0);
-    } catch {
-      return 0;
-    }
-  });
+  const [optUtcDayState, setOptUtcDayState] = useState<{ date: string; count: number }>(() => ({
+    date: getOptTodayUtcStr(),
+    count: 0,
+  }));
+  const [optPostSlCooldownUntilMs, setOptPostSlCooldownUntilMs] = useState<number>(0);
+
   useEffect(() => {
-    const today = getOptTodayUtcStr();
-    try {
-      const raw = localStorage.getItem(optUtcDayStorageKey);
-      if (raw) {
-        const parsed = JSON.parse(raw);
-        setOptUtcDayState({ date: today, count: parsed?.date === today ? Math.max(0, Number(parsed.count) || 0) : 0 });
-      } else {
-        setOptUtcDayState({ date: today, count: 0 });
-      }
-      setOptPostSlCooldownUntilMs(Number(localStorage.getItem(`delta_options_post_sl_v1_${tradingMode}`) || 0));
-    } catch {}
-  }, [optUtcDayStorageKey, tradingMode]);
+    setOptUtcDayState({ date: getOptTodayUtcStr(), count: 0 });
+    setOptPostSlCooldownUntilMs(0);
+  }, [tradingMode]);
 
   const utcDayTradesCount = optUtcDayState.date === getOptTodayUtcStr() ? optUtcDayState.count : 0;
   const incrementUtcDayTradeCount = useCallback(() => {
     const today = getOptTodayUtcStr();
-    setOptUtcDayState((prev) => {
-      const next = { date: today, count: (prev.date === today ? prev.count : 0) + 1 };
-      try {
-        localStorage.setItem(optUtcDayStorageKey, JSON.stringify(next));
-      } catch {}
-      return next;
-    });
-  }, [optUtcDayStorageKey]);
+    setOptUtcDayState((prev) => ({
+      date: today,
+      count: (prev.date === today ? prev.count : 0) + 1,
+    }));
+  }, []);
 
   const triggerOptPostSlCooldown = useCallback(() => {
     const until = Date.now() + POST_SL_COOLDOWN_BARS * 15 * 60 * 1000;
     setOptPostSlCooldownUntilMs(until);
-    try {
-      localStorage.setItem(`delta_options_post_sl_v1_${tradingMode}`, String(until));
-    } catch {}
-  }, [tradingMode]);
+  }, []);
 
   const postSlCooldownBarsRemaining =
     optPostSlCooldownUntilMs > Date.now()
@@ -897,28 +875,7 @@ export function useOptionsStrategyEngine({
     count: 0,
   });
 
-  const CLOSED_OPTION_SIGS_KEY = 'delta_options_closed_ex_sigs_v1';
-  const closedOptionSignaturesRef = useRef<Map<string, number>>(
-    (() => {
-      const map = new Map<string, number>();
-      try {
-        const raw = localStorage.getItem(CLOSED_OPTION_SIGS_KEY);
-        if (raw) {
-          const parsed = JSON.parse(raw);
-          const cutoff = Date.now() - 24 * 60 * 60 * 1000;
-          if (parsed && typeof parsed === 'object') {
-            for (const [k, ts] of Object.entries(parsed)) {
-              const numTs = Number(ts);
-              if (Number.isFinite(numTs) && numTs >= cutoff) {
-                map.set(k, numTs);
-              }
-            }
-          }
-        }
-      } catch {}
-      return map;
-    })()
-  );
+  const closedOptionSignaturesRef = useRef<Map<string, number>>(new Map());
 
   const recordClosedOptionPositionSignatures = useCallback((pos: OptionStrategyPosition) => {
     const now = Date.now();
@@ -940,9 +897,6 @@ export function useOptionsStrategyEngine({
       .sort((a, b) => b[1] - a[1])
       .slice(0, 80);
     closedOptionSignaturesRef.current = new Map(entries);
-    try {
-      localStorage.setItem(CLOSED_OPTION_SIGS_KEY, JSON.stringify(Object.fromEntries(entries)));
-    } catch {}
   }, []);
 
   const isOptionLegBlockedFromAdoption = useCallback(
@@ -1168,10 +1122,6 @@ export function useOptionsStrategyEngine({
 
       // Immediately clear active position and unlock 1/1 Options Slot without imposing 15m cooldown
       recordClosedOptionPositionSignatures(pos);
-      try {
-        localStorage.removeItem('delta_options_active_position_v1');
-        localStorage.removeItem('delta_active_options_strategy');
-      } catch {}
       setActivePosition(null);
       setLiveExchangePositionsCount(0);
       setLiveExchangeOptionLegs([]);
@@ -1231,6 +1181,7 @@ export function useOptionsStrategyEngine({
 
   const [autoHandoffEnabled, setAutoHandoffEnabled] = useState<boolean>(true);
 
+  const [candles5m, setCandles5m] = useState<any[]>([]);
   const [candles15m, setCandles15m] = useState<any[]>([]);
   const [candles1h, setCandles1h] = useState<any[]>([]);
   const [candles4h, setCandles4h] = useState<any[]>([]);
@@ -1239,12 +1190,14 @@ export function useOptionsStrategyEngine({
     let active = true;
     const fetchMultiTf = async () => {
       try {
-        const [r15, r1h, r4h] = await Promise.all([
+        const [r5, r15, r1h, r4h] = await Promise.all([
+          fetch(`/api/delta/candles?symbol=${encodeURIComponent(selectedSymbol)}&resolution=5m`).then((r) => (r.ok ? r.json() : null)).catch(() => null),
           fetch(`/api/delta/candles?symbol=${encodeURIComponent(selectedSymbol)}&resolution=15m`).then((r) => (r.ok ? r.json() : null)).catch(() => null),
           fetch(`/api/delta/candles?symbol=${encodeURIComponent(selectedSymbol)}&resolution=1h`).then((r) => (r.ok ? r.json() : null)).catch(() => null),
           fetch(`/api/delta/candles?symbol=${encodeURIComponent(selectedSymbol)}&resolution=4h`).then((r) => (r.ok ? r.json() : null)).catch(() => null),
         ]);
         if (!active) return;
+        if (Array.isArray(r5?.candles) && r5.candles.length > 0) setCandles5m(r5.candles);
         if (Array.isArray(r15?.candles) && r15.candles.length > 0) setCandles15m(r15.candles);
         if (Array.isArray(r1h?.candles) && r1h.candles.length > 0) setCandles1h(r1h.candles);
         if (Array.isArray(r4h?.candles) && r4h.candles.length > 0) setCandles4h(r4h.candles);
@@ -1299,6 +1252,67 @@ export function useOptionsStrategyEngine({
     };
   }, [candles4h, markPrice, computedCamarilla.pivot, calcCprWidth, regimeRouter.cprWidthPct, regimeRouter.isWideCpr]);
 
+  // Master Institutional Intraday Sniper Evaluation
+  const institutionalSniperResult = useMemo<InstitutionalBtcSniperResult | null>(() => {
+    const derivedEquity = liveAvailableEquityUsd > 0 ? liveAvailableEquityUsd : 1000;
+    return evaluateInstitutionalBtcSniper({
+      symbol: selectedSymbol,
+      currentPrice: markPrice > 0 ? markPrice : 85000,
+      candles: {
+        c4h: candles4h,
+        c1h: candles1h,
+        c15m: candles15m,
+        c5m: candles5m,
+      },
+      accountEquityUsd: derivedEquity,
+      sessionRealizedPnLUsd: sessionRealisedPnlUsd || 0,
+      consecutiveStopsCount: 0,
+      high24h: curMarket?.high24h || (markPrice > 0 ? markPrice * 1.015 : 86000),
+      low24h: curMarket?.low24h || (markPrice > 0 ? markPrice * 0.985 : 84000),
+      change24h: curMarket?.change24h || 0,
+    });
+  }, [
+    selectedSymbol,
+    markPrice,
+    candles4h,
+    candles1h,
+    candles15m,
+    candles5m,
+    liveAvailableEquityUsd,
+    sessionRealisedPnlUsd,
+    curMarket,
+  ]);
+
+  // Hard No-Trade Circuit Breaker & Filter Audit
+  const { isHardNoTradeBlocked, hardNoTradeReasons } = useMemo(() => {
+    if (!institutionalSniperResult) {
+      return { isHardNoTradeBlocked: false, hardNoTradeReasons: [] as string[] };
+    }
+    const reasons: string[] = [];
+    if (institutionalSniperResult.circuitBreakerActive) {
+      reasons.push('Risk Circuit Breaker Active (3 Consecutive Losses or Max Daily Drawdown Exceeded)');
+    }
+    for (const f of institutionalSniperResult.hardFilters.filters) {
+      if (f.triggered) {
+        reasons.push(`${f.label}: ${f.reason}`);
+      }
+    }
+    // Check if score is < 10 without a valid range regime
+    const isRangeRegime =
+      institutionalSniperResult.dailyCpr.widthRegime === 'WIDE' ||
+      institutionalSniperResult.dailyCpr.widthPct > 0.55 ||
+      (markPrice >= institutionalSniperResult.camarilla.l3 &&
+       markPrice <= institutionalSniperResult.camarilla.h3 &&
+       institutionalSniperResult.ema15m.stack === 'ENTANGLED_CHOP');
+
+    if (institutionalSniperResult.confluence.totalScore < 10 && !isRangeRegime) {
+      reasons.push(`Setup score ${institutionalSniperResult.confluence.totalScore}/16 < 10/16 without range regime`);
+    }
+
+    const blocked = reasons.length > 0;
+    return { isHardNoTradeBlocked: blocked, hardNoTradeReasons: reasons };
+  }, [institutionalSniperResult, markPrice]);
+
   const executionLane: 'TRENDING_DIRECTIONAL' | 'NEUTRAL_THETA_HARVEST' =
     autoHandoffEnabled && (regimeRouter.routeDestination === 'OPTIONS_DEBIT_SPREAD' || isWide4hCpr || isCprStretched)
       ? 'NEUTRAL_THETA_HARVEST'
@@ -1310,13 +1324,90 @@ export function useOptionsStrategyEngine({
   const activeEngineMode: 'CAMARILLA_SNIPER' | 'OPTIONS_LAB_CREDIT' =
     regimeRouter.routeDestination === 'OPTIONS_DEBIT_SPREAD' ? 'OPTIONS_LAB_CREDIT' : 'CAMARILLA_SNIPER';
 
-  // Route trending Wide CPR / High Volatility to Defined-Risk Debit Spreads (Bull Call Spread / Bear Put Spread)
-  const effectiveResolvedStrategy: OptionStrategyName =
-    candles15m.length >= 15 && !regimeRouter.isNoTrade && regimeRouter.recommendedOptionsStrategy
-      ? regimeRouter.recommendedOptionsStrategy
-      : regimeRouter.direction === 'SHORT'
-      ? 'Bear Put Spread'
-      : resolvedStrategy;
+  // ═══════════════════════════════════════════════════════════
+  // INSTITUTIONAL REGIME-BASED OPTIONS STRATEGY ROUTER
+  // 1. WIDE CPR (> 0.55%) / Neutral Rotational Range: Iron Condor or Short Strangle
+  // 2. NARROW CPR (< 0.25%) + Confirmed 15M Breakout (Score >= 10/16): Bull Call / Bear Put Debit Spread
+  // 3. TREND CONTINUATION (Setup A, Score >= 10/16): Bull Put / Bear Call Credit Spread, or Covered Call/Put
+  // 4. CAMARILLA REVERSAL (Setup B at H3/H4 or L3/L4): Defined-risk Credit/Debit Spread (0.25% risk cap)
+  // ═══════════════════════════════════════════════════════════
+  const institutionalResolvedStrategy: OptionStrategyName = useMemo(() => {
+    if (!institutionalSniperResult) {
+      return (
+        candles15m.length >= 15 && !regimeRouter.isNoTrade && regimeRouter.recommendedOptionsStrategy
+          ? regimeRouter.recommendedOptionsStrategy
+          : regimeRouter.direction === 'SHORT'
+          ? 'Bear Put Spread'
+          : resolvedStrategy
+      );
+    }
+
+    const { dailyCpr, camarilla, setup, confluence, currentPrice, ema15m } = institutionalSniperResult;
+    const score = confluence.totalScore;
+    const matchingBtcPerp = positions.find(
+      (p) => (p.product_symbol === 'BTCUSD' || p.product_symbol === 'BTC-PERP') && Math.abs(Number(p.size)) > 0
+    );
+
+    // Rule 1: WIDE CPR (> 0.55%) or Neutral Rotational Range (price between L3 and H3 with tangled EMAs)
+    const isWideOrRange =
+      dailyCpr.widthPct > 0.55 ||
+      dailyCpr.widthRegime === 'WIDE' ||
+      (currentPrice >= camarilla.l3 && currentPrice <= camarilla.h3 && ema15m.stack === 'ENTANGLED_CHOP');
+
+    if (isWideOrRange) {
+      const isIvElevated = Boolean(curMarket?.change24h && Math.abs(curMarket.change24h) > 4);
+      const isVirginBreakout = institutionalSniperResult.virginCprZones.some(
+        (z) => z.isUntouched && Math.abs(z.midpoint - currentPrice) / currentPrice < 0.005
+      );
+      if (isIvElevated && !isVirginBreakout && !intradayMode) {
+        return 'Short Strangle';
+      }
+      return 'Iron Condor';
+    }
+
+    // Rule 2: NARROW CPR (< 0.25%) + Confirmed 15M Breakout (Score >= 10/16)
+    const isNarrowCpr = dailyCpr.widthPct < 0.25 || dailyCpr.widthRegime === 'NARROW';
+    if (isNarrowCpr && (score >= 10 || setup.id === 'SETUP_C_NARROW_CPR_BREAKOUT')) {
+      if (currentPrice > dailyCpr.cprTop || currentPrice >= camarilla.h4 || setup.direction === 'LONG') {
+        return 'Bull Call Spread';
+      }
+      return 'Bear Put Spread';
+    }
+
+    // Rule 3: TREND CONTINUATION (Setup A, Score >= 10/16)
+    if (setup.id === 'SETUP_A_TREND_CONTINUATION' && score >= 10) {
+      if (matchingBtcPerp) {
+        const perpSize = Number(matchingBtcPerp.size);
+        return perpSize > 0 ? 'Covered Call' : 'Covered Put';
+      }
+      return setup.direction === 'SHORT' ? 'Bear Call Spread' : 'Bull Put Spread';
+    }
+
+    // Rule 4: CAMARILLA REVERSAL (Setup B at H3/H4 or L3/L4)
+    if (setup.id === 'SETUP_B_CAMARILLA_REVERSAL') {
+      if (setup.direction === 'SHORT' || currentPrice >= camarilla.h3) {
+        return 'Bear Call Spread';
+      }
+      return 'Bull Put Spread';
+    }
+
+    // Fallback to unified regime router
+    if (candles15m.length >= 15 && !regimeRouter.isNoTrade && regimeRouter.recommendedOptionsStrategy) {
+      return regimeRouter.recommendedOptionsStrategy;
+    }
+
+    return regimeRouter.direction === 'SHORT' ? 'Bear Put Spread' : resolvedStrategy;
+  }, [
+    institutionalSniperResult,
+    positions,
+    curMarket,
+    intradayMode,
+    candles15m.length,
+    regimeRouter,
+    resolvedStrategy,
+  ]);
+
+  const effectiveResolvedStrategy: OptionStrategyName = institutionalResolvedStrategy;
 
   useEffect(() => {
     if (effectiveResolvedStrategy) {
@@ -1772,7 +1863,8 @@ export function useOptionsStrategyEngine({
     if (
       activeStrat === 'Iron Condor' ||
       activeStrat === 'Iron Butterfly' ||
-      activeStrat === 'Bear Call Spread'
+      activeStrat === 'Bear Call Spread' ||
+      activeStrat === 'Bull Put Spread'
     ) {
       // Defined-risk credit spread: net spread margin per 1-lot unit is bounded by wing width minus credit offset
       return Math.max(0.5, +(spreadWidth * contractMult * 0.65).toFixed(2));
@@ -2177,6 +2269,54 @@ export function useOptionsStrategyEngine({
           ];
         }
 
+        case 'Bull Put Spread': {
+          // Anchor short Put leg shielded behind Daily/Virgin CPR support wall if active, else fallback to calibration / ATM - step
+          const shortStrike = virginPutWall || intradayCalibration?.strikes?.shortPutStrike || (atm - step);
+          const longStrike = virginPutWall
+            ? (shortStrike - step * 2)
+            : (intradayCalibration?.strikes?.longPutStrike || (shortStrike - step * 2));
+          const expiry = intradayMode ? deltaMarketStructure.nextDailyExpiryDateStr : expiryStr;
+          const dte = intradayMode ? 1 : dteVal;
+
+          const pShort = getPrem('PUT', shortStrike, false, false);
+          const pLong = getPrem('PUT', longStrike, false, true);
+
+          return [
+            {
+              id: 'leg-1',
+              type: 'PUT',
+              action: 'SELL',
+              strike: shortStrike,
+              expiry,
+              dte,
+              premiumEntry: pShort > 0 ? pShort : 76.50,
+              premiumCurrent: pShort > 0 ? pShort : 76.50,
+              delta: 0.32,
+              gamma: -0.00010,
+              theta: 41.00,
+              vega: -23.80,
+              iv: 50.2,
+              contracts,
+            },
+            {
+              id: 'leg-2',
+              type: 'PUT',
+              action: 'BUY',
+              strike: longStrike,
+              expiry,
+              dte,
+              premiumEntry: pLong > 0 ? pLong : 34.20,
+              premiumCurrent: pLong > 0 ? pLong : 34.20,
+              delta: -0.19,
+              gamma: 0.00007,
+              theta: -25.00,
+              vega: 16.50,
+              iv: 51.5,
+              contracts,
+            },
+          ];
+        }
+
         case 'Bear Call Spread': {
           // Anchor short Call leg to unmitigated Virgin CPR overhead resistance wall if active, else fallback to calibration / ATM + step
           const shortStrike = virginCallWall || intradayCalibration?.strikes?.shortCallStrike || (atm + step);
@@ -2512,11 +2652,16 @@ export function useOptionsStrategyEngine({
 
         case 'Iron Condor':
         default: {
-          // Anchor Iron Condor short strikes directly to active Virgin CPR walls when present
-          const shortPutStrike = virginPutWall || (atm - step);
-          const wingPutStrike = shortPutStrike - step;
-          const shortCallStrike = virginCallWall || (atm + step);
-          const wingCallStrike = shortCallStrike + step;
+          // Anchor Iron Condor short strikes outside Camarilla H3/L3 at 0.16Δ–0.20Δ, protective wings outside H4/L4
+          const camL3Strike = computedCamarilla?.l3 ? Math.floor(computedCamarilla.l3 / strikeUnit) * strikeUnit : null;
+          const camL4Strike = computedCamarilla?.l4 ? Math.floor(computedCamarilla.l4 / strikeUnit) * strikeUnit : null;
+          const camH3Strike = computedCamarilla?.h3 ? Math.ceil(computedCamarilla.h3 / strikeUnit) * strikeUnit : null;
+          const camH4Strike = computedCamarilla?.h4 ? Math.ceil(computedCamarilla.h4 / strikeUnit) * strikeUnit : null;
+
+          const shortPutStrike = camL3Strike || virginPutWall || (atm - step * 2);
+          const wingPutStrike = camL4Strike || (shortPutStrike - step * 2);
+          const shortCallStrike = camH3Strike || virginCallWall || (atm + step * 2);
+          const wingCallStrike = camH4Strike || (shortCallStrike + step * 2);
 
           const pWingP = getPrem('PUT', wingPutStrike, false, true);
           const pShortP = getPrem('PUT', shortPutStrike, false, false);
@@ -2532,10 +2677,10 @@ export function useOptionsStrategyEngine({
               dte: dteVal,
               premiumEntry: pWingP,
               premiumCurrent: pWingP,
-              delta: -0.12,
-              gamma: 0.00004,
-              theta: -12.00,
-              vega: 11.50,
+              delta: -0.10,
+              gamma: 0.00003,
+              theta: -10.00,
+              vega: 9.50,
               iv: 53.2,
               contracts,
             },
@@ -2548,10 +2693,10 @@ export function useOptionsStrategyEngine({
               dte: dteVal,
               premiumEntry: pShortP,
               premiumCurrent: pShortP,
-              delta: 0.28,
-              gamma: -0.00009,
-              theta: 32.50,
-              vega: -24.00,
+              delta: 0.18,
+              gamma: -0.00007,
+              theta: 34.50,
+              vega: -22.00,
               iv: 51.0,
               contracts,
             },
@@ -2564,10 +2709,10 @@ export function useOptionsStrategyEngine({
               dte: dteVal,
               premiumEntry: pShortC,
               premiumCurrent: pShortC,
-              delta: -0.29,
-              gamma: -0.00009,
-              theta: 34.00,
-              vega: -25.00,
+              delta: -0.18,
+              gamma: -0.00007,
+              theta: 35.00,
+              vega: -22.50,
               iv: 48.5,
               contracts,
             },
@@ -2580,11 +2725,11 @@ export function useOptionsStrategyEngine({
               dte: dteVal,
               premiumEntry: pWingC,
               premiumCurrent: pWingC,
-              delta: 0.14,
-              gamma: 0.00005,
-              theta: -14.00,
-              vega: 13.00,
-              iv: 47.8,
+              delta: 0.10,
+              gamma: 0.00003,
+              theta: -10.50,
+              vega: 10.00,
+              iv: 48.0,
               contracts,
             },
           ];
@@ -2693,7 +2838,78 @@ export function useOptionsStrategyEngine({
 
   const [liveExchangeOptionLegs, setLiveExchangeOptionLegs] = useState<DeltaLiveOptionPnlLeg[]>([]);
   const [liveExchangeFeesAndCashflowsUsd, setLiveExchangeFeesAndCashflowsUsd] = useState<number>(0);
+  const [liveOptionTickers, setLiveOptionTickers] = useState<
+    Record<
+      string,
+      {
+        markPrice: number;
+        spotPrice?: number;
+        greeks?: { delta: number; gamma: number; theta: number; vega: number };
+        markVol?: number;
+        timestamp: number;
+      }
+    >
+  >({});
 
+  // Subscribe active option contract symbols on wss://socket.india.delta.exchange (v2/ticker)
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const symbolsSet = new Set<string>();
+    for (const p of liveOptionPositions) {
+      const sym = String(p.product_symbol || p.rawSymbol || p.symbol || '').trim().toUpperCase();
+      if (sym.startsWith('C-') || sym.startsWith('P-')) symbolsSet.add(sym);
+    }
+    for (const l of liveExchangeOptionLegs) {
+      const sym = String(l.product_symbol || l.symbol || '').trim().toUpperCase();
+      if (sym.startsWith('C-') || sym.startsWith('P-')) symbolsSet.add(sym);
+    }
+    for (const l of activePosition?.legs || []) {
+      const sym = String(l.symbol || '').trim().toUpperCase();
+      if (sym.startsWith('C-') || sym.startsWith('P-')) symbolsSet.add(sym);
+    }
+    const symbols = Array.from(symbolsSet);
+    if (symbols.length > 0) {
+      window.dispatchEvent(new CustomEvent('delta:ws-subscribe-options', { detail: { symbols } }));
+    }
+  }, [liveOptionPositions, liveExchangeOptionLegs, activePosition?.legs]);
+
+  // Listen to real-time option chain Greeks, IV & mark_price from wss://socket.india.delta.exchange
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const onOptionTicker = (e: Event) => {
+      const detail = (e as CustomEvent).detail;
+      if (!detail || !detail.symbol) return;
+      const sym = String(detail.symbol).trim().toUpperCase();
+      const mPx = Number(detail.markPrice ?? 0);
+      setLiveOptionTickers((prev) => ({
+        ...prev,
+        [sym]: {
+          markPrice: mPx > 0 ? mPx : prev[sym]?.markPrice || 0,
+          spotPrice: Number(detail.spotPrice || 0) > 0 ? Number(detail.spotPrice) : prev[sym]?.spotPrice,
+          greeks: detail.greeks
+            ? {
+                delta: Number(detail.greeks.delta ?? 0),
+                gamma: Number(detail.greeks.gamma ?? 0),
+                theta: Number(detail.greeks.theta ?? 0),
+                vega: Number(detail.greeks.vega ?? 0),
+              }
+            : prev[sym]?.greeks,
+          markVol:
+            detail.markVol !== undefined && Number.isFinite(Number(detail.markVol))
+              ? Number(detail.markVol)
+              : prev[sym]?.markVol,
+          timestamp: Number(detail.timestamp || Date.now()),
+        },
+      }));
+    };
+
+    window.addEventListener('delta:ws-option-ticker', onOptionTicker as EventListener);
+    return () => {
+      window.removeEventListener('delta:ws-option-ticker', onOptionTicker as EventListener);
+    };
+  }, []);
+
+  // Lightweight 5-second REST reconciliation alongside WebSocket streams
   useEffect(() => {
     if (tradingMode !== 'LIVE' || isLiveUnverified) {
       setLiveExchangeOptionLegs([]);
@@ -2707,45 +2923,98 @@ export function useOptionsStrategyEngine({
       const res = await fetchDeltaOptionsLivePnl(creds);
       if (isMounted && res.status === 'success') {
         const activeLegs = (Array.isArray(res.legs) ? res.legs : []).filter(
-          (l) => !isExpiredOptionRecord(l)
+          (l) => Math.abs(Number(l.size ?? l.contracts ?? 0)) > 0 && !isExpiredOptionRecord(l)
         );
         setLiveExchangeOptionLegs(activeLegs);
         setLiveExchangeFeesAndCashflowsUsd(Number(res.totalFeesAndCashflowsUsd ?? 0));
       }
     };
 
+    const onPositionsReconciled = (e: Event) => {
+      const detail = (e as CustomEvent).detail;
+      if (detail && Array.isArray(detail.positions)) {
+        const activeOpts = detail.positions.filter((p: any) => {
+          const sym = String(p?.product_symbol || p?.rawSymbol || p?.symbol || '').toUpperCase();
+          const isOpt =
+            p?.contract_type === 'call_options' ||
+            p?.contract_type === 'put_options' ||
+            sym.startsWith('C-') ||
+            sym.startsWith('P-');
+          return isOpt && Math.abs(Number(p?.size ?? p?.contracts ?? 0)) > 0 && !isExpiredOptionRecord(p);
+        });
+        if (activeOpts.length === 0) {
+          setLiveExchangeOptionLegs([]);
+          setLiveExchangeFeesAndCashflowsUsd(0);
+        }
+      }
+      pollLiveOptionsPnl();
+    };
+
+    const onWsResync = () => {
+      pollLiveOptionsPnl();
+    };
+
     pollLiveOptionsPnl();
-    const pollIntervalMs = activePosition?.status === 'ACTIVE' ? 1500 : 4000;
-    const timer = setInterval(pollLiveOptionsPnl, pollIntervalMs);
+    const timer = setInterval(pollLiveOptionsPnl, 5000);
+    if (typeof window !== 'undefined') {
+      window.addEventListener('delta:positions-reconciled', onPositionsReconciled as EventListener);
+      window.addEventListener('delta:position-mismatch-detected', onWsResync);
+      window.addEventListener('delta:ws-reconnected-resync', onWsResync);
+      window.addEventListener('delta:ws-positions', onWsResync);
+    }
     return () => {
       isMounted = false;
       clearInterval(timer);
+      if (typeof window !== 'undefined') {
+        window.removeEventListener('delta:positions-reconciled', onPositionsReconciled as EventListener);
+        window.removeEventListener('delta:position-mismatch-detected', onWsResync);
+        window.removeEventListener('delta:ws-reconnected-resync', onWsResync);
+        window.removeEventListener('delta:ws-positions', onWsResync);
+      }
     };
-  }, [tradingMode, isLiveUnverified, activePosition?.status]);
+  }, [tradingMode, isLiveUnverified]);
 
   useEffect(() => {
     if (isLiveUnverified) return;
 
-    // Prefer direct /api/delta/options/live-pnl feed; fall back to PortfolioContext liveOptionPositions (/api/delta/positions)
+    // If PortfolioContext reconciled 0 option positions AND liveExchangeOptionLegs is empty,
+    // or if PortfolioContext authoritative positions dropped an option leg, reconcile strictly against live exchange state
+    const authoritativeOptSymbols = new Set(
+      liveOptionPositions.map((p) =>
+        String(p.product_symbol || p.rawSymbol || p.symbol || '').trim().toUpperCase()
+      )
+    );
+    const filteredExchangeLegs =
+      liveOptionPositions.length === 0 && exchangeSyncReady
+        ? liveExchangeOptionLegs.filter((l) => Math.abs(Number(l.size ?? l.contracts ?? 0)) > 0)
+        : liveExchangeOptionLegs.filter((l) => {
+            const sym = String(l.product_symbol || l.symbol || '').trim().toUpperCase();
+            return authoritativeOptSymbols.size === 0 || authoritativeOptSymbols.has(sym);
+          });
+
     const rawExchangeSourceLegs =
-      liveExchangeOptionLegs.length > 0
-        ? liveExchangeOptionLegs
+      filteredExchangeLegs.length > 0
+        ? filteredExchangeLegs
         : liveOptionPositions.map((p) => {
             const sym = String(p.product_symbol || p.rawSymbol || p.symbol || '').trim().toUpperCase();
             const isShort = p.side === 'SHORT' || Number(p.signedSize ?? p.size ?? 0) < 0;
             const contractsCount = Math.max(1, Math.round(Math.abs(p.contracts || p.size || 1)));
             const signedLots = isShort ? -contractsCount : contractsCount;
             const entryPx = Number(p.entry_price ?? p.entryPrice ?? 0);
-            const markPx = Number(p.mark_price ?? p.markPrice ?? entryPx);
+            const wsTick = liveOptionTickers[sym];
+            const markPx =
+              wsTick && wsTick.markPrice > 0
+                ? wsTick.markPrice
+                : Number(p.mark_price ?? p.markPrice ?? entryPx);
             const cVal = Number(p.contractValue || (sym.includes('BTC') ? 0.001 : sym.includes('ETH') ? 0.01 : 1));
             const signedSizeBtc = +(signedLots * cVal).toFixed(6);
             const uPnlUsd =
-              typeof p.unrealized_pnl === 'number' && Number.isFinite(p.unrealized_pnl) && p.unrealized_pnl !== 0
-                ? Number(p.unrealized_pnl)
-                : typeof p.unrealisedPnl === 'number' && Number.isFinite(p.unrealisedPnl) && p.unrealisedPnl !== 0
-                ? Number(p.unrealisedPnl)
-                : entryPx > 0 && markPx > 0
+              entryPx > 0 && markPx > 0
                 ? +((markPx - entryPx) * signedSizeBtc).toFixed(6)
+                : typeof p.unrealized_pnl === 'number' && Number.isFinite(p.unrealized_pnl)
+                ? Number(p.unrealized_pnl)
+                : typeof p.unrealisedPnl === 'number' && Number.isFinite(p.unrealisedPnl)
+                ? Number(p.unrealisedPnl)
                 : 0;
             return {
               product_id: Number(p.product_id || (Number.isFinite(Number(p.id)) ? Number(p.id) : 0)),
@@ -2759,7 +3028,7 @@ export function useOptionsStrategyEngine({
               contract_value: cVal,
               entry_price: entryPx,
               mark_price: markPx,
-              spot_price: (p as any).spot_price,
+              spot_price: wsTick?.spotPrice || (p as any).spot_price,
               unrealized_pnl: uPnlUsd,
               unrealized_pnl_inr: Number(p.unrealized_pnl_inr ?? +(uPnlUsd * (usdInrRate || 85)).toFixed(2)),
               realized_cashflow: Number(p.realized_cashflow ?? 0),
@@ -2776,6 +3045,7 @@ export function useOptionsStrategyEngine({
           });
 
     const exchangeSourceLegs = rawExchangeSourceLegs.filter((ex) => {
+      if (Math.abs(Number(ex.size ?? ex.contracts ?? 0)) <= 0) return false;
       if (isExpiredOptionRecord(ex)) return false;
       const sym = String(ex.product_symbol || ex.symbol || '').trim().toUpperCase();
       const action: 'BUY' | 'SELL' = ex.side === 'SHORT' || Number(ex.size) < 0 ? 'SELL' : 'BUY';
@@ -2786,7 +3056,22 @@ export function useOptionsStrategyEngine({
       return true;
     });
 
+    // Instant Mismatch Purge: When Delta Exchange India reports 0 open option legs, purge activePosition immediately
     if (exchangeSourceLegs.length === 0) {
+      if (tradingMode === 'LIVE' && exchangeSyncReady && activePosition && activePosition.status === 'ACTIVE') {
+        console.warn(
+          `[DeltaAI Options Mismatch] Delta Exchange reported 0 open option contracts while Options Lab held "${activePosition.strategyName}". Purging immediately.`
+        );
+        const archived = archiveAndClearOptionsPosition(
+          activePosition,
+          'CLOSED_EXCHANGE_SYNC',
+          'Delta Exchange India reported 0 open option contracts — purged immediately'
+        );
+        if (!archived) {
+          setActivePosition(null);
+          setOptionsPnl(0, cumulativeRealisedPnlRef.current);
+        }
+      }
       return;
     }
 
@@ -2822,24 +3107,25 @@ export function useOptionsStrategyEngine({
         dteVal = Math.max(0, Math.ceil((legExpiryUtcMs - Date.now()) / (1000 * 60 * 60 * 24)));
       }
 
+      const wsTick = liveOptionTickers[rawSym];
       const exchEntry = Number(ex.entry_price ?? 0);
-      const exchMark = Number(ex.mark_price ?? exchEntry);
+      const exchMark =
+        wsTick && wsTick.markPrice > 0
+          ? wsTick.markPrice
+          : Number(ex.mark_price ?? exchEntry);
       const contractsCount = Math.max(1, Math.round(Math.abs(ex.contracts || ex.size || 1)));
       const cVal = Number(ex.contract_value || (rawSym.includes('BTC') ? 0.001 : rawSym.includes('ETH') ? 0.01 : 1));
       const signedLots = action === 'SELL' ? -contractsCount : contractsCount;
       const signedSizeBtc = +(signedLots * cVal).toFixed(6);
-      // Exact Delta Exchange Pure UPNL Formula:
+      // Exact Delta Exchange Pure UPNL Formula recalculated on every live WebSocket mark tick:
       // legUnrealizedPnlUsd = (markPrice - entryPrice) * signedSizeBtc
       const exchUpnl =
-        typeof ex.unrealized_pnl === 'number' && Number.isFinite(ex.unrealized_pnl) && ex.unrealized_pnl !== 0
-          ? +Number(ex.unrealized_pnl).toFixed(6)
-          : exchEntry > 0 && exchMark > 0
+        exchEntry > 0 && exchMark > 0
           ? +((exchMark - exchEntry) * signedSizeBtc).toFixed(6)
+          : typeof ex.unrealized_pnl === 'number' && Number.isFinite(ex.unrealized_pnl)
+          ? +Number(ex.unrealized_pnl).toFixed(6)
           : 0;
-      const exchUpnlInr =
-        typeof (ex as any).unrealized_pnl_inr === 'number' && Number.isFinite((ex as any).unrealized_pnl_inr) && (ex as any).unrealized_pnl_inr !== 0
-          ? +Number((ex as any).unrealized_pnl_inr).toFixed(2)
-          : +(exchUpnl * fxRate).toFixed(2);
+      const exchUpnlInr = +(exchUpnl * fxRate).toFixed(2);
       const legMarginUsd = Number(ex.margin || 0);
 
       const defaultTp =
@@ -2851,10 +3137,33 @@ export function useOptionsStrategyEngine({
           ? +(Math.max(0.1, exchEntry * 0.70)).toFixed(2)
           : +(exchEntry * 1.30).toFixed(2);
 
+      // Authoritative Delta Exchange WebSocket Greeks & IV (signed by BUY=+1 / SELL=-1)
+      const signMultiplier = action === 'BUY' ? 1 : -1;
+      const rawWsGreeks = wsTick?.greeks || (ex as any)?.greeks;
       const baseDelta = optType === 'CALL' ? 0.28 : -0.28;
-      const signedDelta = +(action === 'BUY' ? baseDelta : -baseDelta).toFixed(2);
-      const signedTheta = +(action === 'SELL' ? 14.5 : -11.2).toFixed(2);
-      const signedVega = +(action === 'BUY' ? 12.4 : -12.4).toFixed(2);
+      const resolvedDelta =
+        rawWsGreeks && Number.isFinite(Number(rawWsGreeks.delta))
+          ? +(Number(rawWsGreeks.delta) * signMultiplier).toFixed(3)
+          : +(action === 'BUY' ? baseDelta : -baseDelta).toFixed(2);
+      const resolvedGamma =
+        rawWsGreeks && Number.isFinite(Number(rawWsGreeks.gamma))
+          ? +(Number(rawWsGreeks.gamma) * signMultiplier).toFixed(5)
+          : action === 'BUY'
+          ? 0.00006
+          : -0.00006;
+      const resolvedTheta =
+        rawWsGreeks && Number.isFinite(Number(rawWsGreeks.theta))
+          ? +(Number(rawWsGreeks.theta) * signMultiplier).toFixed(2)
+          : +(action === 'SELL' ? 14.5 : -11.2).toFixed(2);
+      const resolvedVega =
+        rawWsGreeks && Number.isFinite(Number(rawWsGreeks.vega))
+          ? +(Number(rawWsGreeks.vega) * signMultiplier).toFixed(2)
+          : +(action === 'BUY' ? 12.4 : -12.4).toFixed(2);
+      const rawIvVal = wsTick?.markVol ?? Number((ex as any)?.mark_vol ?? (ex as any)?.iv ?? 0);
+      const resolvedIv =
+        Number.isFinite(rawIvVal) && rawIvVal > 0
+          ? +(rawIvVal <= 5 ? rawIvVal * 100 : rawIvVal).toFixed(1)
+          : 49.8;
 
       return {
         id: `live-leg-${idx + 1}`,
@@ -2873,11 +3182,11 @@ export function useOptionsStrategyEngine({
         takeProfitPremium: defaultTp,
         stopLossPremium: defaultSl,
         tpSlStatus: isMultiLegBasket ? 'UNIFIED_BASKET' : 'ARMED_EXCHANGE',
-        delta: signedDelta,
-        gamma: action === 'BUY' ? 0.00006 : -0.00006,
-        theta: signedTheta,
-        vega: signedVega,
-        iv: 49.8,
+        delta: resolvedDelta,
+        gamma: resolvedGamma,
+        theta: resolvedTheta,
+        vega: resolvedVega,
+        iv: resolvedIv,
         contracts: contractsCount,
         contractValue: cVal,
         signedSizeBtc,
@@ -2937,7 +3246,7 @@ export function useOptionsStrategyEngine({
       ALL_OPTION_STRATEGIES.find((s) => s.name === inferredStrategy) || ALL_OPTION_STRATEGIES[0];
 
     setActivePosition((prev) => {
-      // Preserve verified execution metadata (orderId, tpOrderId, slOrderId, id) when syncing 3s exchange updates
+      // Preserve verified execution metadata (orderId, tpOrderId, slOrderId, id) when syncing exchange updates
       const syncedLegs: OptionLeg[] = hydratedLegs.map((hl) => {
         const matchedPrev = prev?.legs?.find(
           (pl) =>
@@ -2960,8 +3269,10 @@ export function useOptionsStrategyEngine({
         syncedLegs.length > 0
           ? syncedLegs.reduce((sum, l) => sum + (l.strike || 0), 0) / syncedLegs.length
           : 64620;
+      const firstLegSym = syncedLegs[0]?.symbol || '';
       const rawExchangeSpot = Number(
-        (exchangeSourceLegs[0] as any)?.spot_price ??
+        liveOptionTickers[firstLegSym]?.spotPrice ??
+          (exchangeSourceLegs[0] as any)?.spot_price ??
           (liveOptionPositions[0] as any)?.spot_price ??
           markPrice
       );
@@ -3006,7 +3317,7 @@ export function useOptionsStrategyEngine({
 
       const nextResolvedId = prev?.id || `live-hydrated-${syncedLegs.map((l) => l.symbol).join('-')}`;
       const nextFeesAndCashflows =
-        liveExchangeOptionLegs.length > 0 && liveExchangeFeesAndCashflowsUsd !== 0
+        filteredExchangeLegs.length > 0 && liveExchangeFeesAndCashflowsUsd !== 0
           ? liveExchangeFeesAndCashflowsUsd
           : exactTotalFeesAndCashflowsUsd;
       const nextExpiryTimestampUtc = (() => {
@@ -3032,7 +3343,9 @@ export function useOptionsStrategyEngine({
             pl.markPremium === syncedLegs[idx].markPremium &&
             pl.entryPremium === syncedLegs[idx].entryPremium &&
             pl.contracts === syncedLegs[idx].contracts &&
-            pl.pnlUsd === syncedLegs[idx].pnlUsd
+            pl.pnlUsd === syncedLegs[idx].pnlUsd &&
+            pl.delta === syncedLegs[idx].delta &&
+            pl.iv === syncedLegs[idx].iv
         )
       ) {
         return prev;
@@ -3070,12 +3383,13 @@ export function useOptionsStrategyEngine({
         expiryTimestampUtc: nextExpiryTimestampUtc,
         status: 'ACTIVE',
         exitMode: isMultiLegBasket ? 'UNIFIED_BASKET' : 'SINGLE_LEG_TP_SL',
-        aiVerdict: `LIVE DELTA EXCHANGE INDIA SINGLE-SOURCE FEED (${syncedLegs.length} LEG${syncedLegs.length === 1 ? '' : 'S'}: ${syncedLegs.map((l) => `${l.action} ${l.contracts}x ${l.symbol}`).join(' · ')}). ${isMultiLegBasket ? 'UNIFIED BASKET EXIT MONITOR (TP1 25% / TP2 50% / TP3 65% · SL -50%).' : 'EXACT EXCHANGE MARK & UPNL SYNCED EVERY 3s.'}`,
+        aiVerdict: `LIVE DELTA EXCHANGE INDIA SINGLE-SOURCE FEED (${syncedLegs.length} LEG${syncedLegs.length === 1 ? '' : 'S'}: ${syncedLegs.map((l) => `${l.action} ${l.contracts}x ${l.symbol}`).join(' · ')}). ${isMultiLegBasket ? 'UNIFIED BASKET EXIT MONITOR (TP1 25% / TP2 50% / TP3 65% · SL -50%).' : 'WEBSOCKET REAL-TIME MARK, GREEKS & 5s RECONCILIATION.'}`,
       };
     });
   }, [
     liveExchangeOptionLegs,
     liveOptionPositions,
+    liveOptionTickers,
     isLiveUnverified,
     usdInrRate,
     markPrice,
@@ -3087,6 +3401,11 @@ export function useOptionsStrategyEngine({
     marginMode,
     calculateGreeksSummary,
     liveExchangeFeesAndCashflowsUsd,
+    tradingMode,
+    exchangeSyncReady,
+    activePosition,
+    archiveAndClearOptionsPosition,
+    setOptionsPnl,
   ]);
 
   // ═══════════════════════════════════════════════════════════
@@ -5095,5 +5414,8 @@ export function useOptionsStrategyEngine({
     estimatedNetDebitUsd,
     utcDayTradesCount,
     postSlCooldownBarsRemaining,
+    institutionalSniperResult,
+    isHardNoTradeBlocked,
+    hardNoTradeReasons,
   };
 }

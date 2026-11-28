@@ -7,6 +7,20 @@
 
 import { OptionLeg, OptionStrategyName, Position, MarketTicker } from '../types';
 import { authFetch } from './firebaseClient';
+import { parseOptionSymbolExpiryUtcMs } from '../utils/optionsExpiryUtils';
+
+export function isExpiredOptionPosition(p: any): boolean {
+  if (!p) return false;
+  const sym = String(p.product_symbol || p.rawSymbol || p.symbol || '').toUpperCase();
+  const ctype = String(p.contract_type || '').toLowerCase();
+  const isOpt = ctype === 'call_options' || ctype === 'put_options' || sym.startsWith('C-') || sym.startsWith('P-');
+  if (!isOpt) return false;
+  const expiryMs =
+    typeof p.expiryTimestampUtc === 'number'
+      ? p.expiryTimestampUtc
+      : parseOptionSymbolExpiryUtcMs(sym);
+  return expiryMs !== null && Date.now() >= expiryMs;
+}
 
 export interface DeltaLiveMarketStructure {
   spotPrice: number;
@@ -519,48 +533,48 @@ export interface DeltaLivePositionsResponse {
   positions: Position[];
 }
 
+let inMemoryDeltaCredentials: StoredDeltaCredentials | null = null;
+let hasPurgedLegacyCredStorage = false;
+
 export function getStoredDeltaCredentials(): StoredDeltaCredentials | null {
-  if (typeof window === 'undefined') return null;
-  try {
-    const raw = window.localStorage.getItem(DELTA_LIVE_CREDENTIALS_STORAGE_KEY);
-    if (!raw) return null;
-    const parsed = JSON.parse(raw);
-    if (
-      parsed &&
-      typeof parsed.apiKey === 'string' &&
-      parsed.apiKey.trim().length >= 8 &&
-      typeof parsed.apiSecret === 'string' &&
-      parsed.apiSecret.trim().length >= 8
-    ) {
-      return {
-        apiKey: parsed.apiKey.trim(),
-        apiSecret: parsed.apiSecret.trim(),
-        environment: parsed.environment === 'TESTNET' ? 'TESTNET' : 'PROD',
-        isVerified: Boolean(parsed.isVerified),
-        verifiedAt: parsed.verifiedAt,
-      };
+  if (typeof window !== 'undefined' && !hasPurgedLegacyCredStorage) {
+    hasPurgedLegacyCredStorage = true;
+    try {
+      // Strictly purge any legacy credential keys from localStorage (never hydrate credentials from localStorage)
+      window.localStorage.removeItem(DELTA_LIVE_CREDENTIALS_STORAGE_KEY);
+      window.localStorage.removeItem('delta_api_credentials');
+      window.localStorage.removeItem('delta_api_credentials_v1');
+      window.localStorage.removeItem('delta_live_gate_unlocked');
+    } catch {
+      // Ignore storage access errors
     }
-  } catch {
-    // Ignore storage read errors
   }
-  return null;
+  return inMemoryDeltaCredentials;
 }
 
 export function saveStoredDeltaCredentials(creds: StoredDeltaCredentials): void {
-  if (typeof window === 'undefined') return;
-  try {
-    window.localStorage.setItem(DELTA_LIVE_CREDENTIALS_STORAGE_KEY, JSON.stringify(creds));
-  } catch {
-    // Ignore storage write errors
+  inMemoryDeltaCredentials = {
+    apiKey: String(creds.apiKey || '').trim(),
+    apiSecret: String(creds.apiSecret || '').trim(),
+    environment: creds.environment === 'TESTNET' ? 'TESTNET' : 'PROD',
+    isVerified: Boolean(creds.isVerified),
+    verifiedAt: creds.verifiedAt,
+  };
+  if (typeof window !== 'undefined') {
+    try {
+      window.localStorage.removeItem(DELTA_LIVE_CREDENTIALS_STORAGE_KEY);
+      window.localStorage.removeItem('delta_api_credentials');
+    } catch {}
   }
 }
 
 export function clearStoredDeltaCredentials(): void {
-  if (typeof window === 'undefined') return;
-  try {
-    window.localStorage.removeItem(DELTA_LIVE_CREDENTIALS_STORAGE_KEY);
-  } catch {
-    // Ignore storage remove errors
+  inMemoryDeltaCredentials = null;
+  if (typeof window !== 'undefined') {
+    try {
+      window.localStorage.removeItem(DELTA_LIVE_CREDENTIALS_STORAGE_KEY);
+      window.localStorage.removeItem('delta_api_credentials');
+    } catch {}
   }
 }
 
@@ -644,13 +658,14 @@ export async function fetchDeltaLiveWallet(
 ): Promise<DeltaLiveWalletResponse> {
   const headers: Record<string, string> = {
     Accept: 'application/json',
-    'Cache-Control': 'no-cache, no-store, must-revalidate',
+    'Cache-Control': 'no-cache, no-store, must-revalidate, proxy-revalidate',
     Pragma: 'no-cache',
+    Expires: '0',
     ...buildDeltaCredentialHeaders(creds),
   };
 
   try {
-    const res = await authFetch(`/api/delta/wallet?_t=${Date.now()}`, {
+    const res = await authFetch('/api/delta/wallet', {
       method: 'GET',
       headers,
       cache: 'no-store',
@@ -744,19 +759,24 @@ export async function fetchDeltaLivePositions(
 ): Promise<DeltaLivePositionsResponse> {
   const headers: Record<string, string> = {
     Accept: 'application/json',
-    'Cache-Control': 'no-cache, no-store, must-revalidate',
+    'Cache-Control': 'no-cache, no-store, must-revalidate, proxy-revalidate',
     Pragma: 'no-cache',
+    Expires: '0',
     ...buildDeltaCredentialHeaders(creds),
   };
 
-  const res = await authFetch(`/api/delta/positions?_t=${Date.now()}`, {
+  const res = await authFetch('/api/delta/positions', {
     method: 'GET',
     headers,
     cache: 'no-store',
   });
 
   const data = await res.json();
-  const positionsList: Position[] = Array.isArray(data?.positions) ? data.positions : [];
+  const rawList: Position[] = Array.isArray(data?.positions) ? data.positions : [];
+  const positionsList: Position[] = rawList.filter((p: any) => {
+    const sz = Number(p?.size ?? p?.contracts ?? 0);
+    return Number.isFinite(sz) && Math.abs(sz) > 0 && !isExpiredOptionPosition(p);
+  });
   const computedOptionLegsCount =
     typeof data?.optionLegsCount === 'number'
       ? data.optionLegsCount
@@ -782,6 +802,160 @@ export async function fetchDeltaLivePositions(
 }
 
 export const fetchLivePositions = fetchDeltaLivePositions;
+
+/**
+ * Direct query to Delta Exchange /v2/positions/margined with cache: 'no-store'
+ * Does NOT alter the signed URL path or query string so Delta Exchange HMAC signatures remain valid.
+ */
+export async function fetchDeltaPositionsMargined(
+  creds?: DeltaCredentialsInput | null
+): Promise<any> {
+  const path = '/v2/positions/margined';
+  const headers: Record<string, string> = {
+    Accept: 'application/json',
+    'Cache-Control': 'no-cache, no-store, must-revalidate, proxy-revalidate',
+    Pragma: 'no-cache',
+    Expires: '0',
+    ...buildDeltaCredentialHeaders(creds),
+  };
+
+  const res = await authFetch(path, {
+    method: 'GET',
+    headers,
+    cache: 'no-store',
+  });
+  return res.json().catch(() => null);
+}
+
+/**
+ * Direct query to Delta Exchange /v2/orders with cache: 'no-store'
+ * Does NOT alter the signed URL path or query string so Delta Exchange HMAC signatures remain valid.
+ */
+export async function fetchDeltaOrders(
+  creds?: DeltaCredentialsInput | null,
+  queryString?: string
+): Promise<any> {
+  const path = queryString ? `/v2/orders?${queryString}` : '/v2/orders';
+  const headers: Record<string, string> = {
+    Accept: 'application/json',
+    'Cache-Control': 'no-cache, no-store, must-revalidate, proxy-revalidate',
+    Pragma: 'no-cache',
+    Expires: '0',
+    ...buildDeltaCredentialHeaders(creds),
+  };
+
+  const res = await authFetch(path, {
+    method: 'GET',
+    headers,
+    cache: 'no-store',
+  });
+  return res.json().catch(() => null);
+}
+
+/**
+ * Direct query to Delta Exchange /v2/fills with cache: 'no-store'
+ * Does NOT alter the signed URL path or query string so Delta Exchange HMAC signatures remain valid.
+ */
+export async function fetchDeltaFills(
+  creds?: DeltaCredentialsInput | null,
+  queryString?: string
+): Promise<any> {
+  const path = queryString ? `/v2/fills?${queryString}` : '/v2/fills';
+  const headers: Record<string, string> = {
+    Accept: 'application/json',
+    'Cache-Control': 'no-cache, no-store, must-revalidate, proxy-revalidate',
+    Pragma: 'no-cache',
+    Expires: '0',
+    ...buildDeltaCredentialHeaders(creds),
+  };
+
+  const res = await authFetch(path, {
+    method: 'GET',
+    headers,
+    cache: 'no-store',
+  });
+  return res.json().catch(() => null);
+}
+
+/**
+ * Direct query to Delta Exchange /v2/wallet/balances with cache: 'no-store'
+ * Does NOT alter the signed URL path or query string so Delta Exchange HMAC signatures remain valid.
+ */
+export async function fetchDeltaWalletBalances(
+  creds?: DeltaCredentialsInput | null
+): Promise<any> {
+  const path = '/v2/wallet/balances';
+  const headers: Record<string, string> = {
+    Accept: 'application/json',
+    'Cache-Control': 'no-cache, no-store, must-revalidate, proxy-revalidate',
+    Pragma: 'no-cache',
+    Expires: '0',
+    ...buildDeltaCredentialHeaders(creds),
+  };
+
+  const res = await authFetch(path, {
+    method: 'GET',
+    headers,
+    cache: 'no-store',
+  });
+  return res.json().catch(() => null);
+}
+
+export interface DeltaAuthoritativeResyncPayload {
+  success: boolean;
+  authenticated: boolean;
+  positions: Position[];
+  openOrders: any[];
+  fills: any[];
+  wallet: any | null;
+  usdInrRate?: number;
+  diagnosticError?: DeltaWalletDiagnosticError | null;
+  timestamp: number;
+}
+
+/**
+ * Full authoritative stateless REST resync across:
+ * /v2/positions/margined, /v2/orders?state=open, /v2/fills, and /v2/wallet/balances
+ */
+export async function fetchDeltaAuthoritativeResync(
+  creds?: DeltaCredentialsInput | null
+): Promise<DeltaAuthoritativeResyncPayload | null> {
+  const headers: Record<string, string> = {
+    Accept: 'application/json',
+    'Cache-Control': 'no-store, no-cache, must-revalidate',
+    Pragma: 'no-cache',
+    Expires: '0',
+    ...buildDeltaCredentialHeaders(creds),
+  };
+
+  try {
+    const res = await authFetch('/api/delta/resync-all', {
+      method: 'GET',
+      headers,
+      cache: 'no-store',
+    });
+    const data = await res.json().catch(() => null);
+    if (!data) return null;
+    const rawPositions: Position[] = Array.isArray(data.positions) ? data.positions : [];
+    const activePositions = rawPositions.filter((p: any) => {
+      const sz = Number(p?.size ?? p?.contracts ?? 0);
+      return Number.isFinite(sz) && Math.abs(sz) > 0 && !isExpiredOptionPosition(p);
+    });
+    return {
+      success: Boolean(data.success),
+      authenticated: Boolean(data.authenticated),
+      positions: activePositions,
+      openOrders: Array.isArray(data.openOrders) ? data.openOrders : [],
+      fills: Array.isArray(data.fills) ? data.fills : [],
+      wallet: data.wallet || null,
+      usdInrRate: typeof data.usdInrRate === 'number' ? data.usdInrRate : undefined,
+      diagnosticError: data.diagnosticError || null,
+      timestamp: data.timestamp || Date.now(),
+    };
+  } catch {
+    return null;
+  }
+}
 
 export async function fetchDeltaLiveWalletAndPositions(
   creds?: { apiKey?: string; apiSecret?: string; environment?: 'PROD' | 'TESTNET' } | null
@@ -994,7 +1168,16 @@ export async function resolveDeltaOptionProduct(params: {
     if (params.symbol) {
       qs.set('symbol', params.symbol);
     }
-    const res = await fetch(`/api/delta/products?${qs.toString()}`);
+    const res = await fetch(`/api/delta/products?${qs.toString()}`, {
+      method: 'GET',
+      headers: {
+        Accept: 'application/json',
+        'Cache-Control': 'no-cache, no-store, must-revalidate, proxy-revalidate',
+        Pragma: 'no-cache',
+        Expires: '0',
+      },
+      cache: 'no-store',
+    });
     if (res.ok) {
       const json = await res.json();
       if (json?.status === 'success' && json?.product?.symbol) {
@@ -1057,10 +1240,14 @@ export async function submitDeltaOrder(
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
+        'Cache-Control': 'no-cache, no-store, must-revalidate, proxy-revalidate',
+        Pragma: 'no-cache',
+        Expires: '0',
         'x-delta-live-unlocked': 'true',
         ...(mode === 'LIVE' ? buildDeltaCredentialHeaders(creds) : {}),
         ...(sessionToken ? { Authorization: `Bearer ${sessionToken}` } : {}),
       },
+      cache: 'no-store',
       body: JSON.stringify(payload),
     });
 
@@ -1461,6 +1648,142 @@ export async function closeDeltaOptionsBasket(
       closedLongsCount: 0,
       results: [],
       error: err?.message || 'Network error calling /api/delta/options/close-basket',
+    };
+  }
+}
+
+export interface ReconcileDeltaClosedPositionPayload {
+  symbol: string;
+  productId?: number;
+  entryPrice?: number;
+  openedAt?: number;
+  fallbackPnlUsd?: number;
+  side?: 'LONG' | 'SHORT';
+  size?: number;
+  cancelOpenBrackets?: boolean;
+}
+
+export interface ReconcileDeltaClosedPositionResponse {
+  success: boolean;
+  closedTrade?: any;
+  cancelledBracketOrders?: boolean;
+  message?: string;
+  error?: string;
+}
+
+export async function reconcileDeltaClosedPosition(
+  payload: ReconcileDeltaClosedPositionPayload,
+  creds?: DeltaCredentialsInput | null
+): Promise<ReconcileDeltaClosedPositionResponse> {
+  try {
+    const res = await authFetch(`/api/delta/reconcile-closed-position?_t=${Date.now()}`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...buildDeltaCredentialHeaders(creds),
+      },
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json().catch(() => ({}));
+    return {
+      success: Boolean(res.ok && data?.success),
+      closedTrade: data?.closedTrade,
+      cancelledBracketOrders: Boolean(data?.cancelledBracketOrders),
+      message: data?.message,
+      error: data?.error,
+    };
+  } catch (err: any) {
+    return {
+      success: false,
+      error: err?.message || 'Network error reconciling closed position',
+    };
+  }
+}
+
+export async function purgeDeltaStalePositionsOnServer(
+  symbol?: string
+): Promise<{ success: boolean; message?: string; error?: string }> {
+  try {
+    const res = await authFetch(`/api/delta/purge-stale-positions?_t=${Date.now()}`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ symbol }),
+    });
+    const data = await res.json().catch(() => ({}));
+    return {
+      success: Boolean(res.ok && data?.success),
+      message: data?.message,
+      error: data?.error,
+    };
+  } catch (err: any) {
+    return {
+      success: false,
+      error: err?.message || 'Failed to purge stale positions on server',
+    };
+  }
+}
+
+export async function closeDeltaPosition(
+  positionId: string,
+  opts?: {
+    reason?: string;
+    exitPrice?: number;
+    realisedPnl?: number;
+    partialSize?: number;
+    sessionToken?: string | null;
+  }
+): Promise<{ success: boolean; alreadyClosed?: boolean; message?: string; error?: string }> {
+  try {
+    const res = await fetch('/api/delta/close-position', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(opts?.sessionToken ? { Authorization: `Bearer ${opts.sessionToken}` } : {}),
+      },
+      body: JSON.stringify({
+        positionId,
+        reason: opts?.reason || 'User Manual Close',
+        exitPrice: opts?.exitPrice,
+        realisedPnl: opts?.realisedPnl,
+        partialSize: opts?.partialSize,
+      }),
+    });
+    const data = await res.json().catch(() => ({}));
+    const rawErrorMsg = String(data.error || data.message || '').toLowerCase();
+    const isAlreadyClosed =
+      Boolean(data.alreadyClosed) ||
+      rawErrorMsg.includes('already closed') ||
+      rawErrorMsg.includes('no_open_position') ||
+      rawErrorMsg.includes('not found') ||
+      rawErrorMsg.includes('size is 0') ||
+      rawErrorMsg.includes('size === 0') ||
+      rawErrorMsg.includes('inactive');
+
+    if (isAlreadyClosed) {
+      return {
+        success: true,
+        alreadyClosed: true,
+        message: data.message || 'Position is already closed on Delta Exchange.',
+      };
+    }
+
+    if (!res.ok) {
+      return {
+        success: false,
+        error: data.error || `HTTP ${res.status}: Failed to close position.`,
+      };
+    }
+
+    return {
+      success: true,
+      message: data.message || 'Position closed successfully.',
+    };
+  } catch (err: any) {
+    return {
+      success: false,
+      error: err?.message || 'Network error closing position.',
     };
   }
 }

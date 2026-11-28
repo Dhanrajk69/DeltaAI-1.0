@@ -1364,11 +1364,11 @@ export const ProDeskTerminal: React.FC<ProDeskTerminalProps> = ({
                               </td>
                               <td className="py-1.5 px-2 text-[10px]">
                                 <span className="text-rose-300">
-                                  {pos.stopLoss ? `$${Number(pos.stopLoss).toFixed(0)}` : '—'}
+                                  {pos.stopLoss ? `$${Number(pos.stopLoss).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : '—'}
                                 </span>
                                 <span className="text-slate-600 mx-1">/</span>
                                 <span className="text-emerald-300">
-                                  {pos.takeProfit ? `$${Number(pos.takeProfit).toFixed(0)}` : '—'}
+                                  {pos.takeProfit ? `$${Number(pos.takeProfit).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : '—'}
                                 </span>
                               </td>
                               <td
@@ -1396,7 +1396,7 @@ export const ProDeskTerminal: React.FC<ProDeskTerminalProps> = ({
                                 </button>
                                 <button
                                   type="button"
-                                  onClick={() => onClosePosition(pos.symbol)}
+                                  onClick={() => onClosePosition(pos.id || pos.symbol)}
                                   className="px-2 py-0.5 rounded bg-rose-500/20 hover:bg-rose-500/30 border border-rose-500/40 text-rose-200 text-[10px] font-bold cursor-pointer"
                                 >
                                   Close

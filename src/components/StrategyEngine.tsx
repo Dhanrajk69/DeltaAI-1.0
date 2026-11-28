@@ -1,6 +1,6 @@
 import React, { useState, useCallback, useMemo, useEffect, useRef } from 'react';
 import { MarketTicker, TradingMode, AiAnalysisResult, SniperSignal, SniperExposureMode, Position } from '../types';
-import { Cpu, Crosshair, Sliders, Layers, ArrowUpRight, ShieldCheck, Terminal, X, Zap, ShieldAlert, ChevronDown, Activity, Sparkles } from 'lucide-react';
+import { Cpu, Crosshair, Sliders, Layers, ArrowUpRight, ShieldCheck, Terminal, X, Zap, ShieldAlert, ChevronDown, Activity, Sparkles, Share2, Check } from 'lucide-react';
 import { CamarillaSniperHub } from './CamarillaSniperHub';
 import { useSniperScalpingEngine } from '../hooks/useSniperScalpingEngine';
 import { OptionsStrategyEngine } from './OptionsStrategyEngine';
@@ -132,6 +132,7 @@ const StrategyEngineInner: React.FC<StrategyEngineProps & { baseSniper: any }> =
     message: string;
     timestamp: number;
   } | null>(null);
+  const [isSignalCopied, setIsSignalCopied] = useState<boolean>(false);
 
   const { latestDispatchedSignal, clearLatestDispatchedSignal, getCooldownRemaining } = useTradingIntelligence();
   const {
@@ -752,6 +753,63 @@ const StrategyEngineInner: React.FC<StrategyEngineProps & { baseSniper: any }> =
     onSendNotification,
   ]);
 
+  const handleShareSignal = useCallback(async () => {
+    const sig = camarillaSniperSignal;
+    const symbol = sig.symbol || selectedAsset;
+    const dir = sig.signal;
+    const scoreVal = sig.setupScore16 ?? (sig.confidence >= 90 ? 15 : sig.confidence >= 80 ? 13 : 11);
+    const gradeVal = sig.setupGrade ?? (scoreVal >= 13 ? 'A+' : scoreVal >= 10 ? 'A' : 'B');
+    const conviction = `${sig.confidence}% (${sig.confidenceStatus}) · Score ${scoreVal}/16 (Grade ${gradeVal})`;
+    const setupName = sig.activeSetupName || (sig.exposureMode === 'MICRO_15' ? '15M Micro Pullback' : 'Institutional Macro Camarilla');
+    const entry = sig.entryPrice > 0 ? `$${sig.entryPrice.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : `$${activeMarket.markPrice.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+    const sl = sig.initialStopLoss > 0 ? `$${sig.initialStopLoss.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : 'Structural';
+    const tp1 = sig.tp1 > 0 ? `$${sig.tp1.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} (35% · BE Ratchet)` : 'TBD';
+    const tp2 = sig.tp2 > 0 ? `$${sig.tp2.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} (35% · Bank Profit)` : 'TBD';
+    const tp3 = sig.tp3 > 0 ? `$${sig.tp3.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} (ATR Trail)` : 'TBD';
+    const tp4 = sig.tp4 > 0 ? `$${sig.tp4.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} (Macro Runner)` : 'TBD';
+    const rr = sig.riskRewardRatio ? `1:${sig.riskRewardRatio}` : '1:2.4';
+    const utcTime = new Date().toUTCString();
+
+    const template = [
+      `🎯 DELTAAI INSTITUTIONAL INTRADAY SIGNAL`,
+      `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`,
+      `Asset: ${symbol} · Direction: ${dir} (${tradingMode} Mode)`,
+      `Conviction: ${conviction}`,
+      `Setup: ${setupName}`,
+      `Entry: ${entry}`,
+      `Stop Loss: ${sl}`,
+      `Target 1: ${tp1}`,
+      `Target 2: ${tp2}`,
+      `Target 3: ${tp3}`,
+      `Target 4: ${tp4}`,
+      `Risk/Reward: ${rr} · Max Risk Cap: 0.25%`,
+      `Exchange: Delta Exchange India`,
+      `Generated: ${utcTime}`,
+      `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`,
+      `Institutional Execution Engine · DeltaAI`,
+    ].join('\n');
+
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        await navigator.clipboard.writeText(template);
+      } else {
+        const textarea = document.createElement('textarea');
+        textarea.value = template;
+        textarea.style.position = 'fixed';
+        textarea.style.opacity = '0';
+        document.body.appendChild(textarea);
+        textarea.select();
+        document.execCommand('copy');
+        document.body.removeChild(textarea);
+      }
+      setIsSignalCopied(true);
+      onSendNotification?.('Signal Copied', `${symbol} ${dir} signal details copied to clipboard`, 'INFO');
+      setTimeout(() => setIsSignalCopied(false), 2500);
+    } catch (err) {
+      console.warn('Clipboard write failed:', err);
+    }
+  }, [camarillaSniperSignal, selectedAsset, tradingMode, activeMarket.markPrice, onSendNotification]);
+
   const handleExecuteCamarillaSniper = useCallback(() => {
     if (isLiveUnverified) {
       onSendNotification(
@@ -993,6 +1051,23 @@ const StrategyEngineInner: React.FC<StrategyEngineProps & { baseSniper: any }> =
               Combined
             </button>
           </div>
+
+          {/* Share Signal Button */}
+          <button
+            type="button"
+            onClick={handleShareSignal}
+            className={`btn-delta ${
+              isSignalCopied ? 'btn-toggle-active !text-emerald-300 !border-emerald-500/50' : 'btn-secondary text-slate-300 hover:text-white'
+            }`}
+            title="Share current signal details to clipboard"
+          >
+            {isSignalCopied ? (
+              <Check className="w-3.5 h-3.5 text-emerald-400" />
+            ) : (
+              <Share2 className="w-3.5 h-3.5 text-cyan-400" />
+            )}
+            <span>{isSignalCopied ? 'Copied!' : 'Share'}</span>
+          </button>
 
           {/* Secondary Tools Grouping Dropdown */}
           <div className="relative z-50" ref={toolsDropdownRef}>
@@ -1287,6 +1362,11 @@ const StrategyEngineInner: React.FC<StrategyEngineProps & { baseSniper: any }> =
           onRefreshSignal={baseSniper.refreshSignalSnapshot}
           pairCooldowns={baseSniper.pairCooldowns}
           consecutiveStopsCount={baseSniper.consecutiveStopsCount}
+          circuitBreakerTripped={baseSniper.circuitBreakerTripped}
+          circuitBreakerReason={baseSniper.circuitBreakerReason}
+          dailyLossPercent={baseSniper.dailyLossPercent}
+          postSlCooldownUntilMs={baseSniper.postSlCooldownUntilMs}
+          onResetCircuitBreaker={baseSniper.resetCircuitBreaker}
           simulate5mCandleClose={baseSniper.simulate5mCandleClose}
           clearPairCooldown={baseSniper.clearPairCooldown}
           bypassHtfFilter={baseSniper.bypassHtfFilter}

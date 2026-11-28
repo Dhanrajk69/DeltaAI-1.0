@@ -37,17 +37,7 @@ export const LayoutPriorityProvider: React.FC<LayoutPriorityProviderProps> = ({
   children,
   baseActivePositionCount = 0,
 }) => {
-  const [layoutMode, setLayoutModeState] = useState<GlobalLayoutMode>(() => {
-    try {
-      const saved = window.localStorage.getItem(STORAGE_KEY);
-      if (saved === 'AUTO' || saved === 'COMPACT' || saved === 'EXPANDED') {
-        return saved;
-      }
-    } catch {
-      // ignore storage errors
-    }
-    return 'AUTO';
-  });
+  const [layoutMode, setLayoutModeState] = useState<GlobalLayoutMode>('AUTO');
 
   const [sourceCounts, setSourceCounts] = useState<Record<string, number>>({});
   const [syncGeneration, setSyncGeneration] = useState<number>(0);
@@ -71,15 +61,6 @@ export const LayoutPriorityProvider: React.FC<LayoutPriorityProviderProps> = ({
 
   const effectiveCompact =
     layoutMode === 'COMPACT' || (layoutMode === 'AUTO' && hasActiveLivePosition);
-
-  // Persist layout mode choice
-  useEffect(() => {
-    try {
-      window.localStorage.setItem(STORAGE_KEY, layoutMode);
-    } catch {
-      // ignore storage errors
-    }
-  }, [layoutMode]);
 
   // Context-aware auto-collapse whenever a live position opens (false -> true) in AUTO mode
   const prevHasLiveRef = useRef<boolean>(hasActiveLivePosition);

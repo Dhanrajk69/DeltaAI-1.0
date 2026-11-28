@@ -59,6 +59,7 @@ import {
   Ema921MomentumCrossResult,
   normalizeCandleTimeSec,
 } from '../utils/aiMatrixEngine';
+import { evaluateInstitutionalBtcSniper, InstitutionalBtcSniperResult } from '../services/intradaySniperEngine';
 import {
   DELTA_MAKER_FEE_RATE,
   DELTA_GST_RATE_UNIFIED,
@@ -175,6 +176,13 @@ async function syncNativeExchangeStopLossLive(params: {
 }): Promise<void> {
   if (params.mode !== 'LIVE') return;
   if (!Number.isFinite(params.stopLossPrice) || params.stopLossPrice <= 0) return;
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(
+      new CustomEvent('delta:update-position-sl', {
+        detail: { symbol: params.symbol, newStopLoss: params.stopLossPrice },
+      })
+    );
+  }
   try {
     const step = getPerpContractStep(params.symbol);
     const derivedContracts =
@@ -640,10 +648,32 @@ export function useSniperScalpingEngine({
     []
   );
 
-  // Requirement 4: Auto-Pilot MUST initialize to false on every fresh boot
-  const [paperAutoSniperEnabled, setPaperAutoSniperEnabled] = useState<boolean>(false);
-  const [liveAutoSniperEnabled, setLiveAutoSniperEnabled] = useState<boolean>(false);
-  const hasUserArmedInSessionRef = useRef<boolean>(false);
+  // Synchronous lazy localStorage initialization strictly for UI Auto-Pilot preferences
+  const [paperAutoSniperEnabled, setPaperAutoSniperEnabled] = useState<boolean>(() => {
+    try {
+      if (typeof window !== 'undefined') {
+        const item =
+          localStorage.getItem('deltaai_sniper_autopilot_armed') ??
+          localStorage.getItem('deltaai_auto_command_enabled');
+        if (item !== null) return item === 'true';
+      }
+    } catch {}
+    return false;
+  });
+  const [liveAutoSniperEnabled, setLiveAutoSniperEnabled] = useState<boolean>(() => {
+    try {
+      if (typeof window !== 'undefined') {
+        const item =
+          localStorage.getItem('deltaai_sniper_autopilot_armed') ??
+          localStorage.getItem('deltaai_auto_command_enabled');
+        if (item !== null) return item === 'true';
+      }
+    } catch {}
+    return false;
+  });
+  const hasUserArmedInSessionRef = useRef<boolean>(true);
+  const [circuitBreakerTripped, setIsCircuitBreakerTripped] = useState<boolean>(false);
+  const [circuitBreakerReason, setCircuitBreakerReason] = useState<string | null>(null);
   const mountTimestampSecRef = useRef<number>(Math.floor(Date.now() / 1000));
   const [manualLotSize, setManualLotSizeState] = useState<number | null>(null);
   const [pendingLimitOrder, setPendingLimitOrder] = useState<PendingSniperLimitOrder | null>(null);
@@ -675,21 +705,11 @@ export function useSniperScalpingEngine({
     }
   }, []);
 
-  // Bypass HTF Filter (Paper Demo Only) toggle state
-  const [bypassHtfFilter, setBypassHtfFilter] = useState<boolean>(() => {
-    try {
-      const saved = localStorage.getItem('delta_bypass_htf_paper');
-      return saved !== null ? saved === 'true' : false;
-    } catch {
-      return false;
-    }
-  });
+  // Bypass HTF Filter (Paper Demo Only) in-memory toggle state
+  const [bypassHtfFilter, setBypassHtfFilter] = useState<boolean>(false);
 
   const handleSetBypassHtfFilter = useCallback((val: boolean) => {
     setBypassHtfFilter(val);
-    try {
-      localStorage.setItem('delta_bypass_htf_paper', String(val));
-    } catch {}
   }, []);
 
   // Cumulative Realized Profit tracking across completed trades
@@ -711,28 +731,7 @@ export function useSniperScalpingEngine({
   const confirmedOnExchangeTradeIdRef = useRef<string | null>(null);
   const isReconcilingExchangeRef = useRef<boolean>(false);
 
-  const CLOSED_EXCHANGE_SIGS_KEY = 'delta_sniper_closed_ex_sigs_v1';
-  const closedExchangeSignaturesRef = useRef<Map<string, number>>(
-    (() => {
-      const map = new Map<string, number>();
-      try {
-        const raw = localStorage.getItem(CLOSED_EXCHANGE_SIGS_KEY);
-        if (raw) {
-          const parsed = JSON.parse(raw);
-          const cutoff = Date.now() - 24 * 60 * 60 * 1000;
-          if (parsed && typeof parsed === 'object') {
-            for (const [k, ts] of Object.entries(parsed)) {
-              const numTs = Number(ts);
-              if (Number.isFinite(numTs) && numTs >= cutoff) {
-                map.set(k, numTs);
-              }
-            }
-          }
-        }
-      } catch {}
-      return map;
-    })()
-  );
+  const closedExchangeSignaturesRef = useRef<Map<string, number>>(new Map());
 
   const recordClosedExchangeSignature = useCallback((sigs: string[]) => {
     const now = Date.now();
@@ -748,9 +747,6 @@ export function useSniperScalpingEngine({
       .sort((a, b) => b[1] - a[1])
       .slice(0, 60);
     closedExchangeSignaturesRef.current = new Map(entries);
-    try {
-      localStorage.setItem(CLOSED_EXCHANGE_SIGS_KEY, JSON.stringify(Object.fromEntries(entries)));
-    } catch {}
   }, []);
 
   const isClosedExchangeSignatureBlocked = useCallback((sigs: string[], ttlMs = 180_000): boolean => {
@@ -764,6 +760,19 @@ export function useSniperScalpingEngine({
       }
     }
     return false;
+  }, []);
+
+  const reconciledClosedOrderIdsRef = useRef<Set<string>>(new Set());
+
+  const addReconciledClosedOrderId = useCallback((...ids: (string | number | undefined | null)[]) => {
+    const set = reconciledClosedOrderIdsRef.current;
+    for (const rawId of ids) {
+      if (!rawId) continue;
+      const id = String(rawId).trim();
+      if (id && !set.has(id)) {
+        set.add(id);
+      }
+    }
   }, []);
 
   useEffect(() => {
@@ -926,146 +935,89 @@ export function useSniperScalpingEngine({
     };
     fetchMultiTfCandles();
     const timer = setInterval(fetchMultiTfCandles, 30000);
+
+    // Update live 5m and 15m candles in real time from wss://socket.india.delta.exchange
+    const handleWsCandle = (ev: any) => {
+      const d = ev?.detail;
+      if (!d || !d.symbol) return;
+      const cSym = String(d.symbol).toUpperCase();
+      const targetNorm = selectedSymbol.toUpperCase();
+      if (cSym !== targetNorm && `${cSym}T` !== targetNorm) return;
+      const cTime = Number(d.candle_start_time ? Math.floor(Number(d.candle_start_time) / 1000000) : d.timestamp ? Math.floor(Number(d.timestamp) / 1000) : 0);
+      const open = Number(d.open || 0);
+      const high = Number(d.high || 0);
+      const low = Number(d.low || 0);
+      const close = Number(d.close || 0);
+      const volume = Number(d.volume || 0);
+      if (!(close > 0 && cTime > 0)) return;
+      const bar = { time: cTime, open, high, low, close, volume };
+      const ch = String(d.type || d.channel || '');
+      if (ch === 'candlestick_5m') {
+        setCandles5m((prev) => {
+          if (prev.length === 0) return [bar];
+          const last = prev[prev.length - 1];
+          if (last.time === bar.time) return [...prev.slice(0, -1), bar];
+          if (bar.time > last.time) return [...prev.slice(-199), bar];
+          return prev;
+        });
+      } else if (ch === 'candlestick_15m') {
+        setCandles15m((prev) => {
+          if (prev.length === 0) return [bar];
+          const last = prev[prev.length - 1];
+          if (last.time === bar.time) return [...prev.slice(0, -1), bar];
+          if (bar.time > last.time) return [...prev.slice(-199), bar];
+          return prev;
+        });
+      }
+    };
+    window.addEventListener('delta:ws-candle', handleWsCandle);
+
     return () => {
       active = false;
       clearInterval(timer);
+      window.removeEventListener('delta:ws-candle', handleWsCandle);
     };
   }, [selectedSymbol, manualRefreshEpoch]);
 
-  // Max 3 trades per UTC day + 3-bar (45m on 15m timeframe) post-SL cooldown
-  const utcDayStorageKey = `delta_sniper_utc_trades_v1_${tradingMode}`;
+  // Max 3 trades per UTC day + post-SL cooldown held strictly in memory (derived from live session/fills)
   const getTodayUtcStr = () => new Date().toISOString().slice(0, 10);
-  const [utcDayState, setUtcDayState] = useState<{ date: string; count: number }>(() => {
-    const today = getTodayUtcStr();
-    try {
-      const raw = localStorage.getItem(utcDayStorageKey);
-      if (raw) {
-        const parsed = JSON.parse(raw);
-        if (parsed?.date === today) {
-          return { date: today, count: Math.max(0, Number(parsed.count) || 0) };
-        }
-      }
-    } catch {}
-    return { date: today, count: 0 };
-  });
-  const [postSlCooldownUntilMs, setPostSlCooldownUntilMs] = useState<number>(() => {
-    try {
-      const raw = localStorage.getItem(`delta_sniper_post_sl_v1_${tradingMode}`);
-      return Number(raw || 0);
-    } catch {
-      return 0;
-    }
-  });
-
-  useEffect(() => {
-    const today = getTodayUtcStr();
-    try {
-      const raw = localStorage.getItem(utcDayStorageKey);
-      if (raw) {
-        const parsed = JSON.parse(raw);
-        if (parsed?.date === today) {
-          setUtcDayState({ date: today, count: Math.max(0, Number(parsed.count) || 0) });
-        } else {
-          setUtcDayState({ date: today, count: 0 });
-        }
-      } else {
-        setUtcDayState({ date: today, count: 0 });
-      }
-      setPostSlCooldownUntilMs(Number(localStorage.getItem(`delta_sniper_post_sl_v1_${tradingMode}`) || 0));
-    } catch {}
-  }, [utcDayStorageKey, tradingMode]);
+  const [utcDayState, setUtcDayState] = useState<{ date: string; count: number }>(() => ({
+    date: getTodayUtcStr(),
+    count: 0,
+  }));
+  const [postSlCooldownUntilMs, setPostSlCooldownUntilMs] = useState<number>(0);
 
   const utcDayTradesCount = utcDayState.date === getTodayUtcStr() ? utcDayState.count : 0;
   const incrementUtcDayTradeCount = useCallback(() => {
     const today = getTodayUtcStr();
-    setUtcDayState((prev) => {
-      const nextCount = (prev.date === today ? prev.count : 0) + 1;
-      const next = { date: today, count: nextCount };
-      try {
-        localStorage.setItem(utcDayStorageKey, JSON.stringify(next));
-      } catch {}
-      return next;
-    });
-  }, [utcDayStorageKey]);
+    setUtcDayState((prev) => ({
+      date: today,
+      count: (prev.date === today ? prev.count : 0) + 1,
+    }));
+  }, []);
 
-  // Anti-Chop Micro Protection: Max 3 Micro trades per rolling hour + 3-bar post-SL cooldown
-  const chopStorageKey = `delta_micro_chop_v1_${tradingMode}`;
-  const [microTradeTimestamps, setMicroTradeTimestamps] = useState<number[]>(() => {
-    try {
-      const raw = localStorage.getItem(chopStorageKey);
-      if (raw) {
-        const parsed = JSON.parse(raw);
-        const oneHrAgo = Date.now() - 3600_000;
-        return Array.isArray(parsed?.timestamps) ? parsed.timestamps.filter((t: number) => t >= oneHrAgo) : [];
-      }
-    } catch {}
-    return [];
-  });
-  const [microSlCooldownUntil, setMicroSlCooldownUntil] = useState<number>(() => {
-    try {
-      const raw = localStorage.getItem(chopStorageKey);
-      if (raw) {
-        const parsed = JSON.parse(raw);
-        return Number(parsed?.slCooldownUntil || 0);
-      }
-    } catch {}
-    return 0;
-  });
-
-  useEffect(() => {
-    try {
-      const raw = localStorage.getItem(chopStorageKey);
-      if (raw) {
-        const parsed = JSON.parse(raw);
-        const oneHrAgo = Date.now() - 3600_000;
-        setMicroTradeTimestamps(Array.isArray(parsed?.timestamps) ? parsed.timestamps.filter((t: number) => t >= oneHrAgo) : []);
-        setMicroSlCooldownUntil(Number(parsed?.slCooldownUntil || 0));
-      } else {
-        setMicroTradeTimestamps([]);
-        setMicroSlCooldownUntil(0);
-      }
-    } catch {}
-  }, [chopStorageKey]);
-
-  const persistMicroChopState = useCallback(
-    (timestamps: number[], slUntil: number) => {
-      try {
-        localStorage.setItem(chopStorageKey, JSON.stringify({ timestamps, slCooldownUntil: slUntil }));
-      } catch {}
-    },
-    [chopStorageKey]
-  );
+  // Anti-Chop Micro Protection in memory: Max 3 Micro trades per rolling hour + 1-candle post-SL cooldown
+  const [microTradeTimestamps, setMicroTradeTimestamps] = useState<number[]>([]);
+  const [microSlCooldownUntil, setMicroSlCooldownUntil] = useState<number>(0);
 
   const recordMicroTradeTimestamp = useCallback(() => {
     const now = Date.now();
     const oneHrAgo = now - 3600_000;
-    setMicroTradeTimestamps((prev) => {
-      const next = [...prev.filter((t) => t >= oneHrAgo), now];
-      persistMicroChopState(next, microSlCooldownUntil);
-      return next;
-    });
-  }, [microSlCooldownUntil, persistMicroChopState]);
+    setMicroTradeTimestamps((prev) => [...prev.filter((t) => t >= oneHrAgo), now]);
+  }, []);
 
   const triggerMicroSlCooldown = useCallback(() => {
-    const threeBarCooldownMs = POST_SL_COOLDOWN_BARS * 15 * 60 * 1000; // 3 x 15m bars = 45m
-    const until = Date.now() + threeBarCooldownMs;
+    const next15mCloseMs = Math.ceil((Date.now() + 1000) / (15 * 60 * 1000)) * (15 * 60 * 1000);
+    const until = Math.max(Date.now() + 15 * 60 * 1000, next15mCloseMs);
     setMicroSlCooldownUntil(until);
     setPostSlCooldownUntilMs(until);
-    try {
-      localStorage.setItem(`delta_sniper_post_sl_v1_${tradingMode}`, String(until));
-    } catch {}
-    setMicroTradeTimestamps((prev) => {
-      const oneHrAgo = Date.now() - 3600_000;
-      const pruned = prev.filter((t) => t >= oneHrAgo);
-      persistMicroChopState(pruned, until);
-      return pruned;
-    });
+    setMicroTradeTimestamps((prev) => prev.filter((t) => t >= Date.now() - 3600_000));
     fetch('/api/delta/micro-sniper/sl-hit', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ mode: tradingMode }),
+      body: JSON.stringify({ mode: tradingMode, cooldownUntil: until }),
     }).catch(() => {});
-  }, [persistMicroChopState, tradingMode]);
+  }, [tradingMode]);
 
   const perpOnlyPositions = useMemo(
     () => positions.filter((p) => !isOptionPositionItem(p)),
@@ -1078,17 +1030,82 @@ export function useSniperScalpingEngine({
 
   const activeTrade: (SniperActiveTrade & { side: 'LONG' | 'SHORT'; direction: 'LONG' | 'SHORT' }) | null = useMemo(() => {
     const raw = isLiveUnverified ? null : isLiveMode ? liveActiveTrade : paperActiveTrade;
-    if (!raw) return null;
-    const resolvedSide: 'LONG' | 'SHORT' =
-      (raw as any).side === 'SHORT' || (raw as any).direction === 'SHORT' || (raw as any).signal === 'SHORT'
-        ? 'SHORT'
-        : 'LONG';
+    if (raw) {
+      const resolvedSide: 'LONG' | 'SHORT' =
+        (raw as any).side === 'SHORT' || (raw as any).direction === 'SHORT' || (raw as any).signal === 'SHORT'
+          ? 'SHORT'
+          : 'LONG';
+      return {
+        ...raw,
+        direction: resolvedSide,
+        side: resolvedSide,
+      };
+    }
+
+    // Dynamic adoption fallback: If raw state is null but perpOnlyPositions has an active position, bind immediately
+    if (isLiveUnverified) return null;
+    const normSelected = normalizePerpSymbol(selectedSymbol);
+    const activePerp =
+      perpOnlyPositions.find(
+        (p) =>
+          normalizePerpSymbol(p.product_symbol || p.rawSymbol || p.symbol) === normSelected &&
+          (Math.abs(Number(p.size ?? 0)) > 0 || Math.abs(Number(p.contracts ?? 0)) > 0)
+      ) ||
+      perpOnlyPositions.find(
+        (p) => Math.abs(Number(p.size ?? 0)) > 0 || Math.abs(Number(p.contracts ?? 0)) > 0
+      );
+
+    if (!activePerp) return null;
+
+    const { side, coinSize, signedCoinSize, contracts } = resolvePerpSizeAndSide(activePerp);
+    if (coinSize <= 0) return null;
+
+    const rawSym = String(activePerp.product_symbol || activePerp.rawSymbol || activePerp.symbol || 'BTCUSD').toUpperCase();
+    const canonicalSym = normalizePerpSymbol(rawSym) || normSelected || 'BTCUSDT';
+    const ticker = getMarketTicker(marketsRef.current, canonicalSym);
+    const entryPx = Number(activePerp.entryPrice ?? activePerp.entry_price ?? 0) || ticker.markPrice;
+    if (entryPx <= 0) return null;
+    const curPx = ticker.markPrice > 0 ? ticker.markPrice : entryPx;
+
+    const computedUpnl = (curPx - entryPx) * signedCoinSize;
+    const pureUpnlUsd = Number.isFinite(computedUpnl)
+      ? +computedUpnl.toFixed(4)
+      : Number(activePerp.unrealisedPnl ?? activePerp.unrealized_pnl ?? 0);
+
+    const { sl, tp1, tp2, tp3, tp4 } = buildAdoptedCamarillaAndTargets({
+      ticker,
+      side,
+      entryPrice: entryPx,
+      markPrice: curPx,
+      timeframe: '5m',
+    });
+
     return {
-      ...raw,
-      direction: resolvedSide,
-      side: resolvedSide,
-    };
-  }, [isLiveUnverified, isLiveMode, liveActiveTrade, paperActiveTrade]);
+      id: activePerp.id || `adopted-${canonicalSym}`,
+      symbol: canonicalSym,
+      side,
+      direction: side,
+      signal: side,
+      lotSize: coinSize,
+      remainingSize: coinSize,
+      contractsCount: contracts,
+      entryPrice: entryPx,
+      currentPrice: curPx,
+      initialStopLoss: Number(activePerp.stopLoss ?? 0) > 0 ? Number(activePerp.stopLoss) : sl,
+      currentStopLoss: Number(activePerp.stopLoss ?? 0) > 0 ? Number(activePerp.stopLoss) : sl,
+      tp1: Number(activePerp.takeProfit ?? 0) > 0 ? Number(activePerp.takeProfit) : tp1,
+      tp2,
+      tp3,
+      tp4,
+      tradeStatus: 'ACTIVE',
+      status: 'OPEN',
+      openedAt: activePerp.openedAt || Date.now(),
+      unrealisedProfitUsd: pureUpnlUsd,
+      unrealizedPnlUsd: pureUpnlUsd,
+      bookedProfitUsd: 0,
+      adoptedFromExchange: true,
+    } as any;
+  }, [isLiveUnverified, isLiveMode, liveActiveTrade, paperActiveTrade, perpOnlyPositions, selectedSymbol]);
 
   const setActiveTrade = useCallback(
     (val: SniperActiveTrade | null | ((prev: SniperActiveTrade | null) => SniperActiveTrade | null)) => {
@@ -1114,10 +1131,26 @@ export function useSniperScalpingEngine({
   const isAutoSniperEnabled = isLiveMode ? liveAutoSniperEnabled : paperAutoSniperEnabled;
 
   const syncSniperAutoPilotFromServer = useCallback((armed: boolean) => {
-    // Boot safety: ignore remote armed=true unless explicitly armed in current browser session
-    if (armed && !hasUserArmedInSessionRef.current) {
+    const savedArmed = (() => {
+      try {
+        return (
+          localStorage.getItem('deltaai_sniper_autopilot_armed') === 'true' ||
+          localStorage.getItem('deltaai_auto_command_enabled') === 'true'
+        );
+      } catch {
+        return false;
+      }
+    })();
+
+    if (!armed && savedArmed && Date.now() - mountTimestampSecRef.current * 1000 < 20_000) {
+      fetch('/api/delta/autopilot-state', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sniperAutoPilotArmed: true, armedAt: Date.now() }),
+      }).catch(() => {});
       return;
     }
+
     setLiveAutoSniperEnabled(armed);
     setPaperAutoSniperEnabled(armed);
     if (armed) {
@@ -1125,15 +1158,12 @@ export function useSniperScalpingEngine({
       setPaperSignalStandby(false);
     }
     try {
-      localStorage.setItem('delta_sniper_autopilot_armed_v1', armed ? 'true' : 'false');
+      localStorage.setItem('deltaai_sniper_autopilot_armed', armed ? 'true' : 'false');
+      localStorage.setItem('deltaai_auto_command_enabled', armed ? 'true' : 'false');
     } catch {}
   }, []);
 
-  // Ensure server-side sniperAutoPilotArmed stays reset to false on initial boot
   useEffect(() => {
-    try {
-      localStorage.setItem('delta_sniper_autopilot_armed_v1', 'false');
-    } catch {}
     const handleSyncEvent = (ev: Event) => {
       const detail = (ev as CustomEvent)?.detail;
       if (detail && typeof detail.sniperAutoPilotArmed === 'boolean') {
@@ -1161,13 +1191,16 @@ export function useSniperScalpingEngine({
           consecutiveStopsCountRef.current = 0;
           setConsecutiveStopsCount(0);
         }
+        setIsCircuitBreakerTripped(false);
+        setCircuitBreakerReason(null);
         setLiveSignalStandby(false);
         setPaperSignalStandby(false);
       }
       setLiveAutoSniperEnabled(val);
       setPaperAutoSniperEnabled(val);
       try {
-        localStorage.setItem('delta_sniper_autopilot_armed_v1', val ? 'true' : 'false');
+        localStorage.setItem('deltaai_sniper_autopilot_armed', val ? 'true' : 'false');
+        localStorage.setItem('deltaai_auto_command_enabled', val ? 'true' : 'false');
       } catch {}
       fetch('/api/delta/autopilot-state', {
         method: 'POST',
@@ -1336,8 +1369,18 @@ export function useSniperScalpingEngine({
       const posIdSig = curTrade.positionId ? `${canonicalSym}:pid:${curTrade.positionId}` : '';
       const shortCooldownSig = `${canonicalSym}:${curTrade.signal}:${Number(curTrade.entryPrice || 0).toFixed(2)}`;
       recordClosedExchangeSignature([exactSig, posIdSig, shortCooldownSig].filter(Boolean));
+      addReconciledClosedOrderId(
+        curTrade.id,
+        curTrade.positionId,
+        curTrade.symbol,
+        curTrade.productSymbol,
+        canonicalSym,
+        exactSig,
+        posIdSig,
+        shortCooldownSig
+      );
 
-      // Immediately transition UI state to CLOSED & clear any stale localStorage keys
+      // Immediately transition UI state to CLOSED
       setLiveActiveTrade(null);
       liveActiveTradeRef.current = null;
       confirmedOnExchangeTradeIdRef.current = null;
@@ -1346,10 +1389,6 @@ export function useSniperScalpingEngine({
       pendingAutoSignalIdRef.current = null;
       signalEpochRef.current += 1;
       setLiveSignalStandby(liveAutoSniperEnabled ? false : true);
-      try {
-        localStorage.removeItem('delta_sniper_active_trade_v1');
-        localStorage.removeItem('delta_active_sniper_trade');
-      } catch {}
 
       const fallbackPnlUsd = +(
         (curTrade.bookedProfitUsd || 0) +
@@ -1389,6 +1428,13 @@ export function useSniperScalpingEngine({
             }
             cancelledBrackets = Boolean(json.cancelledBracketOrders);
             reconciledClosedTrade = json.closedTrade || null;
+            if (reconciledClosedTrade) {
+              addReconciledClosedOrderId(
+                reconciledClosedTrade.orderId,
+                reconciledClosedTrade.fillId,
+                reconciledClosedTrade.id
+              );
+            }
           }
         }
       } catch {
@@ -1476,9 +1522,12 @@ export function useSniperScalpingEngine({
 
           if (isConfirmedOrAdopted) {
             consecutiveZeroExchangePollsRef.current += 1;
-            if (consecutiveZeroExchangePollsRef.current >= 2) {
-              await finalizeExchangeClosedPerpTrade(prevTrade, creds);
-            }
+            addLog(
+              'POSITION_MISMATCH_DETECTED',
+              'Position Mismatch Detected',
+              `Delta Exchange reports ${prevTrade.symbol} as closed (size 0), but DeltaAI was tracking it as active. Finalizing exchange closure.`
+            );
+            await finalizeExchangeClosedPerpTrade(prevTrade, creds);
           }
           return;
         }
@@ -1489,7 +1538,18 @@ export function useSniperScalpingEngine({
         const rawSym = String(p.product_symbol || p.rawSymbol || p.symbol || '').toUpperCase();
         const canonicalSym = normalizePerpSymbol(rawSym);
         const { side, coinSize } = resolvePerpSizeAndSide(p);
-        if (coinSize <= 0) return false;
+        // STRICT RULE: Gate adoption strictly on a live /v2/positions check where Math.abs(Number(position.size)) > 0
+        if (coinSize <= 0 || !Number.isFinite(coinSize)) return false;
+
+        // Never adopt a position whose id, order_id, entry_order_id, or symbol has been recorded as closed
+        const pIdStr = p.id ? String(p.id).trim() : '';
+        const orderIdStr = (p as any).order_id ? String((p as any).order_id).trim() : '';
+        const entryOrderIdStr = (p as any).entry_order_id ? String((p as any).entry_order_id).trim() : '';
+        const closedSet = reconciledClosedOrderIdsRef.current;
+        if (pIdStr && closedSet.has(pIdStr)) return false;
+        if (orderIdStr && closedSet.has(orderIdStr)) return false;
+        if (entryOrderIdStr && closedSet.has(entryOrderIdStr)) return false;
+
         const ep = Number(p.entryPrice ?? p.entry_price ?? 0);
         const openedAtVal = Number(p.openedAt || 0);
         const exactSig = `${canonicalSym}:${side}:${ep.toFixed(2)}:${openedAtVal}`;
@@ -1671,16 +1731,16 @@ export function useSniperScalpingEngine({
   useEffect(() => {
     if (tradingMode !== 'LIVE' || !isLiveApiAuthenticated) return;
     void reconcileLivePerpPositionsNow();
-    // 1.5s reconciliation poll => 2 consecutive zero-size polls = ~3 seconds
+    // Lightweight 5-second REST reconciliation check alongside WebSocket feed
     const pollTimer = setInterval(() => {
       void reconcileLivePerpPositionsNow();
-    }, 1500);
+    }, 5000);
     return () => {
       clearInterval(pollTimer);
     };
   }, [tradingMode, isLiveApiAuthenticated, reconcileLivePerpPositionsNow]);
 
-  // Also trigger immediate exchange reconciliation whenever live positions prop drops the active trade
+  // Trigger immediate exchange reconciliation whenever live positions prop drops the active trade or WS position event arrives
   useEffect(() => {
     if (tradingMode !== 'LIVE' || !isLiveApiAuthenticated) return;
     const curTrade = liveActiveTradeRef.current;
@@ -1692,9 +1752,45 @@ export function useSniperScalpingEngine({
         Math.abs(Number((p as any).signedSize ?? p.size ?? 0)) > 0
     );
     if (!existsInProp) {
+      setLiveActiveTrade(null);
+      liveActiveTradeRef.current = null;
+      confirmedOnExchangeTradeIdRef.current = null;
       void reconcileLivePerpPositionsNow();
     }
   }, [tradingMode, isLiveApiAuthenticated, perpOnlyPositions, reconcileLivePerpPositionsNow]);
+
+  // Respond to global position mismatch & WS closure events by logging and resetting Cockpit state instantaneously
+  useEffect(() => {
+    const handleMismatch = (e: any) => {
+      const closed = e?.detail?.closedPositions || [];
+      addLog(
+        'POSITION_MISMATCH_DETECTED',
+        'Position Mismatch Resolved',
+        'Delta Exchange India reported the position closed (size === 0). Purged from Cockpit state immediately.'
+      );
+
+      for (const pos of closed) {
+        addReconciledClosedOrderId(
+          pos.id,
+          pos.order_id,
+          pos.entry_order_id,
+          pos.symbol,
+          pos.rawSymbol,
+          pos.product_symbol
+        );
+      }
+
+      setLiveActiveTrade(null);
+      liveActiveTradeRef.current = null;
+      confirmedOnExchangeTradeIdRef.current = null;
+      setLiveSignalStandby(liveAutoSniperEnabled ? false : true);
+
+      void reconcileLivePerpPositionsNow();
+    };
+
+    window.addEventListener('delta:position-mismatch-detected', handleMismatch as EventListener);
+    return () => window.removeEventListener('delta:position-mismatch-detected', handleMismatch as EventListener);
+  }, [addLog, addReconciledClosedOrderId, reconcileLivePerpPositionsNow, liveAutoSniperEnabled]);
 
   // ─────────────────────────────────────────────────────────
   // 30-MINUTE CANDLE SYNCHRONIZED HARVESTING CADENCE (00-22/30-52 Rule + $15 Target Lock)
@@ -2439,6 +2535,24 @@ export function useSniperScalpingEngine({
         ? totalEquity
         : Math.max(0, effectiveBalance + effectiveMarginUsed);
 
+    const currentSessionRealizedPnl = isLiveMode ? liveCumulativeRealizedUsd : paperCumulativeRealizedUsd;
+    const institutionalBtcSniper: InstitutionalBtcSniperResult = evaluateInstitutionalBtcSniper({
+      symbol: selectedSymbol,
+      currentPrice: markPrice,
+      candles: {
+        c4h: toOhlc(candles4h),
+        c1h: toOhlc(candles1h),
+        c15m: toOhlc(candles15m),
+        c5m: toOhlc(candles5m),
+      },
+      accountEquityUsd: derivedTotalEq > 0 ? derivedTotalEq : 1000,
+      sessionRealizedPnLUsd: currentSessionRealizedPnl,
+      consecutiveStopsCount,
+      high24h,
+      low24h,
+      change24h: curMarket.change24h || 0,
+    });
+
     const tierRiskUsd = isMicro15 ? 15 : isMicro50 ? 50 : 50;
     const effectiveTierRiskUsd = isMicro15 ? 15 : tierRiskUsd;
     const baselineConfiguredLot = Math.max(0.001, capitalAlloc.defaultLotSize || capitalAlloc.fixedLot || 0.1);
@@ -2809,9 +2923,16 @@ export function useSniperScalpingEngine({
       tradeApproved = false;
     }
 
+    const isCircuitBreakerTripped = institutionalBtcSniper.circuitBreakerActive;
+    if (isCircuitBreakerTripped) {
+      executionGateStatus = 'TRADE BLOCKED';
+      tradeApproved = false;
+    }
+
     const isHydrated =
       (!isSignalStandby || isAutoSniperEnabled) &&
       !isHardGateFail &&
+      !isCircuitBreakerTripped &&
       (allRiskGatesPassed || (isBypassActive && !isHardGateFail) || executionGateStatus === 'ARMED_CONDITIONAL');
 
     const ema921Summary = `5m EMA 9/21 Cross ${dir} (${lotSize} ${selectedSymbol.replace('USDT', '').replace('USD', '')} · ${contractsCount} cts): Entry $${entryPrice.toLocaleString()} · 1.2x ATR SL $${initialStopLoss.toLocaleString()} · 60% Bank@+${ema921Cross.tp1DistancePts}pt ($${tp1.toLocaleString()}, 0.0236% Maker) · BE $${feeAdjustedBePrice.toLocaleString()} · 40% EMA21 Trail -> $${tp4.toLocaleString()}`;
@@ -2820,7 +2941,9 @@ export function useSniperScalpingEngine({
       : `15m Maker Pullback ${dir} (${lotSize} ${selectedSymbol.replace('USDT', '').replace('USD', '')} · ${contractsCount} cts @ ${deltaLeverage}x): post_only Limit $${entryPrice.toLocaleString()} · 1.5x ATR SL $${initialStopLoss.toLocaleString()} · BE@+1.35R $${tp1.toLocaleString()} (Fee-Adj $${feeAdjustedBePrice.toLocaleString()}) · Runner $${tp2.toLocaleString()}–$${tp4.toLocaleString()}`;
 
     let aiVerdict: string;
-    if (isLiveUnverified) {
+    if (isCircuitBreakerTripped) {
+      aiVerdict = institutionalBtcSniper.circuitBreakerReason || 'CIRCUIT BREAKER: Trading halted to preserve capital.';
+    } else if (isLiveUnverified) {
       aiVerdict = 'API Keys Required · Balances Inactive — Connect Delta Exchange API Keys in Settings to trade live.';
     } else if (isEma921Mode && regimeNoTradeBlocked) {
       aiVerdict = `${ema921Cross.statusLabel}: ${ema921Cross.rejectionReasons.join(' · ')}`;
@@ -3035,6 +3158,13 @@ export function useSniperScalpingEngine({
       ema921Cross,
       partialTakeProfitPct: isEma921Mode ? 60 : 50,
       trailBasis: isEma921Mode ? '5M_EMA21' : '15M_EMA20',
+      setupScore16: institutionalBtcSniper.confluence.totalScore,
+      setupGrade: institutionalBtcSniper.confluence.grade,
+      activeSetupName: institutionalBtcSniper.setup.name,
+      activeSetupId: institutionalBtcSniper.setup.id,
+      hardNoTradeReasons: institutionalBtcSniper.hardFilters.filters.filter((f) => f.triggered).map((f) => `${f.label}: ${f.reason}`),
+      isHardNoTradeBlocked: !institutionalBtcSniper.hardFilters.passed,
+      btcSniperResult: institutionalBtcSniper,
     };
   }, [
     curMarket,
@@ -3194,6 +3324,21 @@ export function useSniperScalpingEngine({
 
     const isRealSignal = manualSignal && typeof manualSignal === 'object' && !('nativeEvent' in manualSignal) && ('symbol' in manualSignal) && ('signal' in manualSignal);
     const signalToUse: SniperSignal = isRealSignal ? (manualSignal as SniperSignal) : currentSignal;
+
+    if (signalToUse.btcSniperResult?.circuitBreakerActive) {
+      onSendNotification(
+        'Execution Blocked',
+        signalToUse.btcSniperResult.circuitBreakerReason || 'Circuit breaker active: Trading halted to preserve capital.',
+        'RISK'
+      );
+      return;
+    }
+
+    if (signalToUse.isHardNoTradeBlocked && tradingMode === 'LIVE') {
+      const blockReason = signalToUse.hardNoTradeReasons?.[0] || 'Institutional Hard Filter Blocked';
+      onSendNotification('Execution Blocked', blockReason, 'RISK');
+      return;
+    }
 
     const curMarket = getMarketTicker(markets, signalToUse.symbol || selectedSymbol);
     const liveMark = curMarket.markPrice || 81702.50;
@@ -3770,14 +3915,11 @@ export function useSniperScalpingEngine({
     const pending = pendingLimitOrderRef.current;
     if (!pending) return;
     if (tradingMode === 'LIVE' && pending.orderId) {
-      const creds = typeof window !== 'undefined' ? localStorage.getItem('delta_api_credentials_v1') : null;
-      let headers: Record<string, string> = { 'Content-Type': 'application/json' };
-      if (creds) {
-        try {
-          const parsed = JSON.parse(creds);
-          if (parsed?.apiKey) headers['x-delta-api-key'] = parsed.apiKey;
-          if (parsed?.apiSecret) headers['x-delta-api-secret'] = parsed.apiSecret;
-        } catch {}
+      const creds = getStoredDeltaCredentials();
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+      if (creds?.apiKey && creds?.apiSecret) {
+        headers['x-delta-api-key'] = creds.apiKey;
+        headers['x-delta-api-secret'] = creds.apiSecret;
       }
       await fetch(`/api/delta/orders/${encodeURIComponent(String(pending.orderId))}?symbol=${encodeURIComponent(pending.symbol)}`, {
         method: 'DELETE',
@@ -4011,12 +4153,44 @@ export function useSniperScalpingEngine({
 
       addLog('STOP_LOSS', exitTitle, `Exited at $${currentPrice.toLocaleString()}. Booked PnL: $${totalRealisedPnl.toFixed(2)}`);
 
-      if (consecutiveStopsCountRef.current >= 2) {
-        // Keep Auto-Pilot ARMED (ON); rely on post-SL cooldown to pace entries without disarming Auto-Pilot
+      const nextCumulative = +(cumulativeRealizedProfitUsd + totalRealisedPnl).toFixed(2);
+      const effectiveEquity = (totalEquity && totalEquity > 0) ? totalEquity : (availableBalance || 1000);
+      const dailyLossPercent = nextCumulative < 0 ? +(Math.abs(nextCumulative) / effectiveEquity * 100).toFixed(2) : 0;
+      const consecutiveLosses = consecutiveStopsCountRef.current;
+
+      if (consecutiveLosses >= 3 || dailyLossPercent >= 1.5) {
+        const tripReason = consecutiveLosses >= 3
+          ? `CIRCUIT BREAKER: 3 Consecutive Losses (${consecutiveLosses}/3) Hit`
+          : `CIRCUIT BREAKER: Daily Loss Limit Tripped (${dailyLossPercent.toFixed(2)}% >= 1.5% max daily risk)`;
+
+        setIsCircuitBreakerTripped(true);
+        setCircuitBreakerReason(tripReason);
+
+        setLiveAutoSniperEnabled(false);
+        setPaperAutoSniperEnabled(false);
+        try {
+          localStorage.setItem('deltaai_sniper_autopilot_armed', 'false');
+          localStorage.setItem('deltaai_auto_command_enabled', 'false');
+        } catch {}
+
+        fetch('/api/delta/autopilot-state', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ sniperAutoPilotArmed: false, armedAt: 0, reason: tripReason }),
+        }).catch(() => {});
+
         addLog(
           'AUTOPILOT',
-          'Auto-Pilot Post-SL Cooldown Active',
-          '2 Consecutive Stops Hit — 10m Post-SL Cooldown Armed. Auto-Pilot remains ARMED (ON) for next valid setup.'
+          'Account Protection Circuit Breaker Tripped',
+          `${tripReason}. Auto-Pilot disarmed to protect capital. Manual reset required.`
+        );
+        onSendNotification('Circuit Breaker Active', `${tripReason}. Auto-Pilot paused until manual review.`, 'RISK');
+      } else {
+        // While keeping Auto-Pilot persistently ARMED, enforce 1-candle cooldown and require fresh Score >= 10/16 setup
+        addLog(
+          'AUTOPILOT',
+          'Auto-Pilot 1-Candle Cooldown Active',
+          `Stop-Loss Hit (${consecutiveLosses}/3). Auto-Pilot remains persistently ARMED. Waiting for next 15M completed candle close & fresh Score ≥ 10/16 setup.`
         );
       }
 
@@ -4923,7 +5097,13 @@ export function useSniperScalpingEngine({
     }
 
     if (activeTrade && !['STOPPED_OUT', 'COMPLETED', 'REVERSED', 'TIME_EXIT'].includes(activeTrade.tradeStatus)) {
-      const uPnl = activeTrade.unrealisedProfitUsd || 0;
+      const remSize = activeTrade.remainingSize > 0 ? activeTrade.remainingSize : activeTrade.lotSize;
+      const curPx = markPrice > 0 ? markPrice : activeTrade.currentPrice;
+      const isShort = activeTrade.side === 'SHORT' || activeTrade.signal === 'SHORT';
+      const tickUpnl = curPx > 0 && activeTrade.entryPrice > 0 && remSize > 0
+        ? (isShort ? (activeTrade.entryPrice - curPx) * remSize : (curPx - activeTrade.entryPrice) * remSize)
+        : (activeTrade.unrealisedProfitUsd || 0);
+      const uPnl = Number.isFinite(tickUpnl) ? +tickUpnl.toFixed(4) : (activeTrade.unrealisedProfitUsd || 0);
       const rPnl = +(cumulativeRealizedProfitUsd + (activeTrade.bookedProfitUsd || 0)).toFixed(2);
       setSniperPnl(uPnl, rPnl);
     } else {
@@ -4932,9 +5112,7 @@ export function useSniperScalpingEngine({
     }
   }, [
     activeTrade,
-    activeTrade?.unrealisedProfitUsd,
-    activeTrade?.bookedProfitUsd,
-    activeTrade?.tradeStatus,
+    markPrice,
     cumulativeRealizedProfitUsd,
     isLiveUnverified,
     setSniperPnl,
@@ -5055,6 +5233,8 @@ export function useSniperScalpingEngine({
     const withinBootGuard = Boolean(appBootTimestamp && Date.now() - appBootTimestamp < 10_000);
     if (
       !isAutoSniperEnabled ||
+      circuitBreakerTripped ||
+      consecutiveStopsCountRef.current >= 3 ||
       isLiveUnverified ||
       !isExchangeHydrated ||
       withinBootGuard ||
@@ -5105,9 +5285,11 @@ export function useSniperScalpingEngine({
     }
 
     // 2. Validate trade eligibility: must pass Gate 1 + Gate 7 risk checks, not be stale, and have conviction >= 75%
+    const isScoreQualified = !currentSignal?.btcSniperResult || (currentSignal.btcSniperResult.confluence?.totalScore ?? 0) >= 10;
     const isSignalApproved =
       currentSignal?.riskChecks?.tradeApproved === true &&
-      (currentSignal?.riskChecks?.signalValidationPassed === true || isBypassActive);
+      (currentSignal?.riskChecks?.signalValidationPassed === true || isBypassActive) &&
+      (isScoreQualified || isBypassActive);
     const meetsConfidence = (currentSignal?.confidence ?? 0) >= 75;
     const hasValidEntry = (currentSignal?.entryPrice ?? 0) > 0 || (currentSignal?.camarilla?.h4 ?? 0) > 0 || (currentSignal?.camarilla?.pivot ?? 0) > 0;
     const isStaleSignal = Boolean(currentSignal?.timestamp && Date.now() - currentSignal.timestamp > 15 * 60 * 1000);
@@ -5241,7 +5423,7 @@ export function useSniperScalpingEngine({
       autoExecutionTimerRef.current = null;
       pendingAutoSignalIdRef.current = null;
 
-      if (!isAutoSniperEnabled || isLiveUnverified || !isExchangeHydrated || isExecuting || activeTrade || pendingLimitOrderRef.current || perpOnlyPositions.length > 0) return;
+      if (!isAutoSniperEnabled || circuitBreakerTripped || isLiveUnverified || !isExchangeHydrated || isExecuting || activeTrade || pendingLimitOrderRef.current || perpOnlyPositions.length > 0) return;
 
       lastAutoExecutedSignalId.current = currentSignalId;
       lastAttemptTsRef.current = Date.now();
@@ -5255,6 +5437,7 @@ export function useSniperScalpingEngine({
     }, 1500);
   }, [
     isAutoSniperEnabled,
+    circuitBreakerTripped,
     isLiveUnverified,
     isExchangeHydrated,
     appBootTimestamp,
@@ -5348,8 +5531,10 @@ export function useSniperScalpingEngine({
   const resetCircuitBreaker = useCallback(() => {
     consecutiveStopsCountRef.current = 0;
     setConsecutiveStopsCount(0);
+    setIsCircuitBreakerTripped(false);
+    setCircuitBreakerReason(null);
+    setPostSlCooldownUntilMs(0);
 
-    // setPairCooldowns({}); - Removed
     setIsSignalStandby(false);
     if (tradingMode === 'LIVE') {
       if (isLiveApiAuthenticated) {
@@ -5360,6 +5545,18 @@ export function useSniperScalpingEngine({
       setPaperAutoSniperEnabled(true);
       setPaperSignalStandby(false);
     }
+
+    try {
+      localStorage.setItem('deltaai_sniper_autopilot_armed', 'true');
+      localStorage.setItem('deltaai_auto_command_enabled', 'true');
+    } catch {}
+
+    fetch('/api/delta/autopilot-state', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sniperAutoPilotArmed: true, armedAt: Date.now() }),
+    }).catch(() => {});
+
     addLog('AUTOPILOT', 'Circuit Breaker & Cooldown Reset', 'Circuit breaker reset manually. Loss count cleared, 15m cooldowns removed, Auto-Pilot re-armed.');
     onSendNotification('Circuit Breaker Reset', 'Circuit breaker reset manually. Auto-Pilot re-armed.', 'INFO');
   }, [tradingMode, isLiveApiAuthenticated, addLog, onSendNotification, setIsSignalStandby]);
@@ -5385,50 +5582,10 @@ export function useSniperScalpingEngine({
   // Per-position Drawdown Rescue circuit-breaker map keyed by `${symbol}_${entryPrice}_${side}`
   // Latches immediately on execution OR exchange rejection (e.g. insufficient_margin) for >= 15 minutes
   // or until available wallet margin increases above required_additional_balance.
-  const RESCUE_CIRCUIT_STORAGE_KEY = 'delta_rescue_circuit_breaker_v1';
-  const rescueAttemptedOrBlockedMapRef = useRef<Map<string, RescueCircuitBreakerEntry>>(
-    (() => {
-      const map = new Map<string, RescueCircuitBreakerEntry>();
-      try {
-        const raw = localStorage.getItem(RESCUE_CIRCUIT_STORAGE_KEY);
-        if (raw) {
-          const parsed = JSON.parse(raw);
-          const now = Date.now();
-          if (parsed && typeof parsed === 'object') {
-            for (const [k, v] of Object.entries(parsed)) {
-              const entry = v as RescueCircuitBreakerEntry;
-              if (
-                entry &&
-                typeof entry === 'object' &&
-                (entry.status === 'EXECUTED' ||
-                  entry.status === 'FALLBACK_DERISK_EXECUTED' ||
-                  (typeof entry.cooldownUntil === 'number' && entry.cooldownUntil > now))
-              ) {
-                map.set(k, entry);
-              }
-            }
-          }
-        }
-      } catch {}
-      return map;
-    })()
-  );
+  const rescueAttemptedOrBlockedMapRef = useRef<Map<string, RescueCircuitBreakerEntry>>(new Map());
 
   const persistRescueCircuitMap = useCallback(() => {
-    try {
-      const now = Date.now();
-      const serializable: Record<string, RescueCircuitBreakerEntry> = {};
-      for (const [k, v] of rescueAttemptedOrBlockedMapRef.current.entries()) {
-        if (
-          v.status === 'EXECUTED' ||
-          v.status === 'FALLBACK_DERISK_EXECUTED' ||
-          v.cooldownUntil > now
-        ) {
-          serializable[k] = v;
-        }
-      }
-      localStorage.setItem(RESCUE_CIRCUIT_STORAGE_KEY, JSON.stringify(serializable));
-    } catch {}
+    // In-memory only: never persist trading/rescue state to localStorage
   }, []);
 
   const latchRescueCircuitEntry = useCallback(
@@ -6398,20 +6555,10 @@ export function useSniperScalpingEngine({
     ]
   );
 
-  const [isAutoRescueEnabled, setIsAutoRescueEnabledState] = useState<boolean>(() => {
-    try {
-      const saved = localStorage.getItem('delta_perp_auto_rescue_enabled_v1');
-      if (saved === 'true') return true;
-      if (saved === 'false') return false;
-    } catch {}
-    return false;
-  });
+  const [isAutoRescueEnabled, setIsAutoRescueEnabledState] = useState<boolean>(false);
 
   const setIsAutoRescueEnabled = useCallback((val: boolean) => {
     setIsAutoRescueEnabledState(val);
-    try {
-      localStorage.setItem('delta_perp_auto_rescue_enabled_v1', val ? 'true' : 'false');
-    } catch {}
   }, []);
 
   // Auto-executable Drawdown Rescue loop (strictly <= 1 adjustment per trade, circuit-broken 15m per position on block/execution)
@@ -6459,6 +6606,17 @@ export function useSniperScalpingEngine({
     persistRescueCircuitMap,
   ]);
 
+  const effectiveEquity = (typeof totalEquity === 'number' && totalEquity > 0) ? totalEquity : (availableBalance || 1000);
+  const dailyLossPercent = cumulativeRealizedProfitUsd < 0 ? +(Math.abs(cumulativeRealizedProfitUsd) / effectiveEquity * 100).toFixed(2) : 0;
+  const isCircuitBreakerActive = circuitBreakerTripped || consecutiveStopsCount >= 3 || dailyLossPercent >= 1.5;
+  const effectiveCircuitBreakerReason = circuitBreakerReason || (
+    consecutiveStopsCount >= 3
+      ? `3 Consecutive Losses (${consecutiveStopsCount}/3) Hit`
+      : dailyLossPercent >= 1.5
+      ? `Daily Loss Limit Tripped (${dailyLossPercent.toFixed(2)}% >= 1.5% max daily risk)`
+      : null
+  );
+
   return useMemo(() => ({
     currentSignal,
     activeTrade,
@@ -6469,6 +6627,8 @@ export function useSniperScalpingEngine({
     refreshSignalSnapshot,
     isAutoSniperEnabled,
     setIsAutoSniperEnabled,
+    isAutoPilotArmed: isAutoSniperEnabled,
+    setIsAutoPilotArmed: setIsAutoSniperEnabled,
     syncSniperAutoPilotFromServer,
     directionMode,
     setDirectionMode,
@@ -6496,6 +6656,10 @@ export function useSniperScalpingEngine({
     consecutiveStopsCount,
     resetCircuitBreaker,
     simulate5mCandleClose,
+    circuitBreakerTripped: isCircuitBreakerActive,
+    circuitBreakerReason: effectiveCircuitBreakerReason,
+    dailyLossPercent,
+    postSlCooldownUntilMs,
 
     bypassHtfFilter,
     setBypassHtfFilter: handleSetBypassHtfFilter,
@@ -6558,6 +6722,10 @@ export function useSniperScalpingEngine({
     consecutiveStopsCount,
     resetCircuitBreaker,
     simulate5mCandleClose,
+    isCircuitBreakerActive,
+    effectiveCircuitBreakerReason,
+    dailyLossPercent,
+    postSlCooldownUntilMs,
     bypassHtfFilter,
     handleSetBypassHtfFilter,
     executionTriggerMode,

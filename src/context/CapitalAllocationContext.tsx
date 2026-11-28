@@ -301,48 +301,16 @@ function toRiskSettingsObject(cfg: CapitalAllocationConfig): RiskSettings {
 }
 
 function getAuthHeadersForConfigSync(): Record<string, string> {
-  const headers: Record<string, string> = {
+  return {
     'Content-Type': 'application/json',
     'x-admin-email': 'dhanrajk69@gmail.com',
   };
-  try {
-    const token =
-      localStorage.getItem('delta_session_token') ||
-      localStorage.getItem('delta_auth_token') ||
-      sessionStorage.getItem('delta_session_token');
-    if (token) {
-      headers.Authorization = `Bearer ${token}`;
-    }
-  } catch {}
-  return headers;
 }
 
 const CapitalAllocationContext = createContext<CapitalAllocationContextType | null>(null);
 
 export const CapitalAllocationProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
-  const [config, setConfig] = useState<CapitalAllocationConfig>(() => {
-    try {
-      if (typeof window !== 'undefined') {
-        const savedAlloc = localStorage.getItem(STORAGE_KEY);
-        const savedRisk = localStorage.getItem(RISK_SETTINGS_STORAGE_KEY);
-        const parsedAlloc = savedAlloc ? JSON.parse(savedAlloc) : {};
-        const parsedRisk = savedRisk ? JSON.parse(savedRisk) : {};
-        if (savedAlloc || savedRisk) {
-          return sanitizeConfig({
-            ...parsedAlloc,
-            ...parsedRisk,
-            // Preserve whichever has an explicit defaultLotSize/fixedLot
-            defaultLotSize: parsedRisk.defaultLotSize ?? parsedAlloc.defaultLotSize ?? parsedAlloc.fixedLot,
-            fixedLot: parsedRisk.defaultLotSize ?? parsedAlloc.fixedLot ?? parsedAlloc.defaultLotSize,
-            lotSizingMode: parsedRisk.lotSizingMode ?? parsedAlloc.lotSizingMode,
-          });
-        }
-      }
-    } catch (e) {
-      console.warn('[CapitalAllocation] Failed to load from localStorage:', e);
-    }
-    return DEFAULT_CONFIG;
-  });
+  const [config, setConfig] = useState<CapitalAllocationConfig>(DEFAULT_CONFIG);
 
   const [lastServerSyncAt, setLastServerSyncAt] = useState<number | null>(null);
   const persistTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -396,21 +364,7 @@ export const CapitalAllocationProvider: React.FC<{ children: React.ReactNode }> 
     };
   }, []);
 
-  // Ensure initial localStorage persistence
-  useEffect(() => {
-    try {
-      if (typeof window !== 'undefined') {
-        if (!localStorage.getItem(STORAGE_KEY)) {
-          localStorage.setItem(STORAGE_KEY, JSON.stringify(config));
-        }
-        if (!localStorage.getItem(RISK_SETTINGS_STORAGE_KEY)) {
-          localStorage.setItem(RISK_SETTINGS_STORAGE_KEY, JSON.stringify(toRiskSettingsObject(config)));
-        }
-      }
-    } catch {}
-  }, [config]);
-
-  // Hydrate persisted Risk Settings from ~/.deltaai-data/config.json on mount
+  // Hydrate Risk Settings from server config on mount (in-memory only)
   useEffect(() => {
     if (hasHydratedFromServerRef.current || typeof window === 'undefined') return;
     hasHydratedFromServerRef.current = true;
@@ -423,25 +377,20 @@ export const CapitalAllocationProvider: React.FC<{ children: React.ReactNode }> 
         const srvRisk = data.riskSettings || data.config?.riskSettings;
         const srvLev = data.globalLeverageConfig || data.config?.globalLeverageConfig;
         if (srvRisk || srvLev) {
-          setConfig((prev) => {
-            const merged = sanitizeConfig({
+          setConfig((prev) =>
+            sanitizeConfig({
               ...prev,
               ...(srvLev || {}),
               ...(srvRisk || {}),
-            });
-            try {
-              localStorage.setItem(STORAGE_KEY, JSON.stringify(merged));
-              localStorage.setItem(RISK_SETTINGS_STORAGE_KEY, JSON.stringify(toRiskSettingsObject(merged)));
-            } catch {}
-            return merged;
-          });
+            })
+          );
           setLastServerSyncAt(Date.now());
         }
       })
       .catch(() => {});
   }, []);
 
-  // Sync to localStorage, broadcast cross-component event, and optionally persist to server config.json
+  // Broadcast cross-component event in memory and optionally persist to server config
   const updateConfig = useCallback(
     (
       updater: (prev: CapitalAllocationConfig) => CapitalAllocationConfig,
@@ -453,11 +402,9 @@ export const CapitalAllocationProvider: React.FC<{ children: React.ReactNode }> 
       setConfig((prev) => {
         const next = sanitizeConfig(updater(prev));
         try {
-          localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
-          localStorage.setItem(RISK_SETTINGS_STORAGE_KEY, JSON.stringify(toRiskSettingsObject(next)));
           window.dispatchEvent(new CustomEvent(SYNC_EVENT, { detail: next }));
         } catch (err) {
-          console.warn('[CapitalAllocation] Failed to persist config:', err);
+          console.warn('[CapitalAllocation] Failed to dispatch config sync event:', err);
         }
         if (shouldPersist) {
           persistToServer(next, immediate);
@@ -467,27 +414,6 @@ export const CapitalAllocationProvider: React.FC<{ children: React.ReactNode }> 
     },
     [persistToServer]
   );
-
-  // Listen for storage events from other tabs or windows
-  useEffect(() => {
-    const handleSync = (e?: Event) => {
-      try {
-        if (e && (e as CustomEvent).detail) {
-          return;
-        }
-        const saved = localStorage.getItem(STORAGE_KEY);
-        if (saved) {
-          const sanitized = sanitizeConfig(JSON.parse(saved));
-          setConfig(sanitized);
-        }
-      } catch {}
-    };
-
-    window.addEventListener('storage', handleSync);
-    return () => {
-      window.removeEventListener('storage', handleSync);
-    };
-  }, []);
 
   const hydrateFromServerConfig = useCallback((serverRisk: Partial<RiskSettings>) => {
     if (!serverRisk || typeof serverRisk !== 'object') return;

@@ -60,6 +60,11 @@ export interface CamarillaSniperHubProps {
   onRefreshSignal?: () => void;
   pairCooldowns?: Record<string, number>;
   consecutiveStopsCount?: number;
+  circuitBreakerTripped?: boolean;
+  circuitBreakerReason?: string | null;
+  dailyLossPercent?: number;
+  postSlCooldownUntilMs?: number;
+  onResetCircuitBreaker?: () => void;
   simulate5mCandleClose?: (symbol: string, forcedClose?: number) => void;
   clearPairCooldown?: (symbol: string) => void;
   bypassHtfFilter?: boolean;

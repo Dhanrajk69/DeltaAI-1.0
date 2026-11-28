@@ -42,6 +42,11 @@ export const LiveAccountSyncDiagnosticsPanel: React.FC<LiveAccountSyncDiagnostic
   const [isSyncing, setIsSyncing] = useState<boolean>(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
+  const onSyncCompleteRef = React.useRef(onSyncComplete);
+  React.useEffect(() => {
+    onSyncCompleteRef.current = onSyncComplete;
+  }, [onSyncComplete]);
+
   const fetchReport = useCallback(async (force = false) => {
     try {
       setIsLoading(true);
@@ -56,7 +61,7 @@ export const LiveAccountSyncDiagnosticsPanel: React.FC<LiveAccountSyncDiagnostic
       if (data.success && data.report) {
         setReport(data.report);
         setAuthenticated(Boolean(data.authenticated));
-        if (onSyncComplete) onSyncComplete();
+        onSyncCompleteRef.current?.();
       } else {
         setErrorMessage(data.error || 'Failed to retrieve historical sync diagnostic report.');
       }
@@ -66,7 +71,7 @@ export const LiveAccountSyncDiagnosticsPanel: React.FC<LiveAccountSyncDiagnostic
       setIsLoading(false);
       setIsSyncing(false);
     }
-  }, [onSyncComplete]);
+  }, []);
 
   useEffect(() => {
     fetchReport(false);

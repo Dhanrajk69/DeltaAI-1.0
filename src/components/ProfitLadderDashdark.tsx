@@ -3,14 +3,75 @@ import { Compass, ArrowDown, ArrowUp, Clock } from 'lucide-react';
 import { motion } from 'framer-motion';
 import {
   computeContinuousProfitPalette,
+  computeSequentialLadderSteps,
   ContinuousProfitPalette,
+  SequentialRungState,
 } from '../utils/optionsProfitLadder';
 
 type LadderPnlState = 'POSITIVE' | 'NEGATIVE' | 'FLAT';
 
-interface CircularProgressProps {
+export type SentimentStage = 'STRONG_BULLISH' | 'BULLISH' | 'NEUTRAL' | 'BEARISH' | 'STRONG_BEARISH';
+
+export interface SentimentConfig {
+  stage: SentimentStage;
+  label: string;
+  color: string;
+  accent: string;
+  gradient: [string, string, string];
+  glow: string;
+}
+
+export const SENTIMENT_STAGES: Record<SentimentStage, SentimentConfig> = {
+  STRONG_BULLISH: {
+    stage: 'STRONG_BULLISH',
+    label: 'STR BULL',
+    color: '#065f46', // Dark Green
+    accent: '#34d399',
+    gradient: ['#34d399', '#10b981', '#065f46'],
+    glow: 'rgba(6, 95, 70, 0.45)',
+  },
+  BULLISH: {
+    stage: 'BULLISH',
+    label: 'BULLISH',
+    color: '#10b981', // Green
+    accent: '#10b981',
+    gradient: ['#6ee7b7', '#10b981', '#059669'],
+    glow: 'rgba(16, 185, 129, 0.35)',
+  },
+  NEUTRAL: {
+    stage: 'NEUTRAL',
+    label: 'NEUTRAL',
+    color: '#eab308', // Yellow
+    accent: '#facc15',
+    gradient: ['#fef08a', '#eab308', '#ca8a04'],
+    glow: 'rgba(234, 179, 8, 0.3)',
+  },
+  BEARISH: {
+    stage: 'BEARISH',
+    label: 'BEARISH',
+    color: '#f97316', // Orange
+    accent: '#fb923c',
+    gradient: ['#fdba74', '#f97316', '#ea580c'],
+    glow: 'rgba(249, 115, 22, 0.35)',
+  },
+  STRONG_BEARISH: {
+    stage: 'STRONG_BEARISH',
+    label: 'STR BEAR',
+    color: '#ef4444', // Red
+    accent: '#f87171',
+    gradient: ['#fca5a5', '#ef4444', '#b91c1c'],
+    glow: 'rgba(239, 68, 68, 0.45)',
+  },
+};
+
+export interface CircularProgressProps {
   progress: number;
   displayLabel?: string;
+  sentimentLabel?: string;
+  sentimentColor?: string;
+  sentimentAccent?: string;
+  sentimentGradient?: [string, string, string];
+  isReversing?: boolean;
   palette: ContinuousProfitPalette;
   isHit: boolean;
   isActive: boolean;
@@ -18,9 +79,14 @@ interface CircularProgressProps {
   isHeader?: boolean;
 }
 
-const CircularProgress: React.FC<CircularProgressProps> = ({
+export const CircularProgress: React.FC<CircularProgressProps> = ({
   progress,
   displayLabel,
+  sentimentLabel,
+  sentimentColor,
+  sentimentAccent,
+  sentimentGradient,
+  isReversing = false,
   palette,
   isHit,
   isActive,
@@ -30,47 +96,76 @@ const CircularProgress: React.FC<CircularProgressProps> = ({
   const uid = useId().replace(/:/g, '');
   const dynGradId = `ladder-dyn-${uid}`;
 
-  const radius = 17;
+  const radius = isHeader ? 20 : 17;
+  const size = isHeader ? 50 : 44;
+  const center = size / 2;
+  const strokeWidth = isHeader ? 4.5 : 4;
   const circumference = 2 * Math.PI * radius;
-  const clamped = isDormant && !isHit ? Math.min(100, Math.max(0, progress)) : Math.min(100, Math.max(0, progress));
+  const clamped = Math.min(100, Math.max(0, progress));
   const strokeDashoffset = circumference - (clamped / 100) * circumference;
 
   const showStroke = clamped >= 0;
   const label = displayLabel ?? `${Math.round(clamped)}%`;
 
+  const gradStops = sentimentGradient || (isReversing
+    ? ['#fda4af', '#f43f5e', '#be123c']
+    : [
+        palette?.ringStart || '#38bdf8',
+        palette?.ringMid || '#14b8a6',
+        palette?.ringEnd || '#10b981',
+      ]);
+
   return (
     <div
       className={`relative flex items-center justify-center shrink-0 ${
-        isHeader ? 'w-11 h-11' : 'w-10 h-10'
+        isHeader ? 'w-13 h-13' : 'w-10 h-10'
       }`}
+      title={
+        isHeader
+          ? `Profit Ladder Meter: ${label} · Sentiment: ${sentimentLabel || 'NEUTRAL'} (${
+              isReversing ? 'Anti-clockwise Reversal' : 'Clockwise toward TP'
+            })`
+          : undefined
+      }
     >
       <svg
-        className={`${isHeader ? 'w-11 h-11' : 'w-10 h-10'} -rotate-90 transform overflow-visible`}
-        viewBox="0 0 44 44"
-        style={{ filter: 'drop-shadow(0 0 8px rgba(56, 189, 248, 0.35))' }}
+        className={`${
+          isHeader ? 'w-13 h-13' : 'w-10 h-10'
+        } origin-center transform overflow-visible transition-transform duration-500 ${
+          isReversing ? 'scale-x-[-1] -rotate-90' : '-rotate-90'
+        }`}
+        viewBox={`0 0 ${size} ${size}`}
+        style={{
+          transformOrigin: 'center',
+          filter: isReversing
+            ? 'drop-shadow(0 0 7px rgba(244, 63, 94, 0.55))'
+            : sentimentColor
+            ? `drop-shadow(0 0 7px ${sentimentColor}66)`
+            : 'drop-shadow(0 0 8px rgba(56, 189, 248, 0.35))',
+        }}
       >
         <defs>
           <linearGradient id={dynGradId} x1="0%" y1="0%" x2="100%" y2="100%">
-            <stop offset="0%" stopColor="#38bdf8" />
-            <stop offset="50%" stopColor="#0ea5e9" />
-            <stop offset="100%" stopColor="#2563eb" />
+            <stop offset="0%" stopColor={gradStops[0]} />
+            <stop offset="50%" stopColor={gradStops[1]} />
+            <stop offset="100%" stopColor={gradStops[2]} />
           </linearGradient>
         </defs>
         <circle
-          cx="22"
-          cy="22"
+          cx={center}
+          cy={center}
           r={radius}
           stroke="rgba(255, 255, 255, 0.08)"
-          strokeWidth={4.5}
+          strokeWidth={strokeWidth}
           fill="none"
         />
         {showStroke && (
           <motion.circle
-            cx="22"
-            cy="22"
+            cx={center}
+            cy={center}
             r={radius}
             stroke={`url(#${dynGradId})`}
-            strokeWidth={4.5}
+            strokeWidth={strokeWidth}
             strokeDasharray={circumference}
             initial={{ strokeDashoffset: circumference }}
             animate={{ strokeDashoffset }}
@@ -80,11 +175,31 @@ const CircularProgress: React.FC<CircularProgressProps> = ({
           />
         )}
       </svg>
-      <span
-        className="absolute text-[9.5px] font-extrabold font-mono tabular-nums tracking-tight transition-colors duration-300 text-cyan-200"
-      >
-        {label}
-      </span>
+      {isHeader && sentimentLabel ? (
+        <div className="absolute inset-0 flex flex-col items-center justify-center text-center pointer-events-none leading-none">
+          <span
+            className="text-[9.5px] font-extrabold font-mono tabular-nums tracking-tight transition-colors duration-300"
+            style={{ color: sentimentAccent || (isReversing ? '#fb7185' : '#e0f2fe') }}
+          >
+            {label}
+          </span>
+          <span
+            className="text-[6.5px] font-black uppercase tracking-wider mt-0.5 leading-none"
+            style={{ color: sentimentColor || (isReversing ? '#f43f5e' : '#38bdf8') }}
+          >
+            {sentimentLabel}
+          </span>
+        </div>
+      ) : (
+        <span
+          className={`absolute text-[9.5px] font-extrabold font-mono tabular-nums tracking-tight transition-colors duration-300 ${
+            isReversing ? 'text-rose-400' : isHit ? 'text-emerald-300' : 'text-cyan-200'
+          }`}
+          style={sentimentAccent ? { color: sentimentAccent } : undefined}
+        >
+          {label}
+        </span>
+      )}
     </div>
   );
 };
@@ -407,45 +522,60 @@ export const ProfitLadderDashdark: React.FC<ProfitLadderDashdarkProps> = React.m
     return hrs > 0 ? `${hrs}:${mm}:${ss}` : `${mm}:${ss}`;
   }, [stageElapsedMs]);
 
-  // Sequential stage-by-stage progress:
-  // Completed (< activeStepIndex) = 100%, Active (=== activeStepIndex) = segment 0%..100%, Upcoming (> activeStepIndex) = 0%
-  const stepProgressValues = useMemo(() => {
-    const segStarts = [effectiveEntry, resolvedTp1, resolvedTp2, resolvedTp3];
-    const segEnds = [resolvedTp1, resolvedTp2, resolvedTp3, resolvedTp4];
-    const hitFlags = [
+  // Strict Sequential Progression Engine:
+  // Step 01 fills 0% -> 100% first.
+  // Step 02 stays locked at 0% (LOCKED / PENDING) until Step 01 reaches 100% (COMPLETED).
+  // Step 03 stays locked until Step 02 reaches 100%.
+  // Step 04 stays locked until Step 03 reaches 100%.
+  // In drawdown (negative PnL): rungs sweep anticlockwise in rose/crimson across 4 quartiles of SL.
+  const tpOffsets: [number, number, number, number] = useMemo(() => {
+    return [
+      Math.max(0.1, Math.abs(resolvedTp1 - effectiveEntry)),
+      Math.max(0.1, Math.abs(resolvedTp2 - effectiveEntry)),
+      Math.max(0.1, Math.abs(resolvedTp3 - effectiveEntry)),
+      Math.max(0.1, Math.abs(resolvedTp4 - effectiveEntry)),
+    ];
+  }, [resolvedTp1, resolvedTp2, resolvedTp3, resolvedTp4, effectiveEntry]);
+
+  const rawHitFlags: [boolean, boolean, boolean, boolean] = useMemo(() => {
+    return [
       Boolean(activeTrade?.tp1Hit),
       Boolean(activeTrade?.tp2Hit),
       Boolean(activeTrade?.tp3Hit),
       Boolean(activeTrade?.tp4Hit),
     ];
+  }, [activeTrade?.tp1Hit, activeTrade?.tp2Hit, activeTrade?.tp3Hit, activeTrade?.tp4Hit]);
 
-    return [0, 1, 2, 3].map((idx) => {
-      if (idx < activeStepIndex || hitFlags[idx]) return 100;
-      if (!isTradeActive || idx > activeStepIndex) return 0;
-      if (pnlState === 'NEGATIVE') return drawdownPct;
-      const segStart = segStarts[idx];
-      const segEnd = segEnds[idx];
-      const segTotal = Math.abs(segEnd - segStart);
-      if (segTotal <= 0) return 0;
-      const movedInSeg = isShort ? segStart - markPrice : markPrice - segStart;
-      return Math.min(100, Math.max(0, Math.round((movedInSeg / segTotal) * 100)));
+  const isTradeNegative = isTradeActive && (pnlState === 'NEGATIVE' || liveUnrealizedUsd < -0.01);
+
+  // Absolute adverse move or friction-driven drawdown distance
+  const adverseDistance = useMemo(() => {
+    if (!isTradeActive) return 0;
+    if (adverseMove > 0) return adverseMove;
+    if (liveUnrealizedUsd < 0 && slDistance > 0) {
+      return (drawdownPct / 100) * slDistance;
+    }
+    return 0;
+  }, [isTradeActive, adverseMove, liveUnrealizedUsd, slDistance, drawdownPct]);
+
+  const sequentialRungStates: SequentialRungState[] = useMemo(() => {
+    return computeSequentialLadderSteps({
+      isTradeActive,
+      isNegative: isTradeNegative,
+      currentPositiveValue: Math.max(0, favorableMove),
+      positiveMilestones: tpOffsets,
+      currentNegativeValue: adverseDistance,
+      negativeMaxThreshold: slDistance,
+      hitFlags: rawHitFlags,
     });
   }, [
-    activeStepIndex,
     isTradeActive,
-    pnlState,
-    drawdownPct,
-    effectiveEntry,
-    resolvedTp1,
-    resolvedTp2,
-    resolvedTp3,
-    resolvedTp4,
-    markPrice,
-    isShort,
-    activeTrade?.tp1Hit,
-    activeTrade?.tp2Hit,
-    activeTrade?.tp3Hit,
-    activeTrade?.tp4Hit,
+    isTradeNegative,
+    favorableMove,
+    tpOffsets,
+    adverseDistance,
+    slDistance,
+    rawHitFlags,
   ]);
 
   // Piecewise continuum fill across Entry (22%) -> TP1 (41.5%) -> TP2 (61%) -> TP3 (80.5%) -> TP4 (100%)
@@ -506,13 +636,13 @@ export const ProfitLadderDashdark: React.FC<ProfitLadderDashdarkProps> = React.m
   ]);
 
   const hitFlags = [
-    0 < activeStepIndex || Boolean(activeTrade?.tp1Hit),
-    1 < activeStepIndex || Boolean(activeTrade?.tp2Hit),
-    2 < activeStepIndex || Boolean(activeTrade?.tp3Hit),
-    3 < activeStepIndex || Boolean(activeTrade?.tp4Hit),
+    sequentialRungStates[0].isCompleted,
+    sequentialRungStates[1].isCompleted,
+    sequentialRungStates[2].isCompleted,
+    sequentialRungStates[3].isCompleted,
   ];
 
-  const stepStates = [
+  const stepStates = useMemo(() => [
     {
       num: 'STEP 01',
       label: isEma921Ladder ? '70% (+ $15 Net) · SL → ±$35 BE' : '50% Close · SL Held',
@@ -520,8 +650,8 @@ export const ProfitLadderDashdark: React.FC<ProfitLadderDashdarkProps> = React.m
       reward: rewards.step1,
       rr: rewards.rrRatios[0],
       isHit: hitFlags[0],
-      isActive: isTradeActive && !hitFlags[0] && activeStepIndex === 0,
-      progress: stepProgressValues[0],
+      isActive: sequentialRungStates[0].isActive,
+      seq: sequentialRungStates[0],
     },
     {
       num: 'STEP 02',
@@ -530,8 +660,8 @@ export const ProfitLadderDashdark: React.FC<ProfitLadderDashdarkProps> = React.m
       reward: rewards.step2,
       rr: rewards.rrRatios[1],
       isHit: hitFlags[1],
-      isActive: isTradeActive && !hitFlags[1] && activeStepIndex === 1,
-      progress: stepProgressValues[1],
+      isActive: sequentialRungStates[1].isActive,
+      seq: sequentialRungStates[1],
     },
     {
       num: 'STEP 03',
@@ -540,8 +670,8 @@ export const ProfitLadderDashdark: React.FC<ProfitLadderDashdarkProps> = React.m
       reward: rewards.step3,
       rr: rewards.rrRatios[2],
       isHit: hitFlags[2],
-      isActive: isTradeActive && !hitFlags[2] && activeStepIndex === 2,
-      progress: stepProgressValues[2],
+      isActive: sequentialRungStates[2].isActive,
+      seq: sequentialRungStates[2],
     },
     {
       num: 'STEP 04',
@@ -550,21 +680,46 @@ export const ProfitLadderDashdark: React.FC<ProfitLadderDashdarkProps> = React.m
       reward: rewards.step4,
       rr: rewards.rrRatios[3],
       isHit: hitFlags[3],
-      isActive: isTradeActive && !hitFlags[3] && activeStepIndex === 3,
+      isActive: sequentialRungStates[3].isActive,
       isTerminal: true,
-      progress: stepProgressValues[3],
+      seq: sequentialRungStates[3],
     },
-  ];
+  ], [
+    isEma921Ladder,
+    resolvedTp1,
+    resolvedTp2,
+    resolvedTp3,
+    resolvedTp4,
+    rewards,
+    hitFlags,
+    sequentialRungStates,
+  ]);
 
-  const headerRingProgress =
-    pnlState === 'NEGATIVE' ? drawdownPct : progressPct;
-  const headerRingLabel =
-    pnlState === 'NEGATIVE' ? `-${drawdownPct}%` : `${progressPct}%`;
+  const headerRingProgress = isTradeNegative ? drawdownPct : progressPct;
+  const headerRingLabel = isTradeNegative ? `-${drawdownPct}%` : `+${progressPct}%`;
 
-  const allStepsHit = hitFlags[3] || (isTradeActive && pnlState === 'POSITIVE' && progressPct >= 100);
+  const isReversing = isTradeNegative;
+
+  // Dynamic 5-stage sentiment transitions:
+  // Strong Bullish (#065f46), Bullish (#10b981), Neutral (#eab308), Bearish (#f97316), Strong Bearish (#ef4444)
+  const activeSentiment = useMemo<SentimentConfig>(() => {
+    if (!isTradeActive || Math.abs(liveUnrealizedUsd) < 0.005) {
+      return SENTIMENT_STAGES.NEUTRAL;
+    }
+    if (isTradeNegative) {
+      return drawdownPct >= 50 ? SENTIMENT_STAGES.STRONG_BEARISH : SENTIMENT_STAGES.BEARISH;
+    }
+    const signedProgress = progressPct;
+    if (signedProgress >= 50 || liveUnrealizedUsd >= 25 || activeTrade?.tp3Hit || activeTrade?.tp4Hit) {
+      return SENTIMENT_STAGES.STRONG_BULLISH;
+    }
+    return SENTIMENT_STAGES.BULLISH;
+  }, [isTradeActive, liveUnrealizedUsd, isTradeNegative, drawdownPct, progressPct, activeTrade?.tp3Hit, activeTrade?.tp4Hit]);
+
+  const allStepsHit = rawHitFlags[3] || (isTradeActive && pnlState === 'POSITIVE' && progressPct >= 100);
   const overallSignedRatio = !isTradeActive
     ? 0
-    : pnlState === 'NEGATIVE'
+    : isTradeNegative
     ? -(drawdownPct / 100)
     : allStepsHit
     ? 1
@@ -600,6 +755,11 @@ export const ProfitLadderDashdark: React.FC<ProfitLadderDashdarkProps> = React.m
           <CircularProgress
             progress={headerRingProgress}
             displayLabel={headerRingLabel}
+            sentimentLabel={activeSentiment.label}
+            sentimentColor={activeSentiment.color}
+            sentimentAccent={activeSentiment.accent}
+            sentimentGradient={activeSentiment.gradient}
+            isReversing={isReversing}
             palette={overallPalette}
             isHit={allStepsHit}
             isActive={isTradeActive}
@@ -623,8 +783,8 @@ export const ProfitLadderDashdark: React.FC<ProfitLadderDashdarkProps> = React.m
             </div>
             <p className="text-[10px] text-slate-300 font-mono mt-0.5 truncate">
               {isTradeActive ? (
-                <span>
-                  Live Continuum · {effectiveLotSize} {baseSymbol}
+                <span className="text-cyan-300 font-semibold">
+                  ACTIVE TRACKING · {effectiveLotSize} {baseSymbol}
                 </span>
               ) : (
                 <span className="text-slate-400">
@@ -746,57 +906,31 @@ export const ProfitLadderDashdark: React.FC<ProfitLadderDashdarkProps> = React.m
           ═══════════════════════════════════════════════════════════ */}
       <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-2.5 min-w-0 max-w-full">
         {stepStates.map((step) => {
-          const stepAchieved =
-            step.isHit ||
-            (isTradeActive &&
-              pnlState === 'POSITIVE' &&
-              (step.progress >= 100 ||
-                (step.reward.amount > 0 && liveUnrealizedUsd >= step.reward.amount)));
-          const isDormant = !stepAchieved && !step.isActive;
-          const isNegative = isTradeActive && pnlState === 'NEGATIVE';
+          const seq = step.seq;
+          const isNegative = seq.isReversing;
+          const stepAchieved = seq.isCompleted && !isNegative;
+          const isDormant = seq.isLocked;
 
-          // Continuous progressRatio (0.0 -> 1.0) counting up from $0.00 -> target
-          const rungProgressRatio = stepAchieved
-            ? 1
-            : !isTradeActive || liveUnrealizedUsd <= 0
-            ? 0
-            : step.reward.amount > 0
-            ? Math.min(0.999, Math.max(0, liveUnrealizedUsd / step.reward.amount))
-            : Math.min(0.999, Math.max(0, step.progress / 100));
-
-          const rungProgressPct = stepAchieved
-            ? 100
-            : Math.min(99, Math.max(0, Math.round(rungProgressRatio * 100)));
-
-          const rungSignedRatio = isNegative
-            ? -(drawdownPct / 100)
-            : rungProgressRatio;
-
-          const p = computeContinuousProfitPalette(rungSignedRatio, {
+          const p = computeContinuousProfitPalette(seq.signedRatio, {
             isNeutralFlat: !isTradeActive || Math.abs(liveUnrealizedUsd) < 0.005,
-            isActive: step.isActive,
-            isAchieved: stepAchieved,
+            isActive: seq.isActive,
+            isAchieved: seq.isCompleted,
           });
 
-          const ringProgress = stepAchieved
-            ? 100
-            : isNegative
-            ? drawdownPct
-            : rungProgressPct;
-
-          const ringLabel = stepAchieved
-            ? '100%'
-            : isNegative
-            ? `-${drawdownPct}%`
-            : `${rungProgressPct}%`;
+          const ringProgress = seq.progressPct;
+          const ringLabel = seq.displayLabel;
 
           const remainingDist = Math.abs(step.price - markPrice);
 
           // Clean Dark Obsidian card surfaces (emerald glass tint reserved exclusively for 100% ACHIEVED)
-          const cardSurfaceClass = stepAchieved
-            ? 'bg-[#081c18] border-emerald-500/40 shadow-[0_0_18px_rgba(16,185,129,0.12)]'
-            : step.isActive
-            ? 'bg-[#0c1220] border-cyan-400/50 shadow-[0_0_20px_rgba(56,189,248,0.12)]'
+          const cardSurfaceClass = seq.isCompleted
+            ? isNegative
+              ? 'bg-[#1a090e] border-rose-500/40 shadow-[0_0_18px_rgba(244,63,94,0.14)]'
+              : 'bg-[#081c18] border-emerald-500/40 shadow-[0_0_18px_rgba(16,185,129,0.12)]'
+            : seq.isActive
+            ? isNegative
+              ? 'bg-[#15080c] border-rose-400/50 shadow-[0_0_20px_rgba(244,63,94,0.18)]'
+              : 'bg-[#0c1220] border-cyan-400/50 shadow-[0_0_20px_rgba(56,189,248,0.12)]'
             : 'bg-[#0c1220] border-white/10';
 
           return (
@@ -810,49 +944,31 @@ export const ProfitLadderDashdark: React.FC<ProfitLadderDashdarkProps> = React.m
                   {step.num}
                 </span>
 
-                {stepAchieved ? (
+                {seq.status === 'COMPLETED' ? (
                   <span
-                    className="inline-flex items-center px-1.5 py-0.5 rounded border text-[8.5px] font-extrabold whitespace-nowrap shrink-0 transition-colors duration-300"
-                    style={{
-                      backgroundColor: p.badgeBg,
-                      borderColor: p.badgeBorder,
-                      color: p.text,
-                    }}
+                    className={`inline-flex items-center px-1.5 py-0.5 rounded border text-[8.5px] font-extrabold whitespace-nowrap shrink-0 transition-colors duration-300 ${
+                      isNegative
+                        ? 'bg-rose-500/15 border-rose-500/40 text-rose-400'
+                        : 'bg-emerald-500/15 border-emerald-500/40 text-emerald-400'
+                    }`}
                   >
-                    ✓ ACHIEVED
+                    ✓ COMPLETED
                   </span>
-                ) : isNegative ? (
+                ) : seq.status === 'ACTIVE' ? (
                   <span
-                    className="px-1.5 py-0.5 rounded text-[8.5px] font-extrabold uppercase tracking-tight whitespace-nowrap shrink-0 border transition-colors duration-300"
-                    style={{
-                      backgroundColor: p.badgeBg,
-                      borderColor: p.badgeBorder,
-                      color: p.text,
-                    }}
+                    className={`inline-flex items-center px-1.5 py-0.5 rounded text-[8.5px] font-extrabold uppercase tracking-tight whitespace-nowrap shrink-0 border transition-colors duration-300 ${
+                      isNegative
+                        ? 'bg-rose-500/20 border-rose-400/60 text-rose-300 shadow-[0_0_12px_rgba(244,63,94,0.3)] animate-pulse'
+                        : 'bg-cyan-500/20 border-cyan-400/60 text-cyan-200 shadow-[0_0_12px_rgba(56,189,248,0.25)] animate-pulse'
+                    }`}
                   >
-                    DD · -{drawdownPct}%
-                  </span>
-                ) : step.isActive ? (
-                  <span
-                    className="px-1.5 py-0.5 rounded text-[8.5px] font-extrabold uppercase tracking-tight whitespace-nowrap shrink-0 border transition-colors duration-300"
-                    style={{
-                      backgroundColor: p.badgeBg,
-                      borderColor: p.badgeBorder,
-                      color: p.text,
-                    }}
-                  >
-                    ACTIVE · {rungProgressPct}%
+                    ACTIVE · {seq.displayLabel}
                   </span>
                 ) : (
                   <span
-                    className="px-1.5 py-0.5 rounded border text-[8.5px] font-mono font-bold shrink-0 transition-colors duration-300"
-                    style={{
-                      backgroundColor: p.badgeBg,
-                      borderColor: p.badgeBorder,
-                      color: p.text,
-                    }}
+                    className="px-1.5 py-0.5 rounded border text-[8.5px] font-mono font-bold shrink-0 transition-colors duration-300 bg-white/[0.04] border-white/10 text-slate-400"
                   >
-                    {rungProgressPct > 0 ? `${rungProgressPct}% · ${step.rr}` : `PENDING · ${step.rr}`}
+                    LOCKED / PENDING
                   </span>
                 )}
               </div>
@@ -863,9 +979,10 @@ export const ProfitLadderDashdark: React.FC<ProfitLadderDashdarkProps> = React.m
                   progress={ringProgress}
                   displayLabel={ringLabel}
                   palette={p}
-                  isHit={stepAchieved}
-                  isActive={step.isActive}
+                  isHit={seq.isCompleted}
+                  isActive={seq.isActive}
                   isDormant={isDormant}
+                  isReversing={isNegative}
                 />
                 <div className="text-right min-w-0 flex-1">
                   <div className="flex flex-wrap items-baseline justify-end gap-1 min-w-0">
@@ -912,20 +1029,24 @@ export const ProfitLadderDashdark: React.FC<ProfitLadderDashdarkProps> = React.m
                   </div>
                 </div>
 
-                {/* Progress Bar (Electric Cyan -> Vibrant Teal -> Neon Mint OR Cool Indigo -> Warm Rose -> Deep Crimson) */}
+                {/* Progress Bar (Electric Cyan -> Vibrant Teal -> Neon Mint OR Rose -> Crimson) */}
                 <div className="w-full bg-[#070b14] h-2 rounded-full border border-white/10 overflow-hidden">
                   <div
                     className="h-full rounded-full transition-all duration-500"
                     style={{
-                      width: `${isNegative ? Math.min(100, Math.max(8, drawdownPct)) : rungProgressPct}%`,
-                      background: p.barGradient,
-                      boxShadow: (isNegative ? drawdownPct : rungProgressPct) > 0 ? `0 0 8px ${p.solid}` : 'none',
+                      width: `${seq.progressPct}%`,
+                      background: isNegative
+                        ? 'linear-gradient(90deg, #fda4af 0%, #f43f5e 50%, #be123c 100%)'
+                        : p.barGradient,
+                      boxShadow: seq.progressPct > 0
+                        ? (isNegative ? '0 0 8px rgba(244, 63, 94, 0.5)' : `0 0 8px ${p.solid}`)
+                        : 'none',
                     }}
                   />
                 </div>
 
                 {/* Stage Duration Timer on Active Target Card (Pure White Value, Muted Slate Label) */}
-                {step.isActive && isTradeActive && (
+                {seq.isActive && isTradeActive && (
                   <div
                     className={`px-2 py-1 rounded-md text-[9.5px] font-mono tabular-nums flex items-center justify-between gap-1 border transition-colors ${
                       isStageOver15Min

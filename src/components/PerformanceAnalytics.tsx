@@ -305,6 +305,78 @@ export const PerformanceAnalytics: React.FC<PerformanceAnalyticsProps> = ({
     return list.sort((a, b) => a.closedAt - b.closedAt);
   }, [history, timeframeFilter]);
 
+  // Closed trades table sorting & manual sync state
+  type HistorySortField = 'closedAt' | 'symbol' | 'realisedPnl';
+  const [historySortField, setHistorySortField] = useState<HistorySortField>('closedAt');
+  const [historySortDir, setHistorySortDir] = useState<'asc' | 'desc'>('desc');
+  const [isSyncingHistory, setIsSyncingHistory] = useState<boolean>(false);
+  const [historySyncStatus, setHistorySyncStatus] = useState<string | null>(null);
+
+  const toggleSort = (field: HistorySortField) => {
+    if (historySortField === field) {
+      setHistorySortDir((prev) => (prev === 'asc' ? 'desc' : 'asc'));
+    } else {
+      setHistorySortField(field);
+      setHistorySortDir(field === 'symbol' ? 'asc' : 'desc');
+    }
+  };
+
+  const handleManualRefreshHistory = async () => {
+    setIsSyncingHistory(true);
+    setHistorySyncStatus('Connecting to Delta Exchange /v2/fills...');
+    try {
+      const res = await fetch(`/api/delta/sync-full-history?_t=${Date.now()}`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-admin-email': 'dhanrajk69@gmail.com',
+        },
+        body: JSON.stringify({ maxFillPages: 25, maxOrderPages: 15 }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (data?.success) {
+        const added = data.warehouseAddedCount || 0;
+        const total = data.totalSyncedFills || (Array.isArray(data.tradeHistory) ? data.tradeHistory.length : 0);
+        setHistorySyncStatus(`✓ Synced ${total} fills (${added} new records)`);
+        if (Array.isArray(data.tradeHistory) && typeof window !== 'undefined') {
+          window.dispatchEvent(
+            new CustomEvent('delta:full-history-synced', {
+              detail: {
+                tradeHistory: data.tradeHistory,
+                pairedTradesCount: data.pairedTradesCount || 0,
+                warehouseAddedCount: added,
+              },
+            })
+          );
+        }
+        if (onRefresh) onRefresh();
+      } else {
+        setHistorySyncStatus(data?.error ? `Notice: ${data.error}` : 'History synced with exchange');
+      }
+    } catch (err: any) {
+      setHistorySyncStatus('History sync failed: ' + (err?.message || 'Network error'));
+    } finally {
+      setIsSyncingHistory(false);
+      setTimeout(() => setHistorySyncStatus(null), 6000);
+    }
+  };
+
+  const sortedHistory = useMemo(() => {
+    const list = [...filteredHistory];
+    list.sort((a, b) => {
+      let comparison = 0;
+      if (historySortField === 'closedAt') {
+        comparison = a.closedAt - b.closedAt;
+      } else if (historySortField === 'symbol') {
+        comparison = a.symbol.localeCompare(b.symbol);
+      } else if (historySortField === 'realisedPnl') {
+        comparison = (a.realisedPnl || 0) - (b.realisedPnl || 0);
+      }
+      return historySortDir === 'asc' ? comparison : -comparison;
+    });
+    return list;
+  }, [filteredHistory, historySortField, historySortDir]);
+
   // Exported Active Resolved Strategy Telemetry & CPR Credit Spread vs Camarilla Sniper Comparison
   const exportedStrategyStats = useMemo<ExportedResolvedStrategyStats>(() => {
     return exportActiveResolvedStrategyStats({
@@ -3012,19 +3084,36 @@ export const PerformanceAnalytics: React.FC<PerformanceAnalyticsProps> = ({
           3. COMPACT RECENT CLOSED TRADES LOG & AUDIT STRIP
           ═══════════════════════════════════════════════════════════════════════════ */}
       <div className="panel-delta p-3 sm:p-4">
-        <div className="flex items-center justify-between pb-2.5 mb-2.5 border-b border-slate-800">
+        <div className="flex flex-wrap items-center justify-between gap-2 pb-2.5 mb-2.5 border-b border-slate-800">
           <div className="flex items-center gap-2">
             <Clock className="w-4 h-4 text-cyan-400" />
             <h2 className="panel-delta-title">
-              Completed Trades & Execution Log ({filteredHistory.length})
+              Completed Trades & Execution Log ({sortedHistory.length})
             </h2>
           </div>
-          <span className="text-[11px] text-slate-400 font-mono-numbers">
-            INR/USD Exchange: ₹{effectiveRate}/$
-          </span>
+          <div className="flex flex-wrap items-center gap-2.5">
+            {historySyncStatus && (
+              <span className="text-[10.5px] font-mono px-2 py-0.5 rounded bg-cyan-950/80 border border-cyan-800 text-cyan-300">
+                {historySyncStatus}
+              </span>
+            )}
+            <button
+              type="button"
+              onClick={handleManualRefreshHistory}
+              disabled={isSyncingHistory}
+              className="btn-delta btn-secondary text-[11px] py-1 px-2.5 flex items-center gap-1.5 transition-all"
+              title="Query Delta Exchange India /v2/fills ledger and reconcile local trade history"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 ${isSyncingHistory ? 'animate-spin text-cyan-400' : ''}`} />
+              <span>{isSyncingHistory ? 'Syncing...' : 'Refresh History'}</span>
+            </button>
+            <span className="text-[11px] text-slate-400 font-mono-numbers">
+              INR/USD Exchange: ₹{effectiveRate}/$
+            </span>
+          </div>
         </div>
 
-        {filteredHistory.length === 0 ? (
+        {sortedHistory.length === 0 ? (
           <div className="py-8 text-center text-slate-500 text-xs font-mono-numbers">
             No closed trades logged in this session yet. Execute trades from the Dashboard or Sniper Engine to populate live performance analytics.
           </div>
@@ -3032,19 +3121,58 @@ export const PerformanceAnalytics: React.FC<PerformanceAnalyticsProps> = ({
           <div className="overflow-x-auto">
             <table className="w-full text-left text-xs font-mono-numbers">
               <thead>
-                <tr className="border-b border-slate-800/80 text-slate-400 text-[10px] uppercase">
-                  <th className="py-2 px-2.5">Time</th>
-                  <th className="py-2 px-2.5">Symbol</th>
+                <tr className="border-b border-slate-800/80 text-slate-400 text-[10px] uppercase select-none">
+                  <th
+                    onClick={() => toggleSort('closedAt')}
+                    className="py-2 px-2.5 cursor-pointer hover:text-cyan-300 transition-colors"
+                    title="Sort by Trade Close Date/Time"
+                  >
+                    <span className="flex items-center gap-1">
+                      Time
+                      {historySortField === 'closedAt' && (
+                        <span className="text-cyan-400 text-[11px]">
+                          {historySortDir === 'asc' ? '▲' : '▼'}
+                        </span>
+                      )}
+                    </span>
+                  </th>
+                  <th
+                    onClick={() => toggleSort('symbol')}
+                    className="py-2 px-2.5 cursor-pointer hover:text-cyan-300 transition-colors"
+                    title="Sort alphabetically by Contract Symbol"
+                  >
+                    <span className="flex items-center gap-1">
+                      Symbol
+                      {historySortField === 'symbol' && (
+                        <span className="text-cyan-400 text-[11px]">
+                          {historySortDir === 'asc' ? '▲' : '▼'}
+                        </span>
+                      )}
+                    </span>
+                  </th>
                   <th className="py-2 px-2.5">Side</th>
                   <th className="py-2 px-2.5">Size</th>
                   <th className="py-2 px-2.5">Entry</th>
                   <th className="py-2 px-2.5">Exit</th>
-                  <th className="py-2 px-2.5 text-right">Realised PnL</th>
-                  <th className="py-2 px-2.5">Exit Reason</th>
+                  <th
+                    onClick={() => toggleSort('realisedPnl')}
+                    className="py-2 px-2.5 text-right cursor-pointer hover:text-cyan-300 transition-colors"
+                    title="Sort by Realised PnL"
+                  >
+                    <span className="flex items-center justify-end gap-1">
+                      Realised PnL
+                      {historySortField === 'realisedPnl' && (
+                        <span className="text-cyan-400 text-[11px]">
+                          {historySortDir === 'asc' ? '▲' : '▼'}
+                        </span>
+                      )}
+                    </span>
+                  </th>
+                  <th className="py-2 px-2.5">Exit Reason / Strategy</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-800/40">
-                {filteredHistory.slice(0, 15).map((trade) => {
+                {sortedHistory.slice(0, 20).map((trade) => {
                   const isWin = trade.realisedPnl > 0;
                   const isLoss = trade.realisedPnl < 0;
                   const pnlInr = +(trade.realisedPnl * effectiveRate).toFixed(2);
@@ -3053,11 +3181,85 @@ export const PerformanceAnalytics: React.FC<PerformanceAnalyticsProps> = ({
                     minute: '2-digit',
                     second: '2-digit',
                   });
+                  const dateFormatted = new Date(trade.closedAt).toLocaleDateString([], {
+                    month: 'short',
+                    day: 'numeric',
+                  });
+
+                  // Fee, GST, Slippage & Strategy Tag calculation for interactive tooltip
+                  const contractVal = trade.symbol.includes('BTC') ? 0.001 : trade.symbol.includes('ETH') ? 0.01 : 1;
+                  const notional = Math.abs(trade.size || 0) * (trade.exitPrice || trade.entryPrice || 0) * contractVal;
+                  const estTakerFeeUsd = +(notional * 0.0005).toFixed(3);
+                  const estGstUsd = +(estTakerFeeUsd * 0.18).toFixed(3);
+                  const estTotalFeeUsd = +(estTakerFeeUsd + estGstUsd).toFixed(3);
+                  const estSlippageUsd = +(notional * 0.0002).toFixed(3);
+
+                  const reasonLow = String(trade.reason || '').toLowerCase();
+                  const strategyTag = reasonLow.includes('sniper')
+                    ? 'Sniper Momentum'
+                    : reasonLow.includes('option') || trade.symbol.startsWith('C-') || trade.symbol.startsWith('P-')
+                    ? 'Options CPR Strategy'
+                    : reasonLow.includes('ratchet') || reasonLow.includes('trailing')
+                    ? 'Ratchet Trailing SL'
+                    : reasonLow.includes('tp') || reasonLow.includes('target')
+                    ? 'Target Milestone TP'
+                    : reasonLow.includes('sl') || reasonLow.includes('stop loss')
+                    ? 'Stop Loss Risk Exit'
+                    : reasonLow.includes('reconciliation')
+                    ? 'Exchange Reconciled'
+                    : 'Manual Execution';
 
                   return (
-                    <tr key={trade.id} className="hover:bg-slate-900/50 transition">
-                      <td className="py-2 px-2.5 text-slate-400">{timeFormatted}</td>
-                      <td className="py-2 px-2.5 font-bold text-white">{trade.symbol}</td>
+                    <tr
+                      key={trade.id}
+                      className="group relative hover:bg-slate-900/60 transition cursor-pointer"
+                    >
+                      <td className="py-2 px-2.5 text-slate-400 whitespace-nowrap">
+                        <div>{timeFormatted}</div>
+                        <div className="text-[10px] text-slate-500">{dateFormatted}</div>
+                      </td>
+                      <td className="py-2 px-2.5 font-bold text-white relative">
+                        <span className="flex items-center gap-1.5">
+                          {trade.symbol}
+                          <Info className="w-3 h-3 text-slate-500 group-hover:text-cyan-400 opacity-60 group-hover:opacity-100 transition-opacity" />
+                        </span>
+
+                        {/* Interactive Tooltip on Hover */}
+                        <div className="absolute left-6 top-8 z-50 hidden group-hover:block w-72 p-3 bg-slate-950/95 border border-cyan-800/80 rounded-lg shadow-2xl backdrop-blur-md pointer-events-none text-left">
+                          <div className="flex items-center justify-between pb-1.5 mb-1.5 border-b border-slate-800">
+                            <span className="font-bold text-cyan-300 text-[11px]">{trade.symbol} Execution Breakdown</span>
+                            <span className="text-[9.5px] px-1.5 py-0.5 rounded bg-cyan-900/40 text-cyan-200 border border-cyan-700/50">
+                              {strategyTag}
+                            </span>
+                          </div>
+                          <div className="space-y-1 text-[10.5px] text-slate-300">
+                            <div className="flex justify-between">
+                              <span className="text-slate-400">Position Notional:</span>
+                              <span className="font-mono text-white">${notional.toFixed(2)}</span>
+                            </div>
+                            <div className="flex justify-between">
+                              <span className="text-slate-400">Exchange Fee (0.05%):</span>
+                              <span className="font-mono text-slate-200">${estTakerFeeUsd} (₹{(estTakerFeeUsd * effectiveRate).toFixed(2)})</span>
+                            </div>
+                            <div className="flex justify-between">
+                              <span className="text-slate-400">GST on Brokerage (18%):</span>
+                              <span className="font-mono text-amber-300">${estGstUsd} (₹{(estGstUsd * effectiveRate).toFixed(2)})</span>
+                            </div>
+                            <div className="flex justify-between pt-1 border-t border-slate-800/80 font-bold">
+                              <span className="text-slate-300">Total Exchange Friction:</span>
+                              <span className="font-mono text-rose-300">${estTotalFeeUsd} (₹{(estTotalFeeUsd * effectiveRate).toFixed(2)})</span>
+                            </div>
+                            <div className="flex justify-between pt-1">
+                              <span className="text-slate-400">Estimated Slippage:</span>
+                              <span className="font-mono text-cyan-300">~0.02% (~${estSlippageUsd})</span>
+                            </div>
+                            <div className="flex justify-between text-[10px] text-slate-400 pt-1 border-t border-slate-800/60">
+                              <span>Close Reason:</span>
+                              <span className="text-slate-300 truncate max-w-[150px]">{trade.reason || 'Completed'}</span>
+                            </div>
+                          </div>
+                        </div>
+                      </td>
                       <td className="py-2 px-2.5">
                         <span className={`badge-delta ${
                           trade.side === 'LONG'
@@ -3078,7 +3280,8 @@ export const PerformanceAnalytics: React.FC<PerformanceAnalyticsProps> = ({
                         {Math.abs(isCurrencyInr ? pnlInr : trade.realisedPnl).toFixed(2)}
                       </td>
                       <td className="py-2 px-2.5 text-slate-400 truncate max-w-[200px]" title={trade.reason}>
-                        {trade.reason}
+                        <div className="truncate text-slate-300">{trade.reason}</div>
+                        <div className="text-[9px] text-cyan-400/80">{strategyTag}</div>
                       </td>
                     </tr>
                   );

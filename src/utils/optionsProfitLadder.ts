@@ -21,6 +21,32 @@ export interface ContinuousProfitPalette {
   ringGlow: string;
 }
 
+export type SequentialRungStatus = 'COMPLETED' | 'ACTIVE' | 'LOCKED / PENDING';
+
+export interface SequentialRungState {
+  stepIndex: number; // 0, 1, 2, 3
+  stepNumber: 1 | 2 | 3 | 4;
+  status: SequentialRungStatus;
+  progressPct: number; // 0..100 for SVG dashoffset & progress bar
+  displayLabel: string; // "+100%", "+45%", "+0%", "-35%", "-100%", "0%"
+  signedRatio: number; // -1.0 .. +1.0
+  isReversing: boolean; // true if negative PnL / drawdown
+  isCompleted: boolean;
+  isActive: boolean;
+  isLocked: boolean;
+  badgeLabel: 'COMPLETED' | 'ACTIVE' | 'LOCKED / PENDING';
+}
+
+export interface ComputeSequentialLadderParams {
+  isTradeActive: boolean;
+  isNegative: boolean;
+  currentPositiveValue: number;
+  positiveMilestones: [number, number, number, number];
+  currentNegativeValue: number;
+  negativeMaxThreshold: number;
+  hitFlags?: [boolean, boolean, boolean, boolean];
+}
+
 export interface OptionsLadderStep {
   stepNumber: 1 | 2 | 3 | 4;
   stepLabel: string; // 'Step 01' .. 'Step 04'
@@ -33,8 +59,12 @@ export interface OptionsLadderStep {
   progressRatio: number; // 0.0 .. 1.0 toward this rung
   drawdownRatio: number; // 0.0 .. 1.0 toward max risk / SL
   signedRatio: number; // -1.0 .. +1.0
-  progressPct: number; // 0..100 for this rung (0 -> targetUsd)
+  progressPct: number; // 0..100 for this rung
   drawdownPct: number; // 0..100 when in loss
+  displayLabel: string; // "+100%", "+45%", "+0%", "-35%", "-100%", "0%"
+  statusBadge: 'COMPLETED' | 'ACTIVE' | 'LOCKED / PENDING';
+  isReversing: boolean;
+  isLocked: boolean;
   isAchieved: boolean;
   isCurrentActive: boolean;
   sentiment: ProfitSentiment;
@@ -187,15 +217,8 @@ export function computeContinuousProfitPalette(
   let barGradientRtl: string;
 
   if (clamped < 0) {
-    const d = Math.abs(clamped);
-    barGradient =
-      d > 0.5
-        ? `linear-gradient(90deg, #818CF8 0%, #FB7185 50%, ${solid} 100%)`
-        : `linear-gradient(90deg, #818CF8 0%, ${solid} 100%)`;
-    barGradientRtl =
-      d > 0.5
-        ? `linear-gradient(270deg, #818CF8 0%, #FB7185 50%, ${solid} 100%)`
-        : `linear-gradient(270deg, #818CF8 0%, ${solid} 100%)`;
+    barGradient = `linear-gradient(90deg, #fda4af 0%, #f43f5e 50%, #be123c 100%)`;
+    barGradientRtl = `linear-gradient(270deg, #fda4af 0%, #f43f5e 50%, #be123c 100%)`;
   } else {
     const r = isAchieved ? 1 : clamped;
     barGradient =
@@ -208,24 +231,248 @@ export function computeContinuousProfitPalette(
         : `linear-gradient(270deg, #38BDF8 0%, ${solid} 100%)`;
   }
 
+  const borderFinal = clamped < 0
+    ? (isAchieved ? 'rgba(244, 63, 94, 0.50)' : isActive ? 'rgba(244, 63, 94, 0.45)' : 'rgba(255, 255, 255, 0.10)')
+    : border;
+
+  const bgFinal = clamped < 0
+    ? (isAchieved ? '#1c0a10' : '#0c1220')
+    : bg;
+
+  const glowFinal = clamped < 0
+    ? (isAchieved ? '0 0 18px rgba(244, 63, 94, 0.22)' : isActive ? '0 0 20px rgba(244, 63, 94, 0.18)' : 'none')
+    : glow;
+
+  const badgeBgFinal = clamped < 0
+    ? (isAchieved ? 'rgba(244, 63, 94, 0.20)' : 'rgba(244, 63, 94, 0.14)')
+    : badgeBg;
+
+  const badgeBorderFinal = clamped < 0
+    ? (isAchieved ? 'rgba(244, 63, 94, 0.55)' : 'rgba(244, 63, 94, 0.45)')
+    : badgeBorder;
+
   return {
     hue: h,
     signedRatio: clamped,
-    solid,
-    text,
-    profitText,
-    border,
-    bg,
-    badgeBg,
-    badgeBorder,
-    glow,
+    solid: clamped < 0 ? '#f43f5e' : solid,
+    text: clamped < 0 ? '#fb7185' : text,
+    profitText: isNeutralFlat ? '#94A3B8' : clamped < 0 ? '#fb7185' : text,
+    border: borderFinal,
+    bg: bgFinal,
+    badgeBg: badgeBgFinal,
+    badgeBorder: badgeBorderFinal,
+    glow: glowFinal,
     barGradient,
     barGradientRtl,
-    ringStart: clamped < 0 ? '#818CF8' : '#38BDF8',
-    ringMid: midHex,
-    ringEnd: solid,
-    ringGlow: `drop-shadow(0 0 6px ${rgbToRgba(rgb, 0.48)})`,
+    ringStart: clamped < 0 ? '#fda4af' : '#38BDF8',
+    ringMid: clamped < 0 ? '#f43f5e' : midHex,
+    ringEnd: clamped < 0 ? '#be123c' : solid,
+    ringGlow: clamped < 0
+      ? 'drop-shadow(0 0 7px rgba(244, 63, 94, 0.55))'
+      : `drop-shadow(0 0 6px ${rgbToRgba(rgb, 0.48)})`,
   };
+}
+
+/**
+ * Pure deterministic engine for Strict Sequential 4-Stage Ladder Progress:
+ * 1. Strict Sequential Step Progression (No Parallel Filling):
+ *    - Step 01 fills 0% -> 100% first.
+ *    - Step 02 stays locked at 0% (LOCKED / PENDING) until Step 01 reaches 100% (COMPLETED).
+ *    - Step 03 stays locked at 0% (LOCKED / PENDING) until Step 02 reaches 100% (COMPLETED).
+ *    - Step 04 stays locked at 0% (LOCKED / PENDING) until Step 03 reaches 100% (COMPLETED).
+ * 2. Negative Profit Anticlockwise Reversal (0% to -100%):
+ *    - Sweeps anticlockwise in crimson/rose (#f43f5e / rose-500).
+ *    - Step 01 fills 0% -> -100% across quartile 1 of Stop-Loss/Max Risk.
+ *    - Step 02 stays locked until Step 01 reaches -100%, then fills 0% -> -100% across quartile 2.
+ *    - Step 03 stays locked until Step 02 reaches -100%, then fills 0% -> -100% across quartile 3.
+ *    - Step 04 stays locked until Step 03 reaches -100%, then fills 0% -> -100% across quartile 4.
+ */
+export function computeSequentialLadderSteps(
+  params: ComputeSequentialLadderParams
+): SequentialRungState[] {
+  const {
+    isTradeActive,
+    isNegative,
+    currentPositiveValue,
+    positiveMilestones,
+    currentNegativeValue,
+    negativeMaxThreshold,
+    hitFlags = [false, false, false, false],
+  } = params;
+
+  if (!isTradeActive) {
+    return [0, 1, 2, 3].map((idx) => ({
+      stepIndex: idx,
+      stepNumber: (idx + 1) as 1 | 2 | 3 | 4,
+      status: 'LOCKED / PENDING',
+      progressPct: 0,
+      displayLabel: '0%',
+      signedRatio: 0,
+      isReversing: false,
+      isCompleted: false,
+      isActive: false,
+      isLocked: true,
+      badgeLabel: 'LOCKED / PENDING',
+    }));
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // NEGATIVE PROFIT / DRAWDOWN (ANTICLOCKWISE SEQUENTIAL REVERSAL)
+  // ─────────────────────────────────────────────────────────────
+  if (isNegative) {
+    const maxLoss = Math.max(0.01, negativeMaxThreshold);
+    const dd = Math.max(0, currentNegativeValue);
+
+    // Quartile thresholds: Step 1 = [0, 25%], Step 2 = [25%, 50%], Step 3 = [50%, 75%], Step 4 = [75%, 100%]
+    const quarterLen = maxLoss * 0.25;
+
+    let priorStepsCompleted = true;
+
+    return [0, 1, 2, 3].map((idx) => {
+      const segStart = idx * quarterLen;
+      const segEnd = (idx + 1) * quarterLen;
+
+      let status: SequentialRungStatus = 'LOCKED / PENDING';
+      let progressPct = 0;
+      let displayLabel = '0%';
+      let signedRatio = 0;
+      let isCompleted = false;
+      let isActive = false;
+      let isLocked = true;
+
+      if (dd >= segEnd) {
+        // Quartile fully traversed
+        progressPct = 100;
+        displayLabel = '-100%';
+        status = 'COMPLETED';
+        signedRatio = -1.0;
+        isCompleted = true;
+        isActive = false;
+        isLocked = false;
+      } else if (priorStepsCompleted && dd > segStart) {
+        // Actively filling in reverse 1% -> 99%
+        const fill = Math.min(99, Math.max(1, Math.round(((dd - segStart) / quarterLen) * 100)));
+        progressPct = fill;
+        displayLabel = `-${fill}%`;
+        status = 'ACTIVE';
+        signedRatio = -(fill / 100);
+        isCompleted = false;
+        isActive = true;
+        isLocked = false;
+        priorStepsCompleted = false;
+      } else if (priorStepsCompleted && idx === 0 && dd <= segStart) {
+        // Trade negative but right at inception / initial friction
+        progressPct = 0;
+        displayLabel = '-0%';
+        status = 'ACTIVE';
+        signedRatio = -0.01;
+        isCompleted = false;
+        isActive = true;
+        isLocked = false;
+        priorStepsCompleted = false;
+      } else {
+        // Locked at 0% until previous quartile completes -100%
+        progressPct = 0;
+        displayLabel = '0%';
+        status = 'LOCKED / PENDING';
+        signedRatio = 0;
+        isCompleted = false;
+        isActive = false;
+        isLocked = true;
+        priorStepsCompleted = false;
+      }
+
+      return {
+        stepIndex: idx,
+        stepNumber: (idx + 1) as 1 | 2 | 3 | 4,
+        status,
+        progressPct,
+        displayLabel,
+        signedRatio,
+        isReversing: true,
+        isCompleted,
+        isActive,
+        isLocked,
+        badgeLabel: status,
+      };
+    });
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // POSITIVE PROFIT (CLOCKWISE STRICT SEQUENTIAL PROGRESSION)
+  // ─────────────────────────────────────────────────────────────
+  const fav = Math.max(0, currentPositiveValue);
+  let priorCompleted = true;
+
+  return [0, 1, 2, 3].map((idx) => {
+    const segStart = idx === 0 ? 0 : positiveMilestones[idx - 1];
+    const segEnd = positiveMilestones[idx];
+    const segLen = Math.max(0.001, segEnd - segStart);
+
+    let status: SequentialRungStatus = 'LOCKED / PENDING';
+    let progressPct = 0;
+    let displayLabel = '0%';
+    let signedRatio = 0;
+    let isCompleted = false;
+    let isActive = false;
+    let isLocked = true;
+
+    if (hitFlags[idx] || fav >= segEnd) {
+      // Step is 100% completed
+      progressPct = 100;
+      displayLabel = '+100%';
+      status = 'COMPLETED';
+      signedRatio = 1.0;
+      isCompleted = true;
+      isActive = false;
+      isLocked = false;
+    } else if (priorCompleted && fav > segStart) {
+      // Actively filling 1% -> 99%
+      const fill = Math.min(99, Math.max(1, Math.round(((fav - segStart) / segLen) * 100)));
+      progressPct = fill;
+      displayLabel = `+${fill}%`;
+      status = 'ACTIVE';
+      signedRatio = fill / 100;
+      isCompleted = false;
+      isActive = true;
+      isLocked = false;
+      priorCompleted = false;
+    } else if (priorCompleted && idx === 0) {
+      // Step 01 is active at 0% when trade just opened
+      progressPct = 0;
+      displayLabel = '+0%';
+      status = 'ACTIVE';
+      signedRatio = 0;
+      isCompleted = false;
+      isActive = true;
+      isLocked = false;
+      priorCompleted = false;
+    } else {
+      // Locked at 0% until preceding step reaches 100%
+      progressPct = 0;
+      displayLabel = '0%';
+      status = 'LOCKED / PENDING';
+      signedRatio = 0;
+      isCompleted = false;
+      isActive = false;
+      isLocked = true;
+      priorCompleted = false;
+    }
+
+    return {
+      stepIndex: idx,
+      stepNumber: (idx + 1) as 1 | 2 | 3 | 4,
+      status,
+      progressPct,
+      displayLabel,
+      signedRatio,
+      isReversing: false,
+      isCompleted,
+      isActive,
+      isLocked,
+      badgeLabel: status,
+    };
+  });
 }
 
 export function formatLadderPrice(price: number): string {
@@ -479,33 +726,32 @@ export function buildOptionsProfitLadder(
     minStrike < safeEntrySpot * 0.995 ? minStrike : +(safeEntrySpot * 0.965).toFixed(2);
 
   const isFlat = !isPositionActive || Math.abs(liveProfitUsd) < 0.005;
+  const isNegative = isPositionActive && liveProfitUsd < 0;
 
-  const steps: OptionsLadderStep[] = rawDefs.map((def) => {
+  const rawTargetUsds = rawDefs.map((def) => {
     const frac = def.targetPct / 100;
-    const targetUsd = isDebitSpread && def.targetDebitMultiple
+    return isDebitSpread && def.targetDebitMultiple
       ? +(netDebitPaidUsd * (def.targetDebitMultiple - 1)).toFixed(2)
       : +(safeMaxProfitUsd * frac).toFixed(2);
+  }) as [number, number, number, number];
+
+  const sequentialSteps = computeSequentialLadderSteps({
+    isTradeActive: isPositionActive,
+    isNegative,
+    currentPositiveValue: Math.max(0, liveProfitUsd),
+    positiveMilestones: rawTargetUsds,
+    currentNegativeValue: Math.abs(Math.min(0, liveProfitUsd)),
+    negativeMaxThreshold: safeMaxRiskUsd,
+  });
+
+  const steps: OptionsLadderStep[] = rawDefs.map((def, idx) => {
+    const frac = def.targetPct / 100;
+    const targetUsd = rawTargetUsds[idx];
     const targetInr = +(targetUsd * rate).toFixed(2);
+    const seq = sequentialSteps[idx];
 
-    // Achieved ONLY when live profit reaches >= 100% of this step's target
-    const isAchieved =
-      isPositionActive &&
-      targetUsd > 0 &&
-      (liveProfitUsd >= targetUsd || (liveProfitPct >= def.targetPct && liveProfitUsd > 0));
-
-    // Continuous progressRatio in [0.0, 1.0]
-    const progressRatio = isAchieved
-      ? 1
-      : !isPositionActive || targetUsd <= 0 || liveProfitUsd <= 0
-      ? 0
-      : Math.min(0.999, Math.max(0, liveProfitUsd / targetUsd));
-
-    const progressPct = isAchieved
-      ? 100
-      : Math.min(99, Math.max(0, Math.round(progressRatio * 100)));
-
-    const signedRatio =
-      isPositionActive && liveProfitUsd < 0 ? -overallDrawdownRatio : progressRatio;
+    // Positive completion vs drawdown completion
+    const isAchieved = seq.isCompleted && !seq.isReversing;
 
     let sentiment: ProfitSentiment = 'NEUTRAL';
     if (isFlat) {
@@ -549,10 +795,10 @@ export function buildOptionsProfitLadder(
           Math.max(entryUnitPremium * 0.25 * frac, (targetUsd / Math.max(1, baseContracts)) * 0.1)
         ).toFixed(2);
 
-    const palette = computeContinuousProfitPalette(signedRatio, {
+    const palette = computeContinuousProfitPalette(seq.signedRatio, {
       isNeutralFlat: isFlat,
-      isActive: false,
-      isAchieved,
+      isActive: seq.isActive,
+      isAchieved: seq.isCompleted,
     });
 
     return {
@@ -564,13 +810,17 @@ export function buildOptionsProfitLadder(
       targetInr,
       currentProfitUsd: liveProfitUsd,
       currentProfitInr: liveProfitInr,
-      progressRatio,
+      progressRatio: seq.progressPct / 100,
       drawdownRatio: overallDrawdownRatio,
-      signedRatio,
-      progressPct,
+      signedRatio: seq.signedRatio,
+      progressPct: seq.progressPct,
       drawdownPct: overallDrawdownPct,
+      displayLabel: seq.displayLabel,
+      statusBadge: seq.badgeLabel,
+      isReversing: seq.isReversing,
+      isLocked: seq.isLocked,
       isAchieved,
-      isCurrentActive: false,
+      isCurrentActive: seq.isActive,
       sentiment,
       palette,
       targetSpotPrice,
@@ -582,23 +832,12 @@ export function buildOptionsProfitLadder(
     };
   });
 
-  // Determine the first unachieved step as the currently active step (or step 4 if all achieved)
-  let activeStepIndex = 1;
-  const firstUnachieved = steps.find((s) => !s.isAchieved);
-  if (firstUnachieved) {
-    activeStepIndex = firstUnachieved.stepNumber;
-  } else {
-    activeStepIndex = 4;
-  }
-
-  steps.forEach((s) => {
-    s.isCurrentActive = isPositionActive && !s.isAchieved && s.stepNumber === activeStepIndex;
-    s.palette = computeContinuousProfitPalette(s.signedRatio, {
-      isNeutralFlat: isFlat,
-      isActive: s.isCurrentActive,
-      isAchieved: s.isAchieved,
-    });
-  });
+  // Determine active step index: first active, or first locked, or 4
+  const activeStepItem =
+    sequentialSteps.find((s) => s.isActive) ||
+    sequentialSteps.find((s) => s.isLocked) ||
+    sequentialSteps[3];
+  const activeStepIndex = (activeStepItem ? activeStepItem.stepIndex + 1 : 4) as 1 | 2 | 3 | 4;
 
   const terminalTargetUsd = steps[2]?.targetUsd || safeMaxProfitUsd;
   const overallAchieved =

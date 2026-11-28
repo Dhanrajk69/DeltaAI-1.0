@@ -1,10 +1,11 @@
-import React, { createContext, useContext, useState, useEffect, useMemo, useCallback } from 'react';
+import React, { createContext, useContext, useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import { Position, ClosedTrade, TradeSentimentTag } from '../types';
 import {
   AUTHENTIC_DELTA_POSITIONS,
   DeltaWalletDiagnosticError,
   DeltaLiveWalletResponse,
   DeltaLivePositionsResponse,
+  fetchDeltaAuthoritativeResync,
   fetchDeltaLiveWalletAndPositions,
   getStoredDeltaCredentials,
 } from '../services/deltaExchangeService';
@@ -137,6 +138,9 @@ export interface PortfolioContextType extends PortfolioTelemetryState {
   resetSniperPnl: () => void;
   resetOptionsPnl: () => void;
   setUsdInrRate: (rate: number) => void;
+  updatePositionStopLoss: (posIdOrSymbol: string, newStopLoss: number) => void;
+  positionMismatchWarning: string | null;
+  clearPositionMismatchWarning: () => void;
 }
 
 const DEFAULT_USD_INR_RATE = 85.0;
@@ -203,6 +207,9 @@ const defaultState: PortfolioContextType = {
   resetSniperPnl: () => {},
   resetOptionsPnl: () => {},
   setUsdInrRate: () => {},
+  updatePositionStopLoss: () => {},
+  positionMismatchWarning: null,
+  clearPositionMismatchWarning: () => {},
 };
 
 export const PortfolioContext = createContext<PortfolioContextType>(defaultState);
@@ -282,104 +289,92 @@ export const PortfolioProvider: React.FC<{ children: React.ReactNode; initialRat
 
   const setSniperPnl = useCallback((unrealizedUsd: number, realizedUsd?: number) => {
     const cleanUnrealized = isNaN(unrealizedUsd) ? 0 : +unrealizedUsd.toFixed(2);
-    setSniperUnrealizedUsd(cleanUnrealized);
+    setSniperUnrealizedUsd((prev) => (Math.abs(prev - cleanUnrealized) < 0.0001 ? prev : cleanUnrealized));
     if (realizedUsd !== undefined && !isNaN(realizedUsd)) {
-      setSniperRealizedUsd(+realizedUsd.toFixed(2));
+      const cleanRealized = +realizedUsd.toFixed(2);
+      setSniperRealizedUsd((prev) => (Math.abs(prev - cleanRealized) < 0.0001 ? prev : cleanRealized));
     }
   }, []);
 
   const setOptionsPnl = useCallback((unrealizedUsd: number, realizedUsd?: number) => {
     const cleanUnrealized = isNaN(unrealizedUsd) ? 0 : +unrealizedUsd.toFixed(4);
-    setOptionsUnrealizedUsd(cleanUnrealized);
+    setOptionsUnrealizedUsd((prev) => (Math.abs(prev - cleanUnrealized) < 0.0001 ? prev : cleanUnrealized));
     if (realizedUsd !== undefined && !isNaN(realizedUsd)) {
-      setOptionsRealizedUsd(+realizedUsd.toFixed(2));
+      const cleanRealized = +realizedUsd.toFixed(2);
+      setOptionsRealizedUsd((prev) => (Math.abs(prev - cleanRealized) < 0.0001 ? prev : cleanRealized));
     }
   }, []);
 
   const setBasePositionsPnl = useCallback((unrealizedUsd: number, realizedUsd?: number) => {
     const cleanUnrealized = isNaN(unrealizedUsd) ? 0 : +unrealizedUsd.toFixed(2);
-    setBasePositionsUsd(cleanUnrealized);
+    setBasePositionsUsd((prev) => (Math.abs(prev - cleanUnrealized) < 0.0001 ? prev : cleanUnrealized));
     if (realizedUsd !== undefined && !isNaN(realizedUsd)) {
-      setBaseRealizedUsd(+realizedUsd.toFixed(2));
+      const cleanRealized = +realizedUsd.toFixed(2);
+      setBaseRealizedUsd((prev) => (Math.abs(prev - cleanRealized) < 0.0001 ? prev : cleanRealized));
     }
   }, []);
 
   const resetSniperPnl = useCallback(() => {
-    setSniperUnrealizedUsd(0);
+    setSniperUnrealizedUsd((prev) => (prev === 0 ? prev : 0));
   }, []);
 
   const resetOptionsPnl = useCallback(() => {
-    setOptionsUnrealizedUsd(0);
+    setOptionsUnrealizedUsd((prev) => (prev === 0 ? prev : 0));
   }, []);
 
-  const [positions, setPositionsState] = useState<Position[]>(() => {
-    if (typeof window !== 'undefined') {
-      try {
-        const cached = localStorage.getItem('delta_positions_v3');
-        if (cached) {
-          const parsed = JSON.parse(cached);
-          if (Array.isArray(parsed) && parsed.length > 0) {
-            const valid = parsed.filter(
-              (p: any) =>
-                p &&
-                ![
-                  'pos-1',
-                  'pos-2',
-                  'pos-3',
-                  'mock-1',
-                  'mock-2',
-                  'mock-btc',
-                  'mock-eth',
-                  'mock-sol',
-                  'delta-live-1',
-                  'delta-live-2',
-                ].includes(p.id) &&
-                !isExpiredOptionPosition(p)
-            );
-            if (valid.length > 0) return valid;
-          }
-        }
-      } catch {
-        // Ignore malformed or restricted storage cache
-      }
-    }
-    return [];
-  });
+  // Strict rule: NEVER hydrate active positions from cache or localStorage without live exchange validation
+  const [positions, setPositionsState] = useState<Position[]>([]);
+  const [positionMismatchWarning, setPositionMismatchWarning] = useState<string | null>(null);
+  const mismatchTimerRef = useRef<NodeJS.Timeout | null>(null);
+
+  const clearPositionMismatchWarning = useCallback(() => {
+    if (mismatchTimerRef.current) clearTimeout(mismatchTimerRef.current);
+    setPositionMismatchWarning(null);
+  }, []);
 
   const [openOrders, setOpenOrdersState] = useState<any[]>([]);
   const [history, setHistoryState] = useState<ClosedTrade[]>([]);
 
-  // Persistent Trade Journal metadata mapping (tradeId -> notes, sentiment, tags)
-  const [tradeJournalMap, setTradeJournalMap] = useState<Record<string, TradeJournalMetadata>>(() => {
-    if (typeof window !== 'undefined') {
-      try {
-        const cached = localStorage.getItem('delta_trade_journal_metadata_v1');
-        if (cached) {
-          const parsed = JSON.parse(cached);
-          if (parsed && typeof parsed === 'object') return parsed;
-        }
-      } catch {
-        // Ignore malformed or restricted journal metadata cache
-      }
-    }
-    return {};
-  });
+  // In-memory Trade Journal metadata mapping (never persisted to localStorage)
+  const [tradeJournalMap, setTradeJournalMap] = useState<Record<string, TradeJournalMetadata>>({});
+
+  // Strict boot purge: remove any legacy trading, position, order, fill, or PnL keys from localStorage
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    try {
+      const legacyTradingKeys = [
+        'delta_positions_v3',
+        'delta_positions_v3_migrated',
+        'delta_trade_journal_metadata_v1',
+        'delta_sniper_active_trade_v1',
+        'delta_active_sniper_trade',
+        'delta_options_active_position_v1',
+        'delta_active_options_strategy',
+        'delta_sniper_closed_ex_sigs_v1',
+        'delta_reconciled_closed_orders_v1',
+        'delta_options_closed_ex_sigs_v1',
+        'delta_rescue_circuit_breaker_v1',
+        'delta_signal_history_v1',
+        'delta_volatility_breach_history_v1',
+      ];
+      legacyTradingKeys.forEach((k) => window.localStorage.removeItem(k));
+    } catch {}
+  }, []);
 
   const setHistory = useCallback((updater: ClosedTrade[] | ((prev: ClosedTrade[]) => ClosedTrade[])) => {
     setHistoryState((prev: ClosedTrade[]) => {
       const next = typeof updater === 'function' ? updater(prev) : updater;
-      // Merge in any existing journal metadata without creating new refs if identical
       let changed = next.length !== prev.length;
       const mapped = next.map((trade: ClosedTrade, idx: number) => {
         const journal = tradeJournalMap[trade.id];
         let resolved = trade;
         if (
           journal &&
-          (journal.notes !== undefined && journal.notes !== trade.notes ||
-            journal.sentimentTag !== undefined && journal.sentimentTag !== trade.sentimentTag ||
-            journal.tags !== undefined && journal.tags !== trade.tags ||
-            journal.lessonLearned !== undefined && journal.lessonLearned !== trade.lessonLearned ||
-            journal.journalUpdatedAt !== undefined && journal.journalUpdatedAt !== trade.journalUpdatedAt)
+          ((journal.notes !== undefined && journal.notes !== trade.notes) ||
+            (journal.sentimentTag !== undefined && journal.sentimentTag !== trade.sentimentTag) ||
+            (journal.tags !== undefined && journal.tags !== trade.tags) ||
+            (journal.lessonLearned !== undefined && journal.lessonLearned !== trade.lessonLearned) ||
+            (journal.journalUpdatedAt !== undefined && journal.journalUpdatedAt !== trade.journalUpdatedAt))
         ) {
           resolved = {
             ...trade,
@@ -416,16 +411,9 @@ export const PortfolioProvider: React.FC<{ children: React.ReactNode; initialRat
           ...metadata,
           journalUpdatedAt: Date.now(),
         };
-        const next = { ...prev, [tradeId]: updated };
-        if (typeof window !== 'undefined') {
-          try {
-            localStorage.setItem('delta_trade_journal_metadata_v1', JSON.stringify(next));
-          } catch {}
-        }
-        return next;
+        return { ...prev, [tradeId]: updated };
       });
 
-      // Also merge into active history state
       setHistoryState((prev: ClosedTrade[]) =>
         prev.map((trade: ClosedTrade) => {
           if (trade.id === tradeId) {
@@ -459,17 +447,26 @@ export const PortfolioProvider: React.FC<{ children: React.ReactNode; initialRat
       ) {
         return prev;
       }
-      if (typeof window !== 'undefined') {
-        try {
-          localStorage.setItem('delta_positions_v3', JSON.stringify(next));
-        } catch {}
-      }
       return next;
     });
   }, []);
 
   const setOpenOrders = useCallback((updater: any[] | ((prev: any[]) => any[])) => {
     setOpenOrdersState(updater);
+  }, []);
+
+  const updatePositionStopLoss = useCallback((posIdOrSymbol: string, newStopLoss: number) => {
+    const cleanSym = String(posIdOrSymbol || '').trim().toUpperCase();
+    setPositionsState((prev) =>
+      prev.map((p) => {
+        const matches =
+          p.id === posIdOrSymbol ||
+          p.symbol?.toUpperCase() === cleanSym ||
+          p.rawSymbol?.toUpperCase() === cleanSym ||
+          (p.product_id && String(p.product_id) === posIdOrSymbol);
+        return matches ? { ...p, stopLoss: newStopLoss } : p;
+      })
+    );
   }, []);
 
   const [isSyncingLive, setIsSyncingLive] = useState<boolean>(false);
@@ -508,13 +505,116 @@ export const PortfolioProvider: React.FC<{ children: React.ReactNode; initialRat
         }
 
         if (positionsResponse.status === 'success' && Array.isArray(positionsResponse.positions)) {
-          const activeOnly = positionsResponse.positions.filter((p) => !isExpiredOptionPosition(p));
-          setPositionsState(activeOnly);
-          if (typeof window !== 'undefined') {
-            try {
-              localStorage.setItem('delta_positions_v3', JSON.stringify(activeOnly));
-            } catch {}
-          }
+          const activeOnly = positionsResponse.positions.filter(
+            (p) => !isExpiredOptionPosition(p) && Math.abs(Number(p.size || (p as any).contracts || 0)) > 0
+          );
+
+          setPositionsState((prevPositions) => {
+            const normSym = (s?: string) => String(s || '').toUpperCase().trim();
+            const closedPositions = prevPositions.filter((prevPos) => {
+              const prevSym = normSym(prevPos.product_symbol || prevPos.rawSymbol || prevPos.symbol);
+              const match = activeOnly.find((active) => {
+                const activeSym = normSym(active.product_symbol || active.rawSymbol || active.symbol);
+                return (
+                  (active.id && prevPos.id && active.id === prevPos.id) ||
+                  (activeSym && prevSym && activeSym === prevSym)
+                );
+              });
+              return !match || Math.abs(Number(match.size || (match as any).contracts || 0)) === 0;
+            });
+
+            if (closedPositions.length > 0) {
+              const closedSyms = closedPositions.map((p) => p.rawSymbol || p.symbol).join(', ');
+              const mismatchAlertText =
+                `Position mismatch resolved: Delta Exchange India reported [${closedSyms}] closed (size === 0). Purged from in-memory state.`;
+              console.warn(`[Delta Reconciliation Mismatch] ${mismatchAlertText}`);
+              setPositionMismatchWarning(mismatchAlertText);
+              if (mismatchTimerRef.current) clearTimeout(mismatchTimerRef.current);
+              mismatchTimerRef.current = setTimeout(() => {
+                setPositionMismatchWarning(null);
+              }, 10000);
+
+              if (activeOnly.length === 0) {
+                setSniperUnrealizedUsd(0);
+                setOptionsUnrealizedUsd(0);
+              }
+
+              closedPositions.forEach((pos) => {
+                const sym = pos.rawSymbol || pos.symbol;
+                fetch('/api/delta/purge-stale-positions', {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ symbol: sym }),
+                }).catch(() => {});
+              });
+
+              if (typeof window !== 'undefined') {
+                window.dispatchEvent(
+                  new CustomEvent('delta:position-mismatch-detected', {
+                    detail: {
+                      closedPositions,
+                      message: mismatchAlertText,
+                    },
+                  })
+                );
+              }
+
+              // Reconcile each closed position via /api/delta/reconcile-closed-position to cancel lingering brackets & fetch exact /v2/fills PnL
+              closedPositions.forEach((pos) => {
+                const reqHeaders: Record<string, string> = {
+                  'Content-Type': 'application/json',
+                  'x-admin-email': 'dhanrajk69@gmail.com',
+                };
+                if (effectiveCreds?.apiKey && effectiveCreds?.apiSecret) {
+                  reqHeaders['x-delta-api-key'] = effectiveCreds.apiKey;
+                  reqHeaders['x-delta-api-secret'] = effectiveCreds.apiSecret;
+                }
+                fetch('/api/delta/reconcile-closed-position', {
+                  method: 'POST',
+                  headers: reqHeaders,
+                  body: JSON.stringify({
+                    symbol: pos.rawSymbol || pos.symbol,
+                    productId: pos.product_id,
+                    entryPrice: pos.entryPrice,
+                    openedAt: pos.openedAt,
+                    fallbackPnlUsd: pos.unrealisedPnl || 0,
+                    side: pos.side,
+                    size: pos.size,
+                    cancelOpenBrackets: true,
+                  }),
+                  cache: 'no-store',
+                })
+                  .then((r) => (r.ok ? r.json() : null))
+                  .then((rec) => {
+                    if (rec?.success && rec?.closedTrade) {
+                      setHistoryState((prev) => {
+                        const targetId = rec.closedTrade.id;
+                        const without = prev.filter((t) => t.id !== targetId);
+                        const nextList = [rec.closedTrade, ...without];
+                        const realizedSum = +nextList.reduce((s, item) => s + Number(item.realisedPnl || 0), 0).toFixed(2);
+                        setBaseRealizedUsd(realizedSum);
+                        return nextList;
+                      });
+                    }
+                  })
+                  .catch(() => {});
+              });
+            }
+
+            if (typeof window !== 'undefined') {
+              try {
+                window.dispatchEvent(
+                  new CustomEvent('delta:positions-reconciled', {
+                    detail: {
+                      activePositions: activeOnly,
+                      closedPositions,
+                    },
+                  })
+                );
+              } catch {}
+            }
+            return activeOnly;
+          });
         }
 
         return result;
@@ -533,53 +633,411 @@ export const PortfolioProvider: React.FC<{ children: React.ReactNode; initialRat
     []
   );
 
-  // Fast 3-second polling of /api/delta/positions and /api/delta/wallet (supports both local and server-stored credentials)
-  useEffect(() => {
-    const stored = getStoredDeltaCredentials();
-    refreshLiveWalletAndPositions(stored);
-    const timer = setInterval(() => {
-      const creds = getStoredDeltaCredentials();
-      refreshLiveWalletAndPositions(creds);
-    }, 3000);
-    return () => clearInterval(timer);
-  }, [refreshLiveWalletAndPositions]);
-
-  const syncNow = useCallback(async () => {
+  // Full Authoritative REST Resync (/v2/positions/margined, /v2/orders?state=open, /v2/fills, /v2/wallet/balances)
+  // Overwrites in-memory positions, openOrders, fills history, realized PnL, and wallet cleanly on mount & WS reconnect
+  const resyncAuthoritativeState = useCallback(async () => {
     const creds = getStoredDeltaCredentials();
-    const headers: Record<string, string> = {
-      'Content-Type': 'application/json',
-      'x-admin-email': 'dhanrajk69@gmail.com',
-    };
-    if (creds?.apiKey && creds?.apiSecret) {
-      headers['x-delta-api-key'] = creds.apiKey;
-      headers['x-delta-api-secret'] = creds.apiSecret;
-    }
+    setIsSyncingLive(true);
+    try {
+      const snapshot = await fetchDeltaAuthoritativeResync(creds);
+      if (!snapshot || !snapshot.authenticated) {
+        // Fall back to standard wallet+positions check if unauthenticated
+        await refreshLiveWalletAndPositions(creds);
+        return;
+      }
 
-    await Promise.all([
-      refreshLiveWalletAndPositions(creds),
-      fetch(`/api/delta/sync-full-history?_t=${Date.now()}`, {
-        method: 'POST',
-        headers,
-        body: JSON.stringify({ maxFillPages: 25, maxOrderPages: 15 }),
-        cache: 'no-store',
-      })
-        .then((r) => (r.ok ? r.json() : null))
-        .then((payload) => {
-          if (payload?.success && Array.isArray(payload.tradeHistory) && typeof window !== 'undefined') {
+      if (snapshot.wallet) {
+        const w = snapshot.wallet;
+        setAvailableMargin(w.availableMarginUsd ?? w.availableMargin ?? 0);
+        setAvailableBalance(w.availableBalance ?? w.availableMargin ?? 0);
+        setTotalEquity(w.netEquityUsd ?? w.totalEquity ?? 0);
+        setWalletBalance(w.walletBalanceUsd ?? w.walletBalance ?? w.totalEquity ?? 0);
+        setMarginUsed(w.marginUsed ?? 0);
+        setOpenPositionValueUsd(w.openPositionValueUsd ?? 0);
+        setWalletBalances(Array.isArray(w.balances) ? w.balances : []);
+        setWalletLastUpdated(Date.now());
+        setWalletDiagnosticError(null);
+      } else if (snapshot.diagnosticError && snapshot.diagnosticError.code !== 'MISSING_API_CREDENTIALS') {
+        setWalletDiagnosticError(snapshot.diagnosticError);
+      }
+
+      if (typeof snapshot.usdInrRate === 'number' && snapshot.usdInrRate > 0) {
+        setUsdInrRateState(snapshot.usdInrRate);
+      }
+
+      const activeOnly = (Array.isArray(snapshot.positions) ? snapshot.positions : []).filter(
+        (p) => !isExpiredOptionPosition(p) && Math.abs(Number(p.size || (p as any).contracts || 0)) > 0
+      );
+
+      // Overwrite open orders cleanly and log if stale orders were purged
+      const freshOpenOrders = Array.isArray(snapshot.openOrders) ? snapshot.openOrders : [];
+      setOpenOrdersState((prevOrders) => {
+        if (prevOrders.length > 0) {
+          const freshIds = new Set(freshOpenOrders.map((o: any) => String(o.id ?? o.order_id)));
+          const purgedOrders = prevOrders.filter((o: any) => !freshIds.has(String(o.id ?? o.order_id)));
+          if (purgedOrders.length > 0) {
+            console.warn(
+              `[Delta Order Mismatch] Purged ${purgedOrders.length} omitted/closed order(s) during authoritative resync.`
+            );
+          }
+        }
+        return freshOpenOrders;
+      });
+
+      // Overwrite fills & Booked Profit (Realized P&L) cleanly from Delta Exchange /v2/fills
+      if (Array.isArray(snapshot.fills)) {
+        const mappedFills = snapshot.fills as ClosedTrade[];
+        setHistoryState(mappedFills);
+        const totalBookedUsd = +mappedFills
+          .reduce((sum, f) => sum + Number(f.realisedPnl || 0), 0)
+          .toFixed(2);
+        setBaseRealizedUsd(totalBookedUsd);
+        if (typeof window !== 'undefined') {
+          window.dispatchEvent(
+            new CustomEvent('delta:full-history-synced', {
+              detail: {
+                tradeHistory: mappedFills,
+                pairedTradesCount: mappedFills.length,
+                warehouseAddedCount: 0,
+              },
+            })
+          );
+        }
+      }
+
+      // Reconcile & overwrite open positions cleanly
+      setPositionsState((prevPositions) => {
+        const normSym = (s?: string) => String(s || '').toUpperCase().trim();
+        const closedPositions = prevPositions.filter((prevPos) => {
+          const prevSym = normSym(prevPos.product_symbol || prevPos.rawSymbol || prevPos.symbol);
+          const match = activeOnly.find((active) => {
+            const activeSym = normSym(active.product_symbol || active.rawSymbol || active.symbol);
+            return (
+              (active.id && prevPos.id && active.id === prevPos.id) ||
+              (activeSym && prevSym && activeSym === prevSym)
+            );
+          });
+          return !match || Math.abs(Number(match.size || (match as any).contracts || 0)) === 0;
+        });
+
+        if (closedPositions.length > 0) {
+          const closedSyms = closedPositions.map((p) => p.rawSymbol || p.symbol).join(', ');
+          const mismatchMsg = `Position mismatch resolved: Delta Exchange India reported [${closedSyms}] closed/omitted. Purged immediately.`;
+          console.warn(`[Delta Reconciliation Mismatch] ${mismatchMsg}`);
+          setPositionMismatchWarning(mismatchMsg);
+          if (mismatchTimerRef.current) clearTimeout(mismatchTimerRef.current);
+          mismatchTimerRef.current = setTimeout(() => setPositionMismatchWarning(null), 10000);
+
+          if (activeOnly.length === 0) {
+            setSniperUnrealizedUsd(0);
+            setOptionsUnrealizedUsd(0);
+          }
+
+          if (typeof window !== 'undefined') {
             window.dispatchEvent(
-              new CustomEvent('delta:full-history-synced', {
-                detail: {
-                  tradeHistory: payload.tradeHistory,
-                  pairedTradesCount: payload.pairedTradesCount || 0,
-                  warehouseAddedCount: payload.warehouseAddedCount || 0,
-                },
+              new CustomEvent('delta:position-mismatch-detected', {
+                detail: { closedPositions, message: mismatchMsg },
               })
             );
           }
-        })
-        .catch(() => {}),
-    ]);
+        } else if (activeOnly.length === 0) {
+          setSniperUnrealizedUsd(0);
+          setOptionsUnrealizedUsd(0);
+        }
+
+        if (typeof window !== 'undefined') {
+          window.dispatchEvent(
+            new CustomEvent('delta:positions-reconciled', {
+              detail: { activePositions: activeOnly, closedPositions },
+            })
+          );
+        }
+        return activeOnly;
+      });
+    } finally {
+      setIsSyncingLive(false);
+    }
   }, [refreshLiveWalletAndPositions]);
+
+  // Lightweight 5-second REST reconciliation check alongside WebSocket feed
+  useEffect(() => {
+    void resyncAuthoritativeState();
+    const timer = setInterval(() => {
+      void resyncAuthoritativeState();
+    }, 5000);
+    return () => clearInterval(timer);
+  }, [resyncAuthoritativeState]);
+
+  // Real-time WebSocket stream handlers (wss://socket.india.delta.exchange) + full REST resync on WS reconnect
+  useEffect(() => {
+    const handleWsReconnectResync = () => {
+      void resyncAuthoritativeState();
+    };
+
+    const handleWsPositions = (e: any) => {
+      const payload = e?.detail;
+      if (!payload) return;
+      const items = Array.isArray(payload.result)
+        ? payload.result
+        : Array.isArray(payload.positions)
+        ? payload.positions
+        : payload.symbol || payload.product_symbol || payload.product_id
+        ? [payload]
+        : [];
+
+      if (items.length === 0) return;
+
+      setPositionsState((prev) => {
+        let next = [...prev];
+        const newlyClosed: Position[] = [];
+        const norm = (s?: string) => String(s || '').toUpperCase().trim();
+
+        for (const raw of items) {
+          const rawSym = norm(raw.product_symbol || raw.symbol);
+          const prodId = raw.product_id ? Number(raw.product_id) : undefined;
+          const signedContracts = Number(raw.size ?? 0);
+
+          const matchIdx = next.findIndex((p) => {
+            const pSym = norm(p.product_symbol || p.rawSymbol || p.symbol);
+            return (prodId && p.product_id === prodId) || (rawSym && (pSym === rawSym || pSym === `${rawSym}T`));
+          });
+
+          if (!Number.isFinite(signedContracts) || Math.abs(signedContracts) === 0 || raw.action === 'delete') {
+            if (matchIdx !== -1) {
+              const removed = next[matchIdx];
+              newlyClosed.push(removed);
+              next.splice(matchIdx, 1);
+              console.warn(
+                `[Delta WS Position Closed] ${rawSym || removed.symbol} reported size === 0 on WebSocket. Purged immediately.`
+              );
+            }
+          } else {
+            const isOpt = rawSym.startsWith('C-') || rawSym.startsWith('P-');
+            const cVal = Number(
+              raw.contract_value ||
+                (rawSym.includes('BTC') ? 0.001 : rawSym.includes('ETH') ? 0.01 : rawSym.includes('DOGE') ? 100 : 1)
+            );
+            const absContracts = Math.abs(signedContracts);
+            const coinSize = isOpt ? absContracts : +(absContracts * cVal).toFixed(6);
+            const side: 'LONG' | 'SHORT' = signedContracts < 0 ? 'SHORT' : 'LONG';
+            const entryPx = Number(raw.entry_price ?? (matchIdx !== -1 ? next[matchIdx].entryPrice : 0));
+            const markPx = Number(raw.mark_price ?? (matchIdx !== -1 ? next[matchIdx].markPrice : entryPx));
+            const signedCoin = isOpt ? signedContracts * cVal : side === 'SHORT' ? -coinSize : coinSize;
+            const uPnl =
+              raw.unrealized_pnl !== undefined && Number.isFinite(Number(raw.unrealized_pnl))
+                ? Number(raw.unrealized_pnl)
+                : entryPx > 0 && markPx > 0
+                ? +((markPx - entryPx) * signedCoin).toFixed(4)
+                : 0;
+
+            const updatedPos: Position = {
+              ...(matchIdx !== -1 ? next[matchIdx] : ({} as Position)),
+              id: prodId ? String(prodId) : rawSym,
+              product_id: prodId,
+              symbol: isOpt ? rawSym : rawSym.endsWith('USD') ? `${rawSym}T` : rawSym,
+              rawSymbol: rawSym,
+              product_symbol: rawSym,
+              contract_type: isOpt
+                ? rawSym.startsWith('C-')
+                  ? 'call_options'
+                  : 'put_options'
+                : 'perpetual_futures',
+              side,
+              size: coinSize,
+              signedSize: signedContracts,
+              contracts: absContracts,
+              contractValue: cVal,
+              entryPrice: entryPx,
+              entry_price: entryPx,
+              markPrice: markPx,
+              mark_price: markPx,
+              liquidationPrice: Number(raw.liquidation_price ?? (matchIdx !== -1 ? next[matchIdx].liquidationPrice : 0)),
+              leverage: Number(raw.leverage ?? (matchIdx !== -1 ? next[matchIdx].leverage : 10)),
+              margin: Number(raw.margin ?? (matchIdx !== -1 ? next[matchIdx].margin : 0)),
+              unrealisedPnl: +uPnl.toFixed(4),
+              unrealized_pnl: +uPnl.toFixed(4),
+              unrealisedPnlPercent:
+                Number(raw.margin || 0) > 0 ? +((uPnl / Number(raw.margin)) * 100).toFixed(2) : 0,
+              openedAt: matchIdx !== -1 ? next[matchIdx].openedAt : Date.now(),
+              strategy: matchIdx !== -1 ? next[matchIdx].strategy : 'Delta Exchange Live',
+              mode: 'LIVE',
+            };
+
+            if (matchIdx !== -1) {
+              next[matchIdx] = updatedPos;
+            } else {
+              next.push(updatedPos);
+            }
+          }
+        }
+
+        if (newlyClosed.length > 0) {
+          if (next.length === 0) {
+            setSniperUnrealizedUsd(0);
+            setOptionsUnrealizedUsd(0);
+          }
+          if (typeof window !== 'undefined') {
+            window.dispatchEvent(
+              new CustomEvent('delta:position-mismatch-detected', {
+                detail: {
+                  closedPositions: newlyClosed,
+                  message: 'Position closed on Delta Exchange India (WebSocket size === 0).',
+                },
+              })
+            );
+            window.dispatchEvent(
+              new CustomEvent('delta:positions-reconciled', {
+                detail: { activePositions: next, closedPositions: newlyClosed },
+              })
+            );
+          }
+          void resyncAuthoritativeState();
+        }
+        return next;
+      });
+    };
+
+    const handleWsOrders = (e: any) => {
+      const payload = e?.detail;
+      if (!payload) return;
+      const items = Array.isArray(payload.result)
+        ? payload.result
+        : payload.id || payload.order_id
+        ? [payload]
+        : [];
+      if (items.length === 0) return;
+
+      setOpenOrdersState((prev) => {
+        let next = [...prev];
+        for (const ord of items) {
+          const idStr = String(ord.id ?? ord.order_id ?? '');
+          if (!idStr) continue;
+          const st = String(ord.state || '').toLowerCase();
+          const isOpen = st === 'open' || st === 'pending';
+          const idx = next.findIndex((o) => String(o.id ?? o.order_id) === idStr);
+          if (!isOpen || ord.action === 'delete') {
+            if (idx !== -1) next.splice(idx, 1);
+          } else if (idx !== -1) {
+            next[idx] = { ...next[idx], ...ord };
+          } else {
+            next.unshift(ord);
+          }
+        }
+        return next;
+      });
+    };
+
+    const handleWsUserTrades = () => {
+      // Immediately resync fills, realized P&L, and positions on any live execution fill
+      void resyncAuthoritativeState();
+    };
+
+    const handleWsMargins = (e: any) => {
+      const m = e?.detail;
+      if (!m) return;
+      const avail = Number(m.available_balance ?? m.availableMarginUsd);
+      const bal = Number(m.balance ?? m.walletBalanceUsd);
+      const posMargin = Number(m.position_margin ?? m.order_margin);
+      if (Number.isFinite(avail) && avail >= 0) {
+        setAvailableMargin(+avail.toFixed(2));
+        setAvailableBalance(+avail.toFixed(2));
+      }
+      if (Number.isFinite(bal) && bal >= 0) {
+        setWalletBalance(+bal.toFixed(2));
+      }
+      if (Number.isFinite(posMargin) && posMargin >= 0) {
+        setMarginUsed(+posMargin.toFixed(2));
+      }
+    };
+
+    // Live tick-by-tick mark-to-market unrealized P&L recalculation across open perp & option legs
+    const handleLiveTickMarkUpdate = (e: any) => {
+      const d = e?.detail;
+      if (!d || !d.symbol || !(Number(d.markPrice) > 0)) return;
+      const tickSym = String(d.symbol).toUpperCase().trim();
+      const tickMark = Number(d.markPrice);
+
+      setPositionsState((prev) => {
+        if (prev.length === 0) return prev;
+        let mutated = false;
+        const updated = prev.map((p) => {
+          const pSym = String(p.product_symbol || p.rawSymbol || p.symbol || '').toUpperCase().trim();
+          const canonicalPSym = pSym.endsWith('USD') ? `${pSym}T` : pSym;
+          if (pSym !== tickSym && canonicalPSym !== tickSym && p.symbol?.toUpperCase() !== tickSym) {
+            return p;
+          }
+          if (Math.abs((p.markPrice || 0) - tickMark) < 0.0001) return p;
+          mutated = true;
+          const isOpt =
+            p.contract_type === 'call_options' ||
+            p.contract_type === 'put_options' ||
+            pSym.startsWith('C-') ||
+            pSym.startsWith('P-');
+          const entryPx = Number(p.entry_price ?? p.entryPrice ?? 0);
+          const cVal = Number(p.contractValue || (pSym.includes('BTC') ? 0.001 : pSym.includes('ETH') ? 0.01 : 1));
+          let nextUpnl = p.unrealisedPnl || 0;
+          if (entryPx > 0) {
+            if (isOpt) {
+              const contractsCount = Math.abs(Number(p.contracts || p.size || 0));
+              const signedCoin = (p.side === 'SHORT' ? -contractsCount : contractsCount) * cVal;
+              nextUpnl = +((tickMark - entryPx) * signedCoin).toFixed(4);
+            } else {
+              const absCoinSize = Math.abs(Number(p.size || 0));
+              nextUpnl =
+                p.side === 'LONG'
+                  ? +((tickMark - entryPx) * absCoinSize).toFixed(4)
+                  : +((entryPx - tickMark) * absCoinSize).toFixed(4);
+            }
+          }
+          const nextUpnlPct = p.margin > 0 ? +((nextUpnl / p.margin) * 100).toFixed(2) : p.unrealisedPnlPercent;
+          return {
+            ...p,
+            markPrice: tickMark,
+            mark_price: tickMark,
+            unrealisedPnl: nextUpnl,
+            unrealized_pnl: nextUpnl,
+            unrealisedPnlPercent: nextUpnlPct,
+          };
+        });
+        return mutated ? updated : prev;
+      });
+    };
+
+    window.addEventListener('delta:ws-reconnected-resync', handleWsReconnectResync);
+    window.addEventListener('delta:ws-positions', handleWsPositions);
+    window.addEventListener('delta:ws-orders', handleWsOrders);
+    window.addEventListener('delta:ws-user-trades', handleWsUserTrades);
+    window.addEventListener('delta:ws-margins', handleWsMargins);
+    window.addEventListener('delta:ws-ticker', handleLiveTickMarkUpdate);
+    window.addEventListener('delta:ws-option-ticker', handleLiveTickMarkUpdate);
+
+    return () => {
+      window.removeEventListener('delta:ws-reconnected-resync', handleWsReconnectResync);
+      window.removeEventListener('delta:ws-positions', handleWsPositions);
+      window.removeEventListener('delta:ws-orders', handleWsOrders);
+      window.removeEventListener('delta:ws-user-trades', handleWsUserTrades);
+      window.removeEventListener('delta:ws-margins', handleWsMargins);
+      window.removeEventListener('delta:ws-ticker', handleLiveTickMarkUpdate);
+      window.removeEventListener('delta:ws-option-ticker', handleLiveTickMarkUpdate);
+    };
+  }, [resyncAuthoritativeState]);
+
+  // Immediate Ratchet Breakeven Stop-Loss update listener
+  useEffect(() => {
+    const handleSlUpdate = (e: any) => {
+      const sym = e?.detail?.symbol;
+      const newSl = e?.detail?.newStopLoss;
+      if (sym && typeof newSl === 'number' && Number.isFinite(newSl) && newSl > 0) {
+        updatePositionStopLoss(sym, newSl);
+      }
+    };
+    window.addEventListener('delta:update-position-sl', handleSlUpdate);
+    return () => window.removeEventListener('delta:update-position-sl', handleSlUpdate);
+  }, [updatePositionStopLoss]);
+
+  const syncNow = useCallback(async () => {
+    await resyncAuthoritativeState();
+  }, [resyncAuthoritativeState]);
 
   const refreshPositions = useCallback(
     async (
@@ -783,6 +1241,9 @@ export const PortfolioProvider: React.FC<{ children: React.ReactNode; initialRat
       resetSniperPnl,
       resetOptionsPnl,
       setUsdInrRate,
+      updatePositionStopLoss,
+      positionMismatchWarning,
+      clearPositionMismatchWarning,
     }),
     [
       sniperUnrealizedPnlUsd,
@@ -836,6 +1297,9 @@ export const PortfolioProvider: React.FC<{ children: React.ReactNode; initialRat
       resetSniperPnl,
       resetOptionsPnl,
       setUsdInrRate,
+      updatePositionStopLoss,
+      positionMismatchWarning,
+      clearPositionMismatchWarning,
     ]
   );
 

@@ -110,19 +110,7 @@ export const AiCommandCentre: React.FC<AiCommandCentreProps> = ({
     clampLeverage,
     getContractsCount,
   } = useCapitalAllocation();
-  const [timeframe, setTimeframe] = useState<string>(() => {
-    try {
-      const cached = typeof window !== 'undefined' ? localStorage.getItem('delta_pref_timeframe') : null;
-      if (cached && ['1m', '3m', '5m', '15m', '1h', '4h'].includes(cached)) return cached;
-    } catch {}
-    return '5m';
-  });
-
-  useEffect(() => {
-    try {
-      localStorage.setItem('delta_pref_timeframe', timeframe);
-    } catch {}
-  }, [timeframe]);
+  const [timeframe, setTimeframe] = useState<string>('5m');
   const [showAgentDetails, setShowAgentDetails] = useState<boolean>(false);
   const [bottomTrayTab, setBottomTrayTab] = useState<BottomTrayTab>('OPTIONS_GREEKS');
   const [showScorecardMatrix, setShowScorecardMatrix] = useState<boolean>(false);

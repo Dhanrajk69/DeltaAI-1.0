@@ -18,6 +18,7 @@ import { SniperSignal, SniperActiveTrade, SniperLogEntry, SniperScalpTier, Snipe
 import { useCapitalAllocation } from '../context/CapitalAllocationContext';
 import { calculateSniperFriction } from '../utils/frictionUtils';
 import { ProfitLadderDashdark } from './ProfitLadderDashdark';
+import { usePortfolio } from '../context/PortfolioContext';
 
 export interface ExecutionCockpitProps {
   currentSignal: SniperSignal;
@@ -48,6 +49,10 @@ export interface ExecutionCockpitProps {
   setIsAutoSniperEnabled?: (val: boolean) => void;
   onResetCircuitBreaker?: () => void;
   consecutiveStopsCount?: number;
+  circuitBreakerTripped?: boolean;
+  circuitBreakerReason?: string | null;
+  dailyLossPercent?: number;
+  postSlCooldownUntilMs?: number;
   pairCooldowns?: Record<string, number>;
   cycleRealizedPnL?: number;
   harvestTargetHit?: boolean;
@@ -56,6 +61,15 @@ export interface ExecutionCockpitProps {
   onResetCycleTarget?: () => void;
   isEmaAlignmentPending?: boolean;
   className?: string;
+}
+
+function normalizePerpSymbol(sym?: string): string {
+  if (!sym) return 'BTCUSDT';
+  const up = String(sym).toUpperCase().trim();
+  if (up === 'BTCUSD' || up === 'BTCUSDT' || up.includes('BTC')) return 'BTCUSDT';
+  if (up === 'ETHUSD' || up === 'ETHUSDT' || up.includes('ETH')) return 'ETHUSDT';
+  if (up.endsWith('USD') && !up.endsWith('USDT')) return `${up}T`;
+  return up;
 }
 
 export const ExecutionCockpit: React.FC<ExecutionCockpitProps> = ({
@@ -86,6 +100,10 @@ export const ExecutionCockpit: React.FC<ExecutionCockpitProps> = ({
   setIsAutoSniperEnabled,
   onResetCircuitBreaker,
   consecutiveStopsCount = 0,
+  circuitBreakerTripped = false,
+  circuitBreakerReason = null,
+  dailyLossPercent = 0,
+  postSlCooldownUntilMs = 0,
   pairCooldowns = {},
   cycleRealizedPnL = 0,
   harvestTargetHit = false,
@@ -107,25 +125,19 @@ export const ExecutionCockpit: React.FC<ExecutionCockpitProps> = ({
     leverageSyncLocked,
     clampLeverage,
   } = useCapitalAllocation();
-  const [internalBypass, setInternalBypass] = React.useState<boolean>(() => {
-    try {
-      return localStorage.getItem('delta_bypass_htf_paper') === 'true';
-    } catch {
-      return false;
-    }
-  });
+  const { positions, positionMismatchWarning, clearPositionMismatchWarning } = usePortfolio();
+  const [internalBypass, setInternalBypass] = React.useState<boolean>(false);
 
   React.useEffect(() => {
-    const handleStorageChange = () => {
-      try {
-        setInternalBypass(localStorage.getItem('delta_bypass_htf_paper') === 'true');
-      } catch {}
+    const handleBypassToggle = (e: Event) => {
+      const detail = (e as CustomEvent).detail;
+      if (detail && typeof detail.bypass === 'boolean') {
+        setInternalBypass(detail.bypass);
+      }
     };
-    window.addEventListener('delta_bypass_toggle', handleStorageChange);
-    window.addEventListener('storage', handleStorageChange);
+    window.addEventListener('delta_bypass_toggle', handleBypassToggle as EventListener);
     return () => {
-      window.removeEventListener('delta_bypass_toggle', handleStorageChange);
-      window.removeEventListener('storage', handleStorageChange);
+      window.removeEventListener('delta_bypass_toggle', handleBypassToggle as EventListener);
     };
   }, []);
 
@@ -214,12 +226,101 @@ export const ExecutionCockpit: React.FC<ExecutionCockpitProps> = ({
     }
     setInternalBypass(nextVal);
     try {
-      localStorage.setItem('delta_bypass_htf_paper', nextVal ? 'true' : 'false');
-      window.dispatchEvent(new Event('delta_bypass_toggle'));
+      window.dispatchEvent(new CustomEvent('delta_bypass_toggle', { detail: { bypass: nextVal } }));
     } catch {}
   };
 
-  const isPositionOpen = activeTrade !== null && activeTrade !== undefined && !['STOPPED_OUT', 'COMPLETED', 'REVERSED', 'TIME_EXIT'].includes(activeTrade.tradeStatus);
+  const effectiveActiveTrade = React.useMemo(() => {
+    if (isLiveUnverified) return null;
+    if (
+      activeTrade &&
+      activeTrade.status !== 'CLOSED' &&
+      !['STOPPED_OUT', 'COMPLETED', 'REVERSED', 'TIME_EXIT'].includes(activeTrade.tradeStatus)
+    ) {
+      return activeTrade;
+    }
+    const normSelected = normalizePerpSymbol(selectedSymbol);
+    const activePerps = (Array.isArray(positions) ? positions : []).filter((p) => {
+      const sym = String(p.product_symbol || p.rawSymbol || p.symbol || '').toUpperCase();
+      const isOpt =
+        p.contract_type === 'call_options' ||
+        p.contract_type === 'put_options' ||
+        sym.startsWith('C-') ||
+        sym.startsWith('P-');
+      if (isOpt) return false;
+      const rawSize = Math.abs(Number(p.size ?? 0));
+      const rawContracts = Math.abs(Number(p.contracts ?? 0));
+      return rawSize > 0 || rawContracts > 0;
+    });
+
+    if (activePerps.length === 0) return null;
+
+    const matched =
+      activePerps.find(
+        (p) => normalizePerpSymbol(p.product_symbol || p.rawSymbol || p.symbol) === normSelected
+      ) || activePerps[0];
+
+    const rawSym = String(matched.product_symbol || matched.rawSymbol || matched.symbol || selectedSymbol).toUpperCase();
+    const sideStr = String(matched.side || '').toUpperCase();
+    const side: 'LONG' | 'SHORT' =
+      sideStr === 'SHORT' || sideStr === 'SELL' || Number(matched.signedSize ?? matched.size ?? 0) < 0
+        ? 'SHORT'
+        : 'LONG';
+
+    const rawAbsSize = Math.abs(Number(matched.size ?? 0));
+    const rawContracts = Math.abs(Number(matched.contracts ?? 0));
+    const cVal = Number(matched.contractValue || (rawSym.includes('BTC') ? 0.001 : rawSym.includes('ETH') ? 0.01 : 1));
+    const coinSize = rawContracts > 0 && Math.abs(rawAbsSize - rawContracts) < 1e-6 && cVal < 1
+      ? rawContracts * cVal
+      : rawAbsSize > 0
+      ? rawAbsSize
+      : rawContracts * cVal;
+    const contracts = rawContracts > 0 ? rawContracts : Math.max(1, Math.round(coinSize / cVal));
+    const entryPx = Number(matched.entryPrice ?? matched.entry_price ?? activeMarkPrice);
+    const slDist = entryPx * 0.0028;
+
+    return {
+      id: matched.id || `pos-${rawSym}`,
+      symbol: rawSym,
+      side,
+      direction: side,
+      signal: side,
+      lotSize: coinSize,
+      remainingSize: coinSize,
+      contractsCount: contracts,
+      entryPrice: entryPx,
+      currentPrice: activeMarkPrice > 0 ? activeMarkPrice : entryPx,
+      initialStopLoss: Number(matched.stopLoss ?? 0) > 0 ? Number(matched.stopLoss) : (side === 'SHORT' ? entryPx + slDist : entryPx - slDist),
+      currentStopLoss: Number(matched.stopLoss ?? 0) > 0 ? Number(matched.stopLoss) : (side === 'SHORT' ? entryPx + slDist : entryPx - slDist),
+      tp1: Number(matched.takeProfit ?? 0) > 0 ? Number(matched.takeProfit) : (side === 'SHORT' ? entryPx - slDist * 1.25 : entryPx + slDist * 1.25),
+      tp2: side === 'SHORT' ? entryPx - slDist * 2.0 : entryPx + slDist * 2.0,
+      tp3: side === 'SHORT' ? entryPx - slDist * 2.75 : entryPx + slDist * 2.75,
+      tp4: side === 'SHORT' ? entryPx - slDist * 3.5 : entryPx + slDist * 3.5,
+      tradeStatus: 'ACTIVE',
+      status: 'OPEN',
+      openedAt: matched.openedAt || Date.now(),
+      unrealizedPnlUsd: side === 'LONG' ? (activeMarkPrice - entryPx) * coinSize : (entryPx - activeMarkPrice) * coinSize,
+      unrealisedProfitUsd: side === 'LONG' ? (activeMarkPrice - entryPx) * coinSize : (entryPx - activeMarkPrice) * coinSize,
+      bookedProfitUsd: 0,
+      adoptedFromExchange: true,
+    } as any;
+  }, [isLiveUnverified, activeTrade, positions, selectedSymbol, activeMarkPrice]);
+
+  const liveOpenUnrealisedUsd = React.useMemo(() => {
+    if (!effectiveActiveTrade) return 0;
+    const entryPx = Number(effectiveActiveTrade.entryPrice || 0);
+    const remSize = Number(effectiveActiveTrade.remainingSize > 0 ? effectiveActiveTrade.remainingSize : effectiveActiveTrade.lotSize || 0);
+    if (entryPx <= 0 || remSize <= 0 || activeMarkPrice <= 0) {
+      return Number(effectiveActiveTrade.unrealizedPnlUsd || effectiveActiveTrade.unrealisedProfitUsd || 0);
+    }
+    const isShortTrade = effectiveActiveTrade.side === 'SHORT' || effectiveActiveTrade.signal === 'SHORT';
+    const rawDiff = isShortTrade
+      ? (entryPx - activeMarkPrice) * remSize
+      : (activeMarkPrice - entryPx) * remSize;
+    return Number.isFinite(rawDiff) ? +rawDiff.toFixed(2) : (effectiveActiveTrade.unrealisedProfitUsd || 0);
+  }, [effectiveActiveTrade, activeMarkPrice]);
+
+  const isPositionOpen = (effectiveActiveTrade || activeTrade) !== null && (effectiveActiveTrade || activeTrade) !== undefined && !['STOPPED_OUT', 'COMPLETED', 'REVERSED', 'TIME_EXIT'].includes((effectiveActiveTrade || activeTrade).tradeStatus);
 
   // Format price helper
   const fmt = (p: number | undefined) => {
@@ -247,6 +348,23 @@ export const ExecutionCockpit: React.FC<ExecutionCockpitProps> = ({
       <div className="lg:col-span-5 bg-[#0D111D] border border-slate-800/80 rounded-2xl p-4 shadow-2xl relative overflow-hidden backdrop-blur-md flex flex-col justify-between space-y-3.5 font-mono">
         {/* Top hairline accent */}
         <div className="absolute top-0 left-0 right-0 h-[1px] bg-gradient-to-r from-transparent via-cyan-500/25 to-transparent pointer-events-none" />
+
+        {/* Position Mismatch Warning Alert Banner */}
+        {positionMismatchWarning && (
+          <div className="p-3 bg-rose-950/90 border border-rose-500/80 rounded-xl text-rose-200 text-xs flex items-center justify-between gap-3 shadow-[0_0_15px_rgba(244,63,94,0.3)] animate-pulse">
+            <div className="flex items-center gap-2">
+              <AlertTriangle className="w-4 h-4 text-rose-400 shrink-0" />
+              <span className="font-semibold text-rose-100">{positionMismatchWarning}</span>
+            </div>
+            <button
+              type="button"
+              onClick={clearPositionMismatchWarning}
+              className="px-2 py-0.5 rounded bg-rose-500/20 hover:bg-rose-500/30 border border-rose-500/40 text-[10px] text-white shrink-0 cursor-pointer"
+            >
+              Dismiss
+            </button>
+          </div>
+        )}
 
         {/* Cockpit Card Header with Paper Demo Bypass Switch & Active Tier Badge */}
         <div className="space-y-2.5 pb-2.5 border-b border-slate-800/60">
@@ -487,13 +605,18 @@ export const ExecutionCockpit: React.FC<ExecutionCockpitProps> = ({
         )}
 
         {/* Circuit Breaker Warning Banner */}
-        {(consecutiveStopsCount && consecutiveStopsCount >= 2) && (
+        {(circuitBreakerTripped || (consecutiveStopsCount && consecutiveStopsCount >= 3) || (dailyLossPercent !== undefined && dailyLossPercent >= 1.5)) && (
           <div className="p-2.5 bg-rose-950/90 border border-rose-500/80 rounded-xl text-xs font-mono text-rose-200 shadow-lg my-1 animate-pulse flex items-center justify-between gap-2">
             <div className="flex items-center gap-2">
               <AlertTriangle className="w-4 h-4 text-rose-400 shrink-0" />
               <div>
                 <strong className="text-white uppercase font-bold text-[11px] block">CIRCUIT BREAKER: AUTO-PILOT HALTED</strong>
-                <span className="text-[10px] text-rose-300 block">Auto-pilot halted after 2 consecutive stops to preserve capital.</span>
+                <span className="text-[10px] text-rose-300 block">
+                  {circuitBreakerReason ||
+                    (consecutiveStopsCount >= 3
+                      ? `Auto-pilot halted after 3 consecutive stops (${consecutiveStopsCount}/3) to preserve capital.`
+                      : `Daily loss limit reached (${(dailyLossPercent || 0).toFixed(2)}% >= 1.5% max risk).`)}
+                </span>
               </div>
             </div>
             {onResetCircuitBreaker && (
@@ -503,6 +626,28 @@ export const ExecutionCockpit: React.FC<ExecutionCockpitProps> = ({
                 className="px-2.5 py-1 rounded bg-gradient-to-r from-rose-600 to-red-600 hover:from-rose-500 hover:to-red-500 active:scale-95 text-white font-extrabold text-[10px] uppercase tracking-wider border border-rose-400 shadow-md transition-all cursor-pointer"
               >
                 [RESET CIRCUIT BREAKER & ARMED STATE]
+              </button>
+            )}
+          </div>
+        )}
+
+        {/* Post-SL 1-Candle Cooldown Badge */}
+        {((postSlCooldownUntilMs && postSlCooldownUntilMs > Date.now()) || (currentSignal?.postSlCooldownBarsRemaining && currentSignal.postSlCooldownBarsRemaining > 0)) && (
+          <div className="p-2.5 bg-amber-950/80 border border-amber-500/70 rounded-xl text-xs font-mono text-amber-200 shadow-lg my-1 flex items-center justify-between gap-2">
+            <div className="flex items-center gap-2">
+              <Clock className="w-4 h-4 text-amber-400 shrink-0 animate-spin" />
+              <div>
+                <strong className="text-amber-100 uppercase font-bold text-[11px] block">1-CANDLE POST-SL COOLDOWN</strong>
+                <span className="text-[10px] text-amber-300/90 block">Awaiting completed 15M candle close before next Auto-Pilot entry.</span>
+              </div>
+            </div>
+            {onResetCircuitBreaker && (
+              <button
+                type="button"
+                onClick={onResetCircuitBreaker}
+                className="px-2 py-0.5 rounded bg-amber-800 hover:bg-amber-700 text-white font-bold text-[10px] uppercase border border-amber-400 cursor-pointer"
+              >
+                Skip Cooldown
               </button>
             )}
           </div>
@@ -847,16 +992,20 @@ export const ExecutionCockpit: React.FC<ExecutionCockpitProps> = ({
           ═══════════════════════════════════════════════════════════ */}
       <div className="lg:col-span-7 flex flex-col justify-between space-y-3.5">
         <ProfitLadderDashdark
-          isShort={isShort}
-          entryPrice={currentSignal.entryPrice || activeMarkPrice}
+          isShort={effectiveActiveTrade ? (effectiveActiveTrade.side === 'SHORT' || effectiveActiveTrade.signal === 'SHORT') : isShort}
+          entryPrice={effectiveActiveTrade?.entryPrice || currentSignal.entryPrice || activeMarkPrice}
           markPrice={activeMarkPrice}
-          tp1={currentSignal.tp1}
-          tp2={currentSignal.tp2}
-          tp3={currentSignal.tp3}
-          tp4={currentSignal.tp4}
-          activeTrade={activeTrade}
-          activeTargetIndex={activeTrade?.tp3Hit ? 4 : activeTrade?.tp2Hit ? 3 : activeTrade?.tp1Hit ? 2 : 1}
+          stopLoss={effectiveActiveTrade?.currentStopLoss || effectiveActiveTrade?.initialStopLoss || currentSignal.initialStopLoss}
+          tp1={effectiveActiveTrade?.tp1 || currentSignal.tp1}
+          tp2={effectiveActiveTrade?.tp2 || currentSignal.tp2}
+          tp3={effectiveActiveTrade?.tp3 || currentSignal.tp3}
+          tp4={effectiveActiveTrade?.tp4 || currentSignal.tp4}
+          activeTrade={effectiveActiveTrade}
+          activeTargetIndex={effectiveActiveTrade?.tp3Hit ? 4 : effectiveActiveTrade?.tp2Hit ? 3 : effectiveActiveTrade?.tp1Hit ? 2 : 1}
+          unrealizedPnl={liveOpenUnrealisedUsd}
           isMicro15={isMicro15}
+          lotSize={effectiveActiveTrade?.lotSize || currentSignal.lotSize || defaultLotSize}
+          symbol={selectedSymbol}
           liveUsdInrRate={liveFxRate}
           currencyPrefix={currencyPrefix}
           netBreakevenPrice={friction.netBreakevenPrice}

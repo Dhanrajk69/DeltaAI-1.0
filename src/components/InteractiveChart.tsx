@@ -350,14 +350,7 @@ export const InteractiveChart: React.FC<InteractiveChartProps> = React.memo(({
       setDailyHistoryTick((t) => t + 1);
     });
   }, []);
-  const [localVolatilityThreshold, setLocalVolatilityThreshold] = useState<number>(() => {
-    try {
-      const saved = Number(localStorage.getItem('delta_trend_volatility_threshold'));
-      return Number.isFinite(saved) && saved >= 0 && saved <= 100 ? saved : 50;
-    } catch {
-      return 50;
-    }
-  });
+  const [localVolatilityThreshold, setLocalVolatilityThreshold] = useState<number>(50);
   const volatilityThreshold =
     typeof controlledSmoothingFactor === 'number' && Number.isFinite(controlledSmoothingFactor)
       ? Math.max(0, Math.min(100, Math.round(controlledSmoothingFactor)))
@@ -367,9 +360,6 @@ export const InteractiveChart: React.FC<InteractiveChartProps> = React.memo(({
       const clamped = Math.max(0, Math.min(100, Math.round(nextVal)));
       setLocalVolatilityThreshold(clamped);
       onTrendSmoothingFactorChange?.(clamped);
-      try {
-        localStorage.setItem('delta_trend_volatility_threshold', String(clamped));
-      } catch {}
     },
     [onTrendSmoothingFactorChange]
   );

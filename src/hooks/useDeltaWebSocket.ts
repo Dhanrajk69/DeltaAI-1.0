@@ -26,7 +26,7 @@ export function useDeltaWebSocket(options: UseDeltaWebSocketOptions = {}) {
   const [messageCount, setMessageCount] = useState<number>(0);
   const lastMessageRef = useRef<any>(null);
   const [messageLogs, setMessageLogs] = useState<WsMessageLog[]>([]);
-  const [gatewayUrl, setGatewayUrl] = useState<string>('Local Relay (/ws/delta)');
+  const [gatewayUrl, setGatewayUrl] = useState<string>('wss://socket.india.delta.exchange (via /ws/delta)');
   const [priceFlashing, setPriceFlashing] = useState<Record<string, 'UP' | 'DOWN'>>({});
   const [lastTickTimestamp, setLastTickTimestamp] = useState<number>(Date.now());
   const [lastCandleTimestamp, setLastCandleTimestamp] = useState<number>(Date.now());
@@ -35,12 +35,14 @@ export function useDeltaWebSocket(options: UseDeltaWebSocketOptions = {}) {
   const pingStartRef = useRef<number>(0);
   const pingIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const reconnectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const reconnectAttemptRef = useRef<number>(0);
+  const manualDisconnectRef = useRef<boolean>(false);
   const flashTimeoutsRef = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
   const prevPricesRef = useRef<Record<string, number>>({});
-  const lastPacketTimestampRef = useRef<number>(0);
   const lastPacketArrivalRef = useRef<number>(0);
   const latestGapRef = useRef<number>(350);
   const lastSymTimestampRef = useRef<Record<string, number>>({});
+  const lastResyncBroadcastAtRef = useRef<number>(0);
 
   // Telemetry accumulators flushed to React state on a 250ms cadence to avoid per-packet re-render storms
   const pendingMsgCountRef = useRef<number>(0);
@@ -57,9 +59,29 @@ export function useDeltaWebSocket(options: UseDeltaWebSocketOptions = {}) {
     }
   }, []);
 
-  // Connect function
+  const dispatchAuthoritativeResync = useCallback((detail?: any) => {
+    if (typeof window === 'undefined') return;
+    const now = Date.now();
+    // Coalesce burst reconnect/auth frames within 400ms
+    if (now - lastResyncBroadcastAtRef.current < 400 && !detail?.authenticated) {
+      return;
+    }
+    lastResyncBroadcastAtRef.current = now;
+    window.dispatchEvent(
+      new CustomEvent('delta:ws-reconnected-resync', {
+        detail: detail || { timestamp: now },
+      })
+    );
+  }, []);
+
   const connect = useCallback(() => {
     if (typeof window === 'undefined') return;
+    manualDisconnectRef.current = false;
+
+    if (reconnectTimeoutRef.current) {
+      clearTimeout(reconnectTimeoutRef.current);
+      reconnectTimeoutRef.current = null;
+    }
 
     if (wsRef.current) {
       try {
@@ -72,21 +94,33 @@ export function useDeltaWebSocket(options: UseDeltaWebSocketOptions = {}) {
       wsRef.current = null;
     }
 
-    setStatus('CONNECTING');
+    setStatus(reconnectAttemptRef.current > 0 ? 'RECONNECTING' : 'CONNECTING');
 
-    // Build WebSocket URL: prefer local relay /ws/delta which bridges upstream Delta India
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const wsUrl = `${protocol}//${window.location.host}/ws/delta`;
     setGatewayUrl(wsUrl);
+
+    const scheduleExponentialReconnect = () => {
+      if (manualDisconnectRef.current) return;
+      if (reconnectTimeoutRef.current) clearTimeout(reconnectTimeoutRef.current);
+      const baseDelayMs = Math.min(30_000, 1000 * Math.pow(2, reconnectAttemptRef.current));
+      const jitterMs = Math.floor(Math.random() * 350);
+      reconnectAttemptRef.current = Math.min(reconnectAttemptRef.current + 1, 6);
+      reconnectTimeoutRef.current = setTimeout(() => {
+        setStatus('RECONNECTING');
+        connect();
+      }, baseDelayMs + jitterMs);
+    };
 
     try {
       const ws = new WebSocket(wsUrl);
       wsRef.current = ws;
 
       ws.onopen = () => {
+        reconnectAttemptRef.current = 0;
         setStatus('CONNECTED');
 
-        // Subscribe to live tickers
+        // Subscribe to public market channels (v2/ticker + candlesticks)
         const subscribePayload = {
           type: 'subscribe',
           payload: {
@@ -103,15 +137,29 @@ export function useDeltaWebSocket(options: UseDeltaWebSocketOptions = {}) {
                 ],
               },
               {
+                name: 'candlestick_1m',
+                symbols: ['BTCUSD', 'ETHUSD', 'SOLUSD'],
+              },
+              {
+                name: 'candlestick_5m',
+                symbols: ['BTCUSD', 'ETHUSD', 'SOLUSD'],
+              },
+              {
+                name: 'candlestick_15m',
+                symbols: ['BTCUSD', 'ETHUSD', 'SOLUSD'],
+              },
+              {
                 name: 'l2_orderbook',
-                symbols: ['BTCUSD', 'BTCUSDT'],
+                symbols: ['BTCUSD'],
               },
             ],
           },
         };
         ws.send(JSON.stringify(subscribePayload));
 
-        // Start periodic ping/pong for RTT latency measurement
+        // Immediately trigger full authoritative REST resync on every WebSocket open/reconnect
+        dispatchAuthoritativeResync({ reason: 'ws_open', timestamp: Date.now() });
+
         if (pingIntervalRef.current) clearInterval(pingIntervalRef.current);
         pingIntervalRef.current = setInterval(() => {
           if (ws.readyState === WebSocket.OPEN) {
@@ -127,13 +175,16 @@ export function useDeltaWebSocket(options: UseDeltaWebSocketOptions = {}) {
           pendingMsgCountRef.current += 1;
           lastMessageRef.current = data;
 
-          // Handle pong latency immediately (12s interval)
           if (data.type === 'pong' && pingStartRef.current > 0) {
             const rtt = Date.now() - pingStartRef.current;
             setLatency(Math.max(8, rtt));
           }
 
-          // Handle handshake
+          if (data.type === 'ws_reconnected_resync') {
+            dispatchAuthoritativeResync(data);
+            return;
+          }
+
           if (data.type === 'handshake') {
             if (data.upstreamUrl) {
               setGatewayUrl(`${data.upstreamUrl} (via /ws/delta)`);
@@ -158,24 +209,55 @@ export function useDeltaWebSocket(options: UseDeltaWebSocketOptions = {}) {
             }
           }
 
-          // Handle ticker & markPrice updates (force priority on incoming WebSocket packets)
-          const isTickerPacket = (
-            data.type === 'v2/ticker' ||
-            data.channel === 'v2/ticker' ||
-            data.type === 'ticker' ||
-            data.mark_price !== undefined ||
-            data.markPrice !== undefined
-          ) && data.symbol;
+          const msgType = String(data.type || data.channel || '').toLowerCase();
+
+          // Live candlestick streams (candlestick_1m, candlestick_5m, candlestick_15m)
+          if (msgType.startsWith('candlestick_')) {
+            const nowTime = Date.now();
+            pendingLastCandleRef.current = nowTime;
+            if (typeof window !== 'undefined') {
+              window.dispatchEvent(new CustomEvent('delta:ws-candle', { detail: data }));
+            }
+          }
+
+          // Private authenticated channels: positions, orders, user_trades, margins
+          if (msgType === 'positions' && typeof window !== 'undefined') {
+            window.dispatchEvent(new CustomEvent('delta:ws-positions', { detail: data }));
+            window.dispatchEvent(new CustomEvent('delta:ws-trade-event', { detail: data }));
+          } else if ((msgType === 'orders' || msgType === 'v2/orders') && typeof window !== 'undefined') {
+            window.dispatchEvent(new CustomEvent('delta:ws-orders', { detail: data }));
+            window.dispatchEvent(new CustomEvent('delta:ws-trade-event', { detail: data }));
+          } else if (
+            (msgType === 'user_trades' || msgType === 'v2/user_trades' || msgType === 'fills' || msgType === 'v2/fills') &&
+            typeof window !== 'undefined'
+          ) {
+            window.dispatchEvent(new CustomEvent('delta:ws-user-trades', { detail: data }));
+            window.dispatchEvent(new CustomEvent('delta:ws-trade-event', { detail: data }));
+          } else if (msgType === 'margins' && typeof window !== 'undefined') {
+            window.dispatchEvent(new CustomEvent('delta:ws-margins', { detail: data }));
+          }
+
+          // Public v2/ticker updates (Futures markPrice + Option Chain Greeks/IV)
+          const isTickerPacket =
+            (msgType === 'v2/ticker' ||
+              msgType === 'ticker' ||
+              data.mark_price !== undefined ||
+              data.markPrice !== undefined) &&
+            Boolean(data.symbol) &&
+            msgType !== 'positions' &&
+            msgType !== 'orders';
 
           if (isTickerPacket) {
-            const sym = data.symbol;
-            const rawMark = data.mark_price ?? data.markPrice ?? data.close ?? data.price ?? data.last_price;
+            const sym = String(data.symbol);
+            const upperSym = sym.toUpperCase();
+            const isOptionContract = upperSym.startsWith('C-') || upperSym.startsWith('P-');
+            const rawMark =
+              data.mark_price ?? data.markPrice ?? data.close ?? data.quotes?.mark_price ?? data.price ?? data.last_price;
             const newPrice = Number(rawMark || 0);
             const rawIndex = data.index_price ?? data.indexPrice ?? data.spot_price;
             const newIndex = rawIndex !== undefined ? Number(rawIndex) : undefined;
-
-            // Compute timestamp gap between incoming WebSocket price packets in milliseconds
             const nowTime = Date.now();
+
             if (lastPacketArrivalRef.current > 0) {
               const delta = nowTime - lastPacketArrivalRef.current;
               latestGapRef.current = Math.min(2500, Math.max(12, delta));
@@ -184,9 +266,7 @@ export function useDeltaWebSocket(options: UseDeltaWebSocketOptions = {}) {
             }
             lastPacketArrivalRef.current = nowTime;
             pendingLastTickRef.current = nowTime;
-            pendingLastCandleRef.current = Math.floor(nowTime / (5 * 60 * 1000)) * (5 * 60 * 1000);
 
-            // Track per-symbol gap
             if (sym) {
               const prevSymArrival = lastSymTimestampRef.current[sym] || nowTime;
               const symDelta = nowTime - prevSymArrival;
@@ -196,44 +276,79 @@ export function useDeltaWebSocket(options: UseDeltaWebSocketOptions = {}) {
               lastSymTimestampRef.current[sym] = nowTime;
             }
 
-            if (newPrice > 0) {
-              const oldPrice = prevPricesRef.current[sym] || newPrice;
-              if (newPrice !== oldPrice) {
-                const dir = newPrice > oldPrice ? 'UP' : 'DOWN';
-                setPriceFlashing((prev) => (prev[sym] === dir ? prev : { ...prev, [sym]: dir }));
-                if (flashTimeoutsRef.current[sym]) {
-                  clearTimeout(flashTimeoutsRef.current[sym]);
-                }
-                flashTimeoutsRef.current[sym] = setTimeout(() => {
-                  delete flashTimeoutsRef.current[sym];
-                  setPriceFlashing((prev) => {
-                    if (!prev[sym]) return prev;
-                    const copy = { ...prev };
-                    delete copy[sym];
-                    return copy;
-                  });
-                }, 800);
+            if (isOptionContract || data.greeks) {
+              if (typeof window !== 'undefined') {
+                window.dispatchEvent(
+                  new CustomEvent('delta:ws-option-ticker', {
+                    detail: {
+                      symbol: upperSym,
+                      markPrice: newPrice,
+                      spotPrice: newIndex,
+                      greeks: data.greeks || null,
+                      markVol: data.mark_vol !== undefined ? Number(data.mark_vol) : undefined,
+                      quotes: data.quotes || null,
+                      timestamp: typeof data.timestamp === 'number' && data.timestamp > 0 ? data.timestamp : nowTime,
+                    },
+                  })
+                );
               }
-              prevPricesRef.current[sym] = newPrice;
-            }
+            } else {
+              if (newPrice > 0) {
+                const oldPrice = prevPricesRef.current[sym] || newPrice;
+                if (newPrice !== oldPrice) {
+                  const dir = newPrice > oldPrice ? 'UP' : 'DOWN';
+                  setPriceFlashing((prev) => (prev[sym] === dir ? prev : { ...prev, [sym]: dir }));
+                  if (flashTimeoutsRef.current[sym]) {
+                    clearTimeout(flashTimeoutsRef.current[sym]);
+                  }
+                  flashTimeoutsRef.current[sym] = setTimeout(() => {
+                    delete flashTimeoutsRef.current[sym];
+                    setPriceFlashing((prev) => {
+                      if (!prev[sym]) return prev;
+                      const copy = { ...prev };
+                      delete copy[sym];
+                      return copy;
+                    });
+                  }, 800);
+                }
+                prevPricesRef.current[sym] = newPrice;
+              }
 
-            if (onTickerUpdate) {
-              onTickerUpdate({
-                symbol: sym,
-                markPrice: newPrice > 0 ? newPrice : undefined,
-                indexPrice: newIndex !== undefined && newIndex > 0 ? newIndex : undefined,
-                high24h: data.high24h ?? data.high ? Number(data.high24h || data.high) : undefined,
-                low24h: data.low24h ?? data.low ? Number(data.low24h || data.low) : undefined,
-                volume24hUsd: data.volume24hUsd ?? data.turnover_usd ? Number(data.volume24hUsd || data.turnover_usd) : undefined,
-                fundingRate: data.fundingRate ?? data.funding_rate ? Number(data.fundingRate || data.funding_rate) : undefined,
-                nextFundingCountdown: data.nextFundingCountdown || data.next_funding_countdown || undefined,
-                change24h: data.change24h !== undefined ? Number(data.change24h) : data.mark_change_24h !== undefined ? Number(data.mark_change_24h) : undefined,
-                timestamp: typeof data.timestamp === 'number' && data.timestamp > 0 ? data.timestamp : nowTime,
-              });
+              if (onTickerUpdate) {
+                onTickerUpdate({
+                  symbol: sym,
+                  markPrice: newPrice > 0 ? newPrice : undefined,
+                  indexPrice: newIndex !== undefined && newIndex > 0 ? newIndex : undefined,
+                  high24h: data.high24h ?? data.high ? Number(data.high24h || data.high) : undefined,
+                  low24h: data.low24h ?? data.low ? Number(data.low24h || data.low) : undefined,
+                  volume24hUsd: data.volume24hUsd ?? data.turnover_usd ? Number(data.volume24hUsd || data.turnover_usd) : undefined,
+                  fundingRate: data.fundingRate ?? data.funding_rate ? Number(data.fundingRate || data.funding_rate) : undefined,
+                  nextFundingCountdown: data.nextFundingCountdown || data.next_funding_countdown || undefined,
+                  change24h:
+                    data.change24h !== undefined
+                      ? Number(data.change24h)
+                      : data.mark_change_24h !== undefined
+                      ? Number(data.mark_change_24h)
+                      : undefined,
+                  timestamp: typeof data.timestamp === 'number' && data.timestamp > 0 ? data.timestamp : nowTime,
+                });
+              }
+
+              if (typeof window !== 'undefined' && newPrice > 0) {
+                window.dispatchEvent(
+                  new CustomEvent('delta:ws-ticker', {
+                    detail: {
+                      symbol: sym,
+                      markPrice: newPrice,
+                      indexPrice: newIndex,
+                      timestamp: nowTime,
+                    },
+                  })
+                );
+              }
             }
           }
 
-          // Buffer sliding message log (last 20 messages) for batched flush
           pendingLogsRef.current.unshift({
             id: `ws-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
             time: new Date().toLocaleTimeString(),
@@ -246,7 +361,7 @@ export function useDeltaWebSocket(options: UseDeltaWebSocketOptions = {}) {
           }
           pendingDirtyRef.current = true;
         } catch {
-          // ignore parse error
+          // ignore malformed frame
         }
       };
 
@@ -259,20 +374,17 @@ export function useDeltaWebSocket(options: UseDeltaWebSocketOptions = {}) {
         setStatus('DISCONNECTED');
         setPacketGap(9999);
         if (pingIntervalRef.current) clearInterval(pingIntervalRef.current);
-        // Automatic reconnection after 3.5s
-        reconnectTimeoutRef.current = setTimeout(() => {
-          setStatus('RECONNECTING');
-          connect();
-        }, 3500);
+        scheduleExponentialReconnect();
       };
     } catch {
       setStatus('DISCONNECTED');
       setPacketGap(9999);
-      reconnectTimeoutRef.current = setTimeout(connect, 4000);
+      scheduleExponentialReconnect();
     }
-  }, [onTickerUpdate]);
+  }, [onTickerUpdate, dispatchAuthoritativeResync]);
 
   const disconnect = useCallback(() => {
+    manualDisconnectRef.current = true;
     if (reconnectTimeoutRef.current) clearTimeout(reconnectTimeoutRef.current);
     if (pingIntervalRef.current) clearInterval(pingIntervalRef.current);
     clearAllFlashTimeouts();
@@ -295,6 +407,25 @@ export function useDeltaWebSocket(options: UseDeltaWebSocketOptions = {}) {
       pingStartRef.current = Date.now();
       wsRef.current.send(JSON.stringify({ type: 'ping' }));
     }
+  }, []);
+
+  // Allow Options Lab & dynamic modules to subscribe option contract symbols on wss://socket.india.delta.exchange
+  useEffect(() => {
+    const handleOptionSub = (e: any) => {
+      const symbols: string[] = Array.isArray(e?.detail?.symbols) ? e.detail.symbols : [];
+      if (symbols.length > 0 && wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+        wsRef.current.send(
+          JSON.stringify({
+            type: 'subscribe',
+            payload: {
+              channels: [{ name: 'v2/ticker', symbols }],
+            },
+          })
+        );
+      }
+    };
+    window.addEventListener('delta:ws-subscribe-options', handleOptionSub);
+    return () => window.removeEventListener('delta:ws-subscribe-options', handleOptionSub);
   }, []);
 
   // Batched telemetry flush & real-time packet gap monitor (~250ms cadence)

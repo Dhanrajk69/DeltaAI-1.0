@@ -341,33 +341,7 @@ const TradingIntelligenceBar: React.FC<TradingIntelligenceBarProps> = React.memo
   const [nowTick, setNowTick] = useState<number>(() => Date.now());
   const signalsDropdownRef = useRef<HTMLDivElement | null>(null);
   const breachPopoverRef = useRef<HTMLDivElement | null>(null);
-  const [trackedSignalHistory, setTrackedSignalHistory] = useState<HistoricalSignalItem[]>(() => {
-    try {
-      const raw = localStorage.getItem(SIGNAL_HISTORY_STORAGE_KEY);
-      if (raw) {
-        const parsed = JSON.parse(raw);
-        if (Array.isArray(parsed)) {
-          const valid = parsed.filter(
-            (item) =>
-              item &&
-              typeof item.id === 'string' &&
-              typeof item.entryPrice === 'number' &&
-              item.entryPrice > 0 &&
-              typeof item.timestamp === 'number'
-          );
-          const seenIds = new Set<string>();
-          return valid
-            .filter((item) => {
-              if (seenIds.has(item.id)) return false;
-              seenIds.add(item.id);
-              return true;
-            })
-            .slice(0, 15);
-        }
-      }
-    } catch {}
-    return [];
-  });
+  const [trackedSignalHistory, setTrackedSignalHistory] = useState<HistoricalSignalItem[]>([]);
 
   const {
     voiceEnabled,
@@ -865,9 +839,6 @@ const TradingIntelligenceBar: React.FC<TradingIntelligenceBarProps> = React.memo
 
       const dedupedPrev = prev.filter((item) => item.id !== activeId);
       const updated = [nextEntry, ...dedupedPrev].slice(0, 15);
-      try {
-        localStorage.setItem(SIGNAL_HISTORY_STORAGE_KEY, JSON.stringify(updated));
-      } catch {}
       return updated;
     });
 
@@ -994,9 +965,6 @@ const TradingIntelligenceBar: React.FC<TradingIntelligenceBarProps> = React.memo
         const merged = Array.from(byId.values())
           .sort((a, b) => b.timestamp - a.timestamp)
           .slice(0, 100);
-        try {
-          localStorage.setItem(SIGNAL_HISTORY_STORAGE_KEY, JSON.stringify(merged.slice(0, 50)));
-        } catch {}
         return merged;
       });
     };
@@ -2724,6 +2692,7 @@ interface SignalAndPositionLifecycleBridgeProps {
   ) => Promise<void>;
   addNotification: (title: string, message: string, type: 'INFO' | 'TRADE' | 'RISK' | 'AI') => void;
   playTradeFill: () => void;
+  onUpdatePositionSL?: (posId: string, newSL: number) => void;
   sniperRecordTradeRef: React.MutableRefObject<
     ((trade: ClosedTrade, posUpdate?: SniperPositionSyncUpdate) => void) | null
   >;
@@ -2742,15 +2711,32 @@ const SignalAndPositionLifecycleBridge: React.FC<SignalAndPositionLifecycleBridg
   handleClosePosition,
   addNotification,
   playTradeFill,
+  onUpdatePositionSL,
   sniperRecordTradeRef,
   sniperLifecycleExitRef,
 }) => {
   const { lockedActiveSignal, clearLockedSignalForCooldown } = useAiMatrixCorrelation();
   const processedPosEventsRef = useRef<Set<string>>(new Set());
 
+  // Listen for Dynamic Ratchet Breakeven Stop-Loss updates across the applet
+  useEffect(() => {
+    const handleSlUpdate = (e: any) => {
+      const sym = e?.detail?.symbol;
+      const newSl = e?.detail?.newStopLoss;
+      if (sym && typeof newSl === 'number' && Number.isFinite(newSl) && newSl > 0 && onUpdatePositionSL) {
+        onUpdatePositionSL(sym, newSl);
+      }
+    };
+    window.addEventListener('delta:update-position-sl', handleSlUpdate);
+    return () => window.removeEventListener('delta:update-position-sl', handleSlUpdate);
+  }, [onUpdatePositionSL]);
+
   // Wire Sniper Engine closed-trade & lifecycle exit callbacks into AiMatrixCorrelationContext & Paper History
   useEffect(() => {
     sniperRecordTradeRef.current = (closedTrade, posUpdate) => {
+      if (posUpdate?.newStopLoss && onUpdatePositionSL && posUpdate.symbol) {
+        onUpdatePositionSL(posUpdate.symbol, posUpdate.newStopLoss);
+      }
       if (tradingMode !== 'PAPER') return;
       const matchingPos = posUpdate?.symbol
         ? paperPositions.find((p) => p.symbol === posUpdate.symbol)
@@ -2793,6 +2779,7 @@ const SignalAndPositionLifecycleBridge: React.FC<SignalAndPositionLifecycleBridg
     setPaperPortfolio,
     playTradeFill,
     clearLockedSignalForCooldown,
+    onUpdatePositionSL,
   ]);
 
   // Monitor non-Sniper open PAPER positions (from Order Pad) for automated SL & TP1-TP4 4-tier ladder exits
@@ -3052,20 +3039,6 @@ export default function App() {
   const [authError, setAuthError] = useState<string>('');
 
   useEffect(() => {
-    try {
-      const bypass = localStorage.getItem('delta_admin_bypass_email');
-      if (bypass === 'dhanrajk69@gmail.com') {
-        setAuthUser({
-          uid: 'admin-dhanrajk69-uid',
-          email: 'dhanrajk69@gmail.com',
-          displayName: 'Dhanraj K (Admin)',
-          getIdToken: async () => 'mock-admin-firebase-id-token-dhanrajk69-verified',
-        } as any);
-        setIsAuthLoading(false);
-        return;
-      }
-    } catch {}
-
     getRedirectResult(auth)
       .then((result) => {
         if (result?.user) {
@@ -3079,7 +3052,9 @@ export default function App() {
       .catch(() => {});
 
     const unsubscribe = onAuthStateChanged(auth, (user) => {
-      setAuthUser(user);
+      if (user) {
+        setAuthUser(user);
+      }
       setIsAuthLoading(false);
     });
     return () => unsubscribe();
@@ -3094,9 +3069,6 @@ export default function App() {
       getIdToken: async () => 'mock-admin-firebase-id-token-dhanrajk69-verified',
     };
     setAuthUser(adminUser as any);
-    try {
-      localStorage.setItem('delta_admin_bypass_email', 'dhanrajk69@gmail.com');
-    } catch {}
   };
 
   const handleGoogleSignIn = async () => {
@@ -3121,98 +3093,31 @@ export default function App() {
 
   const [currentTab, setCurrentTab] = useState<string>('dashboard');
   const [isSidebarOpen, setIsSidebarOpen] = useState<boolean>(false);
-  const [isSidebarCollapsed, setIsSidebarCollapsed] = useState<boolean>(() => {
-    try {
-      return localStorage.getItem('delta_sidebar_collapsed') === 'true';
-    } catch {
-      return false;
-    }
-  });
+  const [isSidebarCollapsed, setIsSidebarCollapsed] = useState<boolean>(false);
 
   const handleToggleSidebarCollapse = useCallback(() => {
-    setIsSidebarCollapsed((prev) => {
-      const next = !prev;
-      try {
-        localStorage.setItem('delta_sidebar_collapsed', String(next));
-      } catch {}
-      return next;
-    });
+    setIsSidebarCollapsed((prev) => !prev);
   }, []);
 
-  const [showShortTermTrendOverlay, setShowShortTermTrendOverlay] = useState<boolean>(() => {
-    try {
-      return localStorage.getItem('delta_short_term_trend_overlay') === 'true';
-    } catch {
-      return false;
-    }
-  });
+  const [showShortTermTrendOverlay, setShowShortTermTrendOverlay] = useState<boolean>(false);
 
   const handleToggleShortTermTrendOverlay = useCallback(() => {
-    setShowShortTermTrendOverlay((prev) => {
-      const next = !prev;
-      try {
-        localStorage.setItem('delta_short_term_trend_overlay', String(next));
-      } catch {}
-      return next;
-    });
+    setShowShortTermTrendOverlay((prev) => !prev);
   }, []);
 
-  const [trendSmoothingFactor, setTrendSmoothingFactor] = useState<number>(() => {
-    try {
-      const saved = Number(localStorage.getItem('delta_trend_volatility_threshold'));
-      return Number.isFinite(saved) && saved >= 0 && saved <= 100 ? Math.round(saved) : 50;
-    } catch {
-      return 50;
-    }
-  });
+  const [trendSmoothingFactor, setTrendSmoothingFactor] = useState<number>(50);
 
   const handleTrendSmoothingFactorChange = useCallback((nextVal: number) => {
     const clamped = Math.max(0, Math.min(100, Math.round(nextVal)));
     setTrendSmoothingFactor(clamped);
-    try {
-      localStorage.setItem('delta_trend_volatility_threshold', String(clamped));
-    } catch {}
   }, []);
 
   const [trendVariance, setTrendVariance] = useState<{ stdDev: number; stdDevPct: number } | null>(null);
-  const [volatilityBreachAlertEnabled, setVolatilityBreachAlertEnabled] = useState<boolean>(() => {
-    try {
-      return typeof window !== 'undefined' && localStorage.getItem('delta_volatility_breach_alert_enabled') === 'true';
-    } catch {
-      return false;
-    }
-  });
-  const [volatilityBreachThreshold, setVolatilityBreachThreshold] = useState<number>(() => {
-    try {
-      const saved = typeof window !== 'undefined' ? localStorage.getItem('delta_volatility_breach_threshold') : null;
-      if (saved !== null) {
-        const parsed = parseFloat(saved);
-        if (Number.isFinite(parsed) && parsed >= 0.1 && parsed <= 10.0) return parsed;
-      }
-    } catch {}
-    return 1.0;
-  });
-  const [volatilityBreachChimeEnabled, setVolatilityBreachChimeEnabled] = useState<boolean>(() => {
-    try {
-      const saved = typeof window !== 'undefined' ? localStorage.getItem('delta_volatility_breach_chime_enabled') : null;
-      if (saved !== null) return saved === 'true';
-    } catch {}
-    return true;
-  });
-  const [autoMuteOnBreachEnabled, setAutoMuteOnBreachEnabled] = useState<boolean>(() => {
-    try {
-      const saved = typeof window !== 'undefined' ? localStorage.getItem('delta_auto_mute_on_breach_enabled') : null;
-      if (saved !== null) return saved === 'true';
-    } catch {}
-    return false;
-  });
-  const [autoResetTrendEnabled, setAutoResetTrendEnabled] = useState<boolean>(() => {
-    try {
-      const saved = typeof window !== 'undefined' ? localStorage.getItem('delta_auto_reset_trend_enabled') : null;
-      if (saved !== null) return saved === 'true';
-    } catch {}
-    return false;
-  });
+  const [volatilityBreachAlertEnabled, setVolatilityBreachAlertEnabled] = useState<boolean>(false);
+  const [volatilityBreachThreshold, setVolatilityBreachThreshold] = useState<number>(1.0);
+  const [volatilityBreachChimeEnabled, setVolatilityBreachChimeEnabled] = useState<boolean>(true);
+  const [autoMuteOnBreachEnabled, setAutoMuteOnBreachEnabled] = useState<boolean>(false);
+  const [autoResetTrendEnabled, setAutoResetTrendEnabled] = useState<boolean>(false);
   const [isVolatilityBreachWarningActive, setIsVolatilityBreachWarningActive] = useState<boolean>(false);
   const [trendResetNonce, setTrendResetNonce] = useState<number>(0);
   const [volatilityBreachToast, setVolatilityBreachToast] = useState<{
@@ -3224,30 +3129,7 @@ export default function App() {
     timestamp: number;
     isTest?: boolean;
   } | null>(null);
-  const [volatilityBreachHistory, setVolatilityBreachHistory] = useState<VolatilityBreachHistoryEntry[]>(() => {
-    try {
-      const saved =
-        typeof window !== 'undefined' ? localStorage.getItem(VOLATILITY_BREACH_HISTORY_STORAGE_KEY) : null;
-      if (saved) {
-        const parsed = JSON.parse(saved);
-        if (Array.isArray(parsed)) {
-          return parsed
-            .filter(
-              (item) =>
-                item &&
-                typeof item.id === 'string' &&
-                typeof item.symbol === 'string' &&
-                typeof item.stdDev === 'number' &&
-                typeof item.stdDevPct === 'number' &&
-                typeof item.threshold === 'number' &&
-                typeof item.timestamp === 'number'
-            )
-            .slice(0, 5);
-        }
-      }
-    } catch {}
-    return [];
-  });
+  const [volatilityBreachHistory, setVolatilityBreachHistory] = useState<VolatilityBreachHistoryEntry[]>([]);
   const wasVolatilityBreachingRef = useRef<boolean>(false);
   const lastVolatilityBreachAtRef = useRef<number>(0);
   const lastBreachSymbolRef = useRef<string>('');
@@ -3255,14 +3137,8 @@ export default function App() {
   const [tradingMode, setTradingMode] = useState<TradingMode>('PAPER');
   const [selectedSymbol, setSelectedSymbol] = useState<string>('BTCUSDT');
   const [activeBacktestTrade, setActiveBacktestTrade] = useState<BacktestTradeOverlay | null>(null);
-  const [timeframe, setTimeframe] = useState<string>(() => {
-    try {
-      const cached = typeof window !== 'undefined' ? localStorage.getItem('delta_pref_timeframe') : null;
-      if (cached && ['1m', '3m', '5m', '15m', '1h', '4h', '1d'].includes(cached)) return cached;
-    } catch {}
-    return '5m';
-  });
-  // Interactive USD ($) / INR (₹) Currency State (1 USD = ₹85.00 INR in Delta India telemetry)
+  const [timeframe, setTimeframe] = useState<string>('5m');
+  // Interactive USD ($) / INR (₹) Currency State (UI preference allowed in localStorage)
   const [currency, setCurrency] = useState<'USD' | 'INR'>(() => {
     try {
       const saved = typeof window !== 'undefined' ? localStorage.getItem('delta_pref_currency') : null;
@@ -3278,39 +3154,9 @@ export default function App() {
 
   useEffect(() => {
     try {
-      localStorage.setItem('delta_pref_timeframe', timeframe);
-    } catch {}
-  }, [timeframe]);
-
-  useEffect(() => {
-    try {
       localStorage.setItem('delta_pref_currency', currency);
     } catch {}
   }, [currency]);
-
-  // Purge Stale LocalStorage Cache on boot (clears phantom positions)
-  useEffect(() => {
-    try {
-      if (typeof window !== 'undefined') {
-        const migrated = localStorage.getItem('delta_positions_v3_migrated');
-        if (!migrated) {
-          [
-            'delta_positions',
-            'delta_paper_positions',
-            'delta_demo_positions',
-            'delta_cached_positions',
-            'delta_open_positions',
-            'delta_open_positions_v2',
-            'delta_positions_cache_v2',
-            'delta_positions_v3',
-          ].forEach((key) => localStorage.removeItem(key));
-          localStorage.setItem('delta_positions_v3_migrated', 'true');
-        }
-      }
-    } catch {
-      // Ignore storage migration failures in restricted frames
-    }
-  }, []);
 
   // Delta Exchange India Live API Credentials & Authentication State
   const [apiCredentials, setApiCredentials] = useState<DeltaApiCredentials>(() => {
@@ -3430,10 +3276,7 @@ export default function App() {
                   };
             if (!currentStored || !currentStored.apiKey || currentStored.apiKey.length < 8) {
               setApiCredentials(effectiveHydratedCreds);
-              try {
-                localStorage.setItem('delta_api_credentials', JSON.stringify(effectiveHydratedCreds));
-                localStorage.setItem('delta_live_gate_unlocked', 'true');
-              } catch {}
+              saveStoredDeltaCredentials(effectiveHydratedCreds);
             }
             setServerLiveGateEnabled(true);
             setLiveTradingReady(true);
@@ -3711,7 +3554,9 @@ export default function App() {
 
   const positions: Position[] = useMemo(() => {
     if (tradingMode === 'LIVE') {
-      return isLiveApiAuthenticated ? livePositions.filter((p) => p.mode === 'LIVE') : [];
+      return isLiveApiAuthenticated
+        ? livePositions.filter((p) => p.mode === 'LIVE' && Math.abs(Number(p.size || (p as any).contracts || 0)) > 0)
+        : [];
     }
     return paperPositions.filter((p) => p.mode !== 'LIVE');
   }, [tradingMode, isLiveApiAuthenticated, livePositions, paperPositions]);
@@ -3725,6 +3570,8 @@ export default function App() {
 
   // Synchronize Base Perpetual Positions & Realized PnL to PortfolioContext
   const {
+    positions: portfolioCtxPositions,
+    history: portfolioCtxHistory,
     setBasePositionsPnl,
     setUsdInrRate,
     setPositions,
@@ -3734,7 +3581,37 @@ export default function App() {
     refreshPositions,
     refreshWallet,
     walletDiagnosticError,
+    updatePositionStopLoss,
   } = usePortfolio();
+
+  // Real-Time Mismatch & WebSocket Reactivity: Mirror authoritative PortfolioContext positions & fills immediately into App live state
+  useEffect(() => {
+    if (!isLiveApiAuthenticated) return;
+    const liveOnly = (Array.isArray(portfolioCtxPositions) ? portfolioCtxPositions : []).filter(
+      (p) => Math.abs(Number(p.size || (p as any).contracts || 0)) > 0
+    );
+    setLivePositions(liveOnly);
+    setPositionsHydratedLive(true);
+  }, [portfolioCtxPositions, isLiveApiAuthenticated]);
+
+  useEffect(() => {
+    if (!isLiveApiAuthenticated || !Array.isArray(portfolioCtxHistory) || portfolioCtxHistory.length === 0) return;
+    setLiveHistory((prev) => {
+      const byKey = new Map<string, ClosedTrade>();
+      for (const item of prev) {
+        const key = item.fillId ? `fill:${item.fillId}` : item.id;
+        byKey.set(key, item);
+      }
+      for (const item of portfolioCtxHistory) {
+        const key = item.fillId ? `fill:${item.fillId}` : item.id;
+        const existing = byKey.get(key);
+        byKey.set(key, existing ? { ...existing, ...item, notes: existing.notes ?? item.notes } : item);
+      }
+      return Array.from(byKey.values())
+        .sort((a, b) => Number(b.closedAt || 0) - Number(a.closedAt || 0))
+        .slice(0, 500);
+    });
+  }, [portfolioCtxHistory, isLiveApiAuthenticated]);
 
   const syncLiveAccountWallet = useCallback(
     async (
@@ -3825,7 +3702,10 @@ export default function App() {
       }
 
       if (positionsResponse.status === 'success' && Array.isArray(positionsResponse.positions)) {
-        setLivePositions(positionsResponse.positions);
+        const activeOnly = positionsResponse.positions.filter(
+          (p) => Math.abs(Number(p.size || (p as any).contracts || 0)) > 0
+        );
+        setLivePositions(activeOnly);
         setPositionsHydratedLive(true);
       }
     },
@@ -4097,7 +3977,7 @@ export default function App() {
     }
 
     fetchSyncSnapshot();
-    const pollTimer = setInterval(fetchSyncSnapshot, 6000);
+    const pollTimer = setInterval(fetchSyncSnapshot, 5000);
 
     const handleVisibilityChange = () => {
       if (!document.hidden) {
@@ -4220,17 +4100,33 @@ export default function App() {
       }));
     };
 
+    const handlePositionsReconciled = (
+      e: CustomEvent<{ activePositions: Position[]; closedPositions: Position[] }>
+    ) => {
+      if (Array.isArray(e.detail?.activePositions)) {
+        const activeOnly = e.detail.activePositions.filter(
+          (p) => Math.abs(Number(p.size || (p as any).contracts || 0)) > 0
+        );
+        setLivePositions(activeOnly);
+        setPositionsHydratedLive(true);
+      }
+    };
+
     window.addEventListener('delta:record-closed-trade', handleRecordClosedTrade as EventListener);
     window.addEventListener('delta:full-history-synced', handleFullHistorySynced as EventListener);
+    window.addEventListener('delta:positions-reconciled', handlePositionsReconciled as EventListener);
     return () => {
       window.removeEventListener('delta:record-closed-trade', handleRecordClosedTrade as EventListener);
       window.removeEventListener('delta:full-history-synced', handleFullHistorySynced as EventListener);
+      window.removeEventListener('delta:positions-reconciled', handlePositionsReconciled as EventListener);
     };
   }, []);
 
   useEffect(() => {
-    setPositions(positions);
-    setHistory(history);
+    if (tradingMode === 'PAPER') {
+      setPositions(positions);
+      setHistory(history);
+    }
     if (tradingMode === 'LIVE' && !isLiveApiAuthenticated) {
       setBasePositionsPnl(0, 0);
       return;
@@ -4470,9 +4366,6 @@ export default function App() {
 
   const handleToggleAutoMuteOnBreach = useCallback((enabled: boolean) => {
     setAutoMuteOnBreachEnabled(enabled);
-    try {
-      localStorage.setItem('delta_auto_mute_on_breach_enabled', String(enabled));
-    } catch {}
   }, []);
 
   const handleToggleGeneralSound = useCallback(() => {
@@ -4485,9 +4378,6 @@ export default function App() {
 
   const handleToggleAutoResetTrend = useCallback((enabled: boolean) => {
     setAutoResetTrendEnabled(enabled);
-    try {
-      localStorage.setItem('delta_auto_reset_trend_enabled', String(enabled));
-    } catch {}
   }, []);
 
   const handleDismissVolatilityBreach = useCallback(() => {
@@ -4513,31 +4403,19 @@ export default function App() {
         }
       } catch {}
     }
-    try {
-      localStorage.setItem('delta_volatility_breach_alert_enabled', String(enabled));
-    } catch {}
   }, [handleDismissVolatilityBreach]);
 
   const handleChangeVolatilityBreachThreshold = useCallback((nextThreshold: number) => {
     const safe = Math.max(0.1, Math.min(10.0, +nextThreshold.toFixed(1)));
     setVolatilityBreachThreshold(safe);
-    try {
-      localStorage.setItem('delta_volatility_breach_threshold', String(safe));
-    } catch {}
   }, []);
 
   const handleToggleVolatilityBreachChime = useCallback((enabled: boolean) => {
     setVolatilityBreachChimeEnabled(enabled);
-    try {
-      localStorage.setItem('delta_volatility_breach_chime_enabled', String(enabled));
-    } catch {}
   }, []);
 
   const handleClearVolatilityBreachHistory = useCallback(() => {
     setVolatilityBreachHistory([]);
-    try {
-      localStorage.removeItem(VOLATILITY_BREACH_HISTORY_STORAGE_KEY);
-    } catch {}
   }, []);
 
   const triggerVolatilityBreachNotification = useCallback(
@@ -4564,11 +4442,7 @@ export default function App() {
           timestamp: now,
           isTest: payload.isTest,
         };
-        const updated = [nextEntry, ...prev].slice(0, 5);
-        try {
-          localStorage.setItem(VOLATILITY_BREACH_HISTORY_STORAGE_KEY, JSON.stringify(updated));
-        } catch {}
-        return updated;
+        return [nextEntry, ...prev].slice(0, 5);
       });
       setVolatilityBreachToast({
         id: entryId,
@@ -4736,10 +4610,10 @@ export default function App() {
     }
   }, [normalizeSymbol]);
 
-  // Poll market state every 3 seconds
+  // Poll market state every 5 seconds alongside live WebSocket feed
   useEffect(() => {
     fetchMarketData();
-    const interval = setInterval(fetchMarketData, 3000);
+    const interval = setInterval(fetchMarketData, 5000);
     return () => clearInterval(interval);
   }, [fetchMarketData]);
 
@@ -5035,9 +4909,21 @@ export default function App() {
       }
     }
 
+    const norm = (s?: string) => String(s || '').toUpperCase().trim();
+    const isTargetPos = (p: Position) => {
+      const t = norm(positionId);
+      return (
+        p.id === positionId ||
+        norm(p.symbol) === t ||
+        norm(p.rawSymbol) === t ||
+        norm(p.product_symbol) === t ||
+        (p.product_id && String(p.product_id) === String(positionId))
+      );
+    };
+
     // Immediate optimistic closure for paper mode
     if (tradingMode === 'PAPER') {
-      const targetPos = paperPositions.find((p) => p.id === positionId);
+      const targetPos = paperPositions.find(isTargetPos);
       if (targetPos) {
         const exitPx =
           typeof overrides?.exitPrice === 'number' && overrides.exitPrice > 0
@@ -5067,7 +4953,7 @@ export default function App() {
         const winsCount = updatedHistory.filter((t) => (t.realisedPnl || 0) >= 0).length;
         const computedWinRate = updatedHistory.length > 0 ? +((winsCount / updatedHistory.length) * 100).toFixed(1) : 0;
 
-        setPaperPositions((prev) => prev.filter((p) => p.id !== positionId));
+        setPaperPositions((prev) => prev.filter((p) => !isTargetPos(p)));
         setPaperPortfolio((prev) => {
           const newRealized = +(prev.realisedPnlTotal + computedPnl).toFixed(2);
           const newDaily = +(prev.dailyPnl + computedPnl).toFixed(2);
@@ -5109,35 +4995,97 @@ export default function App() {
         }),
       });
       const data = await res.json().catch(() => ({}));
-      if (!res.ok) {
+      const rawErrorMsg = String(data.error || data.message || '').toLowerCase();
+      const isAlreadyClosed =
+        Boolean(data.alreadyClosed) ||
+        rawErrorMsg.includes('already closed') ||
+        rawErrorMsg.includes('no_open_position') ||
+        rawErrorMsg.includes('not found') ||
+        rawErrorMsg.includes('size is 0') ||
+        rawErrorMsg.includes('size === 0') ||
+        rawErrorMsg.includes('inactive');
+
+      if (isAlreadyClosed) {
+        if (tradingMode === 'LIVE') {
+          setLivePositions((prev) => prev.filter((p) => !isTargetPos(p)));
+          setPositions((prev) => prev.filter((p) => !isTargetPos(p)));
+          addNotification(
+            'Position Reconciled',
+            data.message || 'Position was already closed on Delta Exchange. Cleared from active view.',
+            'INFO'
+          );
+        }
+      } else if (!res.ok) {
         if (tradingMode === 'LIVE') {
           throw new Error(data.error || `Failed to close live position (status ${res.status})`);
         }
       } else {
         if (tradingMode === 'LIVE') {
+          setLivePositions((prev) => prev.filter((p) => !isTargetPos(p)));
+          setPositions((prev) => prev.filter((p) => !isTargetPos(p)));
           playTradeFill();
           addNotification('Position Closed', data.message || 'Position closed successfully', 'TRADE');
         }
       }
       fetchMarketData();
     } catch (err: any) {
-      addNotification('Close Position Alert', err?.message || 'Failed to close position on server', 'RISK');
+      const errMsg = String(err?.message || '').toLowerCase();
+      const isAlreadyClosed =
+        errMsg.includes('already closed') ||
+        errMsg.includes('no_open_position') ||
+        errMsg.includes('not found') ||
+        errMsg.includes('size is 0') ||
+        errMsg.includes('size === 0') ||
+        errMsg.includes('inactive');
+
+      if (isAlreadyClosed && tradingMode === 'LIVE') {
+        setLivePositions((prev) => prev.filter((p) => !isTargetPos(p)));
+        setPositions((prev) => prev.filter((p) => !isTargetPos(p)));
+        addNotification(
+          'Position Reconciled',
+          'Position was already closed on Delta Exchange. Cleared from active view.',
+          'INFO'
+        );
+      } else {
+        addNotification('Close Position Alert', err?.message || 'Failed to close position on server', 'RISK');
+      }
     }
   };
 
   // Dynamic Ratchet Stop Loss Update (Stage 1 Break-Even & Stage 2 Trailing ATR)
   const handleUpdatePositionSL = useCallback((posId: string, newSL: number) => {
+    const norm = (s?: string) => String(s || '').toUpperCase().trim();
+    const isTargetPos = (p: Position) => {
+      const t = norm(posId);
+      return (
+        p.id === posId ||
+        norm(p.symbol) === t ||
+        norm(p.rawSymbol) === t ||
+        norm(p.product_symbol) === t ||
+        (p.product_id && String(p.product_id) === String(posId))
+      );
+    };
+
     if (tradingMode === 'PAPER') {
       setPaperPositions((prev) =>
-        prev.map((p) => (p.id === posId ? { ...p, stopLoss: newSL } : p))
+        prev.map((p) => (isTargetPos(p) ? { ...p, stopLoss: newSL } : p))
       );
     } else {
       setLivePositions((prev) =>
-        prev.map((p) => (p.id === posId ? { ...p, stopLoss: newSL } : p))
+        prev.map((p) => (isTargetPos(p) ? { ...p, stopLoss: newSL } : p))
       );
     }
-    addNotification('Dynamic Ratchet Stop-Loss Updated', `Position stop-loss adjusted to $${newSL.toLocaleString()}`, 'RISK');
-  }, [tradingMode, addNotification]);
+    setPositions((prev) =>
+      prev.map((p) => (isTargetPos(p) ? { ...p, stopLoss: newSL } : p))
+    );
+    updatePositionStopLoss(posId, newSL);
+
+    addNotification(
+      'Dynamic Ratchet Stop-Loss Updated',
+      `Position stop-loss adjusted to $${Number(newSL).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`,
+      'RISK'
+    );
+  }, [tradingMode, addNotification, setPositions, updatePositionStopLoss]);
 
   // Dynamic Ratchet Partial Scaling (Stage 1: Scale 25% lots)
   const handleScalePosition = useCallback((posId: string, scalePct: number) => {
@@ -5198,8 +5146,15 @@ export default function App() {
       true
     );
     sniperEngine.closeActiveSniperTrade('Emergency Kill Switch');
+    sniperEngine.setIsAutoSniperEnabled?.(false);
     try {
-      localStorage.setItem('delta_options_autopilot_enabled_v1', 'false');
+      localStorage.setItem('deltaai_sniper_autopilot_armed', 'false');
+      localStorage.setItem('deltaai_auto_command_enabled', 'false');
+      fetch('/api/delta/autopilot-state', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sniperAutoPilotArmed: false, armedAt: 0, reason: 'Disarmed via Emergency Kill Switch' }),
+      }).catch(() => {});
       fetch('/api/options/autopilot-state', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -5216,12 +5171,18 @@ export default function App() {
         },
         body: JSON.stringify({}),
       });
-      const data = await res.json();
+      const data = await res.json().catch(() => ({}));
+      if (tradingMode === 'PAPER') {
+        setPaperPositions([]);
+      } else {
+        setLivePositions([]);
+      }
+      setPositions([]);
       if (!res.ok) throw new Error(data.error || 'Kill switch failed');
-      addNotification('EMERGENCY KILL SWITCH', data.message, 'RISK');
+      addNotification('EMERGENCY KILL SWITCH', data.message || 'All positions terminated and orders cancelled', 'RISK');
       fetchMarketData();
     } catch (err: any) {
-      addNotification('Kill Switch Notice', err.message, 'RISK');
+      addNotification('Kill Switch Notice', err?.message || 'Kill switch executed', 'RISK');
     }
     setIsKillModalOpen(false);
   };
@@ -5501,6 +5462,7 @@ export default function App() {
           handleClosePosition={handleClosePosition}
           addNotification={addNotification}
           playTradeFill={playTradeFill}
+          onUpdatePositionSL={handleUpdatePositionSL}
           sniperRecordTradeRef={sniperRecordTradeRef}
           sniperLifecycleExitRef={sniperLifecycleExitRef}
         />
